@@ -1,0 +1,32 @@
+{
+  "expo": {
+    "name": "Hadoo",
+    "slug": "hadoo",
+    "scheme": "hadoo",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "newArchEnabled": false,
+    "plugins": [
+      "expo-router",
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "kotlinVersion": "1.9.25"
+          }
+        }
+      ]
+    ],
+    "experiments": {
+      "typedRoutes": true
+    },
+    "android": {
+      "package": "com.icemonkey.hadoo"
+    },
+    "ios": {
+      "bundleIdentifier": "com.icemonkey.hadoo",
+      "supportsTablet": false
+    }
+  }
+}
