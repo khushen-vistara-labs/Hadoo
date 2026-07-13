@@ -28,6 +28,21 @@ Run iOS on macOS with Xcode:
 npm run ios
 ```
 
+### Running On A Real Android Device
+
+This app does not run in Expo Go. It uses Expo development builds and native modules.
+
+For the shortest path on an Android phone with USB debugging enabled:
+
+```bash
+npm install
+npm run android
+```
+
+If your phone is already connected by USB and developer options are enabled, that command will build the native app, install it on the device, and connect it to Metro.
+
+Detailed device setup and troubleshooting lives in [docs/running-on-android-device.md](/Users/icemonkey/code/Hadoo/docs/running-on-android-device.md).
+
 ## Notes
 
 - This project targets Expo development builds, not Expo Go.
