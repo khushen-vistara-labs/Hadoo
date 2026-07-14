@@ -33,6 +33,15 @@ type HeroSlide = {
   onPress: () => void;
 };
 
+type ContinueCardData = {
+  title: string;
+  subtitle: string;
+  artwork?: ArtworkLike;
+  cta: string;
+  progress: number;
+  onPress: () => void;
+};
+
 type QuickAction = {
   id: string;
   icon: "moon" | "folder" | "download" | "settings";
@@ -101,28 +110,30 @@ export default function HomeScreen() {
     toastService.show("Detail views for provider collections are not wired yet.");
   };
 
+  const continueCard = useMemo<ContinueCardData | undefined>(() => {
+    if (!continueTrack) {
+      return undefined;
+    }
+
+    return {
+      title: continueTrack.title,
+      subtitle: `${continueTrack.artist} · ${continueDuration ? formatDuration(continueDuration) : "Open player"}`,
+      artwork: continueTrack.artwork,
+      cta: currentTrack ? (isPlaying ? "Now Playing" : "Resume") : "Resume",
+      progress: continueRatio,
+      onPress: () => {
+        if (currentTrack) {
+          router.push("/now-playing");
+          return;
+        }
+
+        void playerService.resumeStoredTrack(continueTrack, continueProgress);
+      },
+    };
+  }, [continueDuration, continueProgress, continueRatio, continueTrack, currentTrack, isPlaying]);
+
   const heroSlides = useMemo<HeroSlide[]>(() => {
     const slides: HeroSlide[] = [];
-
-    if (continueTrack) {
-      slides.push({
-        id: `continue-${continueTrack.id}`,
-        eyebrow: "Continue Listening",
-        title: continueTrack.title,
-        subtitle: `${continueTrack.artist} · ${continueDuration ? formatDuration(continueDuration) : "Open player"}`,
-        artwork: continueTrack.artwork,
-        cta: currentTrack ? (isPlaying ? "Now Playing" : "Resume") : "Resume",
-        progress: continueRatio,
-        onPress: () => {
-          if (currentTrack) {
-            router.push("/now-playing");
-            return;
-          }
-
-          void playerService.resumeStoredTrack(continueTrack, continueProgress);
-        },
-      });
-    }
 
     providerSections.slice(0, 3).forEach((section, index) => {
       const leadItem = section.items[0];
@@ -155,12 +166,6 @@ export default function HomeScreen() {
 
     return slides.slice(0, 4);
   }, [
-    continueDuration,
-    continueProgress,
-    continueRatio,
-    continueTrack,
-    currentTrack,
-    isPlaying,
     likedSongs,
     providerSections,
     recentlyPlayed,
@@ -220,20 +225,24 @@ export default function HomeScreen() {
       >
         <TopDiscoverBar warningCount={providerWarnings} />
 
-        <ScrollView
-          horizontal
-          pagingEnabled
-          decelerationRate="fast"
-          snapToAlignment="start"
-          showsHorizontalScrollIndicator={false}
-          contentContainerStyle={styles.heroRail}
-        >
-          {heroSlides.map((slide) => (
-            <HeroCard key={slide.id} slide={slide} />
-          ))}
-        </ScrollView>
+        {continueCard ? <ContinueListeningCard card={continueCard} /> : null}
 
         <QuickActionRow actions={quickActions} />
+
+        {heroSlides.length ? (
+          <ScrollView
+            horizontal
+            pagingEnabled
+            decelerationRate="fast"
+            snapToAlignment="start"
+            showsHorizontalScrollIndicator={false}
+            contentContainerStyle={styles.heroRail}
+          >
+            {heroSlides.map((slide) => (
+              <HeroCard key={slide.id} slide={slide} />
+            ))}
+          </ScrollView>
+        ) : null}
 
         <TrackListRail
           title="Recently Played"
@@ -362,7 +371,13 @@ const HeroCard = ({ slide }: { slide: HeroSlide }) => {
   return (
     <Pressable onPress={slide.onPress} style={styles.heroSlide}>
       {slide.artwork ? (
-        <CachedArtwork artwork={slide.artwork} category="hero" variant="hero" width={320} height={360} />
+        <CachedArtwork
+          artwork={slide.artwork}
+          category="hero"
+          variant="hero"
+          width={320}
+          height={360}
+        />
       ) : (
         <LinearGradient colors={[theme.surfaceAlt, theme.surface, theme.background]} style={styles.heroArtwork}>
           <SymbolIcon name="disc" size={32} color={theme.accent} />
@@ -388,16 +403,40 @@ const HeroCard = ({ slide }: { slide: HeroSlide }) => {
           <View style={[styles.heroCta, { backgroundColor: theme.accent }]}>
             <Text style={styles.heroCtaText}>{slide.cta}</Text>
           </View>
-          {slide.progress != null ? (
-            <View style={styles.heroProgressTrack}>
-              <View
-                style={[
-                  styles.heroProgressValue,
-                  { width: `${slide.progress * 100}%`, backgroundColor: theme.accent },
-                ]}
-              />
-            </View>
-          ) : null}
+        </View>
+      </View>
+    </Pressable>
+  );
+};
+
+const ContinueListeningCard = ({ card }: { card: ContinueCardData }) => {
+  const theme = useTheme();
+
+  return (
+    <Pressable onPress={card.onPress} style={[styles.continueCard, { backgroundColor: theme.surface }]}>
+      <CachedArtwork artwork={card.artwork} category="track" variant="card" width={96} height={96} borderRadius={24} />
+      <View style={styles.continueMeta}>
+        <Text muted style={styles.heroEyebrow}>
+          Continue Listening
+        </Text>
+        <Text variant="headline" numberOfLines={2} style={styles.continueTitle}>
+          {card.title}
+        </Text>
+        <Text muted numberOfLines={1}>
+          {card.subtitle}
+        </Text>
+        <View style={styles.continueFooter}>
+          <View style={[styles.heroCta, { backgroundColor: theme.accent }]}>
+            <Text style={styles.heroCtaText}>{card.cta}</Text>
+          </View>
+          <View style={styles.continueProgressTrack}>
+            <View
+              style={[
+                styles.heroProgressValue,
+                { width: `${card.progress * 100}%`, backgroundColor: theme.accent },
+              ]}
+            />
+          </View>
         </View>
       </View>
     </Pressable>
@@ -719,6 +758,32 @@ const styles = StyleSheet.create({
   heroProgressValue: {
     height: "100%",
     borderRadius: 999,
+  },
+  continueCard: {
+    minHeight: 128,
+    borderRadius: 28,
+    padding: 16,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 14,
+  },
+  continueMeta: {
+    flex: 1,
+    gap: 6,
+  },
+  continueTitle: {
+    fontSize: 24,
+    lineHeight: 30,
+  },
+  continueFooter: {
+    gap: 10,
+    marginTop: 2,
+  },
+  continueProgressTrack: {
+    height: 5,
+    borderRadius: 999,
+    overflow: "hidden",
+    backgroundColor: "rgba(255,255,255,0.12)",
   },
   quickRail: {
     gap: 14,
