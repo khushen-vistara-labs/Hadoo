@@ -35,6 +35,7 @@ export default function RootLayout() {
           <Stack.Screen name="playlist/[id]" options={{ presentation: "card" }} />
           <Stack.Screen name="lyrics" options={{ presentation: "modal" }} />
           <Stack.Screen name="sleep-timer" options={{ presentation: "modal" }} />
+          <Stack.Screen name="player-settings" options={{ presentation: "card" }} />
           <Stack.Screen name="source-settings" options={{ presentation: "card" }} />
         </Stack>
         {pathname !== "/now-playing" ? <MiniPlayer /> : null}

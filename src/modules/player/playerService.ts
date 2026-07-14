@@ -1,7 +1,12 @@
-import TrackPlayer, { RepeatMode as NativeRepeatMode, State } from "react-native-track-player";
+import TrackPlayer, {
+  Event,
+  RepeatMode as NativeRepeatMode,
+  State,
+} from "react-native-track-player";
 
 import { useLibraryStore } from "@/modules/library/libraryStore";
 import { usePlayerStore } from "@/modules/player/playerStore";
+import { useSleepTimerStore } from "@/modules/player/sleepTimerStore";
 import { setupTrackPlayer } from "@/modules/player/trackPlayerSetup";
 import { useSettingsStore } from "@/modules/settings/settingsStore";
 import { sourceRegistry } from "@/modules/sources/SourceRegistry";
@@ -16,9 +21,49 @@ const repeatMap: Record<RepeatMode, NativeRepeatMode> = {
   queue: NativeRepeatMode.Queue,
 };
 
+let listenersAttached = false;
+
+const shouldFireEndOfTrackTimer = (event: {
+  index?: number;
+  lastIndex?: number;
+  lastTrack?: { duration?: number };
+  lastPosition: number;
+}) => {
+  if (event.lastIndex == null || event.lastTrack == null || event.index == null) {
+    return false;
+  }
+
+  const duration = event.lastTrack.duration ?? 0;
+  return duration > 0 && event.lastPosition >= Math.max(duration - 2, 0);
+};
+
 export const playerService = {
   async setup() {
     await setupTrackPlayer();
+    if (!listenersAttached) {
+      TrackPlayer.addEventListener(Event.PlaybackActiveTrackChanged, async (event) => {
+        const activeOption = useSleepTimerStore.getState().activeOption;
+        if (activeOption === "end_of_track" && shouldFireEndOfTrackTimer(event)) {
+          await playerService.stopForSleepTimer();
+          return;
+        }
+
+        await playerService.syncCurrentTrack();
+      });
+      TrackPlayer.addEventListener(Event.PlaybackState, async (event) => {
+        usePlayerStore.getState().setPlaying(event.state === State.Playing);
+      });
+      TrackPlayer.addEventListener(Event.PlaybackProgressUpdated, async (event) => {
+        usePlayerStore.getState().setProgress(event.position, event.duration);
+        const expiresAt = useSleepTimerStore.getState().expiresAt;
+        if (expiresAt != null && Date.now() >= expiresAt) {
+          await playerService.stopForSleepTimer();
+        }
+      });
+      listenersAttached = true;
+    }
+    await playerService.syncCurrentTrack();
+    await playerService.syncState();
   },
 
   async playTrack(track: Track, queue?: Track[]) {
@@ -91,6 +136,7 @@ export const playerService = {
         resolvedQueue.find((item) => item.track.id === track.id)?.track ?? track,
       );
       usePlayerStore.getState().setPlaying(true);
+      usePlayerStore.getState().setProgress(0, track.duration ?? 0);
       usePlayerStore.getState().setError(undefined);
       useLibraryStore.getState().addRecent(track);
     } catch (error) {
@@ -107,6 +153,18 @@ export const playerService = {
   async pause() {
     await TrackPlayer.pause();
     usePlayerStore.getState().setPlaying(false);
+  },
+
+  async stopForSleepTimer() {
+    await TrackPlayer.pause();
+    usePlayerStore.getState().setPlaying(false);
+    useSleepTimerStore.getState().clearTimer();
+  },
+
+  async dismissMiniPlayer() {
+    await TrackPlayer.reset();
+    usePlayerStore.getState().reset();
+    useSleepTimerStore.getState().clearTimer();
   },
 
   async resume() {
@@ -126,6 +184,8 @@ export const playerService = {
 
   async seek(position: number) {
     await TrackPlayer.seekTo(position);
+    const duration = usePlayerStore.getState().duration;
+    usePlayerStore.getState().setProgress(position, duration);
   },
 
   async toggleRepeat() {
@@ -141,14 +201,19 @@ export const playerService = {
   },
 
   async syncState() {
-    const state = await TrackPlayer.getPlaybackState();
+    const [state, progress] = await Promise.all([
+      TrackPlayer.getPlaybackState(),
+      TrackPlayer.getProgress(),
+    ]);
     usePlayerStore.getState().setPlaying(state.state === State.Playing);
+    usePlayerStore.getState().setProgress(progress.position, progress.duration);
   },
 
   async syncCurrentTrack() {
     const activeIndex = await TrackPlayer.getActiveTrackIndex();
     if (activeIndex == null) {
       usePlayerStore.getState().setCurrentTrack(null);
+      usePlayerStore.getState().setProgress(0, 0);
       return;
     }
 

@@ -1,4 +1,4 @@
-import { StyleSheet, Text as RNText } from "react-native";
+import { Ionicons } from "@expo/vector-icons";
 
 type SymbolName =
   | "home"
@@ -8,23 +8,67 @@ type SymbolName =
   | "play"
   | "pause"
   | "back"
+  | "navBack"
   | "next"
   | "repeat"
   | "shuffle"
-  | "down";
+  | "down"
+  | "list"
+  | "mic"
+  | "moon"
+  | "close"
+  | "quote"
+  | "albums"
+  | "forward"
+  | "menu"
+  | "heart"
+  | "heartOutline"
+  | "share"
+  | "sliders"
+  | "equalizer"
+  | "tune"
+  | "add"
+  | "download"
+  | "link"
+  | "refresh"
+  | "sparkles"
+  | "person"
+  | "checkCircle";
 
-const glyphs: Record<SymbolName, string> = {
-  home: "⌂",
-  search: "⌕",
-  library: "☰",
-  settings: "⚙",
-  play: "▶",
-  pause: "⏸",
-  back: "⏮",
-  next: "⏭",
-  repeat: "⟲",
-  shuffle: "⇅",
-  down: "⌄",
+const glyphs: Record<SymbolName, keyof typeof Ionicons.glyphMap> = {
+  home: "home",
+  search: "search",
+  library: "library",
+  settings: "settings",
+  play: "play",
+  pause: "pause",
+  back: "play-skip-back",
+  navBack: "chevron-back",
+  next: "play-skip-forward",
+  repeat: "repeat",
+  shuffle: "shuffle",
+  down: "chevron-down",
+  list: "list",
+  mic: "mic",
+  moon: "moon",
+  close: "close",
+  quote: "document-text",
+  albums: "albums",
+  forward: "chevron-forward",
+  menu: "ellipsis-horizontal",
+  heart: "heart",
+  heartOutline: "heart-outline",
+  share: "share-social-outline",
+  sliders: "options-outline",
+  equalizer: "bar-chart-outline",
+  tune: "construct-outline",
+  add: "add-circle-outline",
+  download: "download-outline",
+  link: "open-outline",
+  refresh: "refresh-outline",
+  sparkles: "sparkles-outline",
+  person: "person-outline",
+  checkCircle: "checkmark-circle",
 };
 
 type Props = {
@@ -34,13 +78,5 @@ type Props = {
 };
 
 export const SymbolIcon = ({ name, size = 18, color }: Props) => (
-  <RNText style={[styles.icon, { fontSize: size, color }]}>{glyphs[name]}</RNText>
+  <Ionicons name={glyphs[name]} size={size} color={color} />
 );
-
-const styles = StyleSheet.create({
-  icon: {
-    fontWeight: "700",
-    textAlign: "center",
-    includeFontPadding: false,
-  },
-});

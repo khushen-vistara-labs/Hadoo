@@ -11,6 +11,7 @@ type PlayerStore = PlaybackSnapshot & {
   setShuffle: (shuffle: boolean) => void;
   setRepeatMode: (repeatMode: RepeatMode) => void;
   setError: (error?: string) => void;
+  reset: () => void;
 };
 
 export const usePlayerStore = create<PlayerStore>((set) => ({
@@ -29,4 +30,13 @@ export const usePlayerStore = create<PlayerStore>((set) => ({
   setShuffle: (shuffle) => set({ shuffle }),
   setRepeatMode: (repeatMode) => set({ repeatMode }),
   setError: (error) => set({ error }),
+  reset: () =>
+    set({
+      currentTrack: null,
+      queue: [],
+      isPlaying: false,
+      progress: 0,
+      duration: 0,
+      error: undefined,
+    }),
 }));
