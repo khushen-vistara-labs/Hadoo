@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Pressable, StyleSheet, TextInput, View } from "react-native";
+import { StyleSheet, TextInput, View } from "react-native";
 
 import { TrackRow } from "@/components/player/TrackRow";
 import { Chip } from "@/components/ui/Chip";

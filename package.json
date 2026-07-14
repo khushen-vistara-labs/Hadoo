@@ -8,7 +8,9 @@
     "android": "expo run:android",
     "ios": "expo run:ios",
     "lint": "expo lint",
-    "typecheck": "tsc --noEmit"
+    "test": "node -e \"console.log('No automated tests configured yet.')\"",
+    "typecheck": "tsc --noEmit",
+    "prepare": "node scripts/install-git-hooks.js"
   },
   "dependencies": {
     "@expo/vector-icons": "~14.0.4",
