@@ -3,7 +3,7 @@ name: Reviewdog
 on:
   pull_request:
     branches:
-      - main
+      - master
 
 concurrency:
   group: reviewdog-${{ github.event.pull_request.number || github.ref }}
