@@ -1,23 +1,32 @@
 import { create } from "zustand";
 import { createJSONStorage, persist } from "zustand/middleware";
 
-import { mockTracks } from "@/data/mockTracks";
 import { appStorage } from "@/store/persistence";
 import type { Track } from "@/types/track";
+
+type ResumeSession = {
+  track: Track;
+  position: number;
+  duration: number;
+  updatedAt: number;
+};
 
 type LibraryStore = {
   likedSongs: Track[];
   recentlyPlayed: Track[];
+  resumeSession?: ResumeSession;
   toggleLike: (track: Track) => void;
   addRecent: (track: Track) => void;
+  updateResumeSession: (session?: ResumeSession) => void;
   clearRecentlyPlayed: () => void;
 };
 
 export const useLibraryStore = create<LibraryStore>()(
   persist(
     (set, get) => ({
-      likedSongs: [mockTracks[0]],
-      recentlyPlayed: mockTracks.slice(0, 3),
+      likedSongs: [],
+      recentlyPlayed: [],
+      resumeSession: undefined,
       toggleLike: (track) => {
         const exists = get().likedSongs.some((item) => item.id === track.id);
         set({
@@ -30,6 +39,7 @@ export const useLibraryStore = create<LibraryStore>()(
         const next = [track, ...get().recentlyPlayed.filter((item) => item.id !== track.id)].slice(0, 12);
         set({ recentlyPlayed: next });
       },
+      updateResumeSession: (resumeSession) => set({ resumeSession }),
       clearRecentlyPlayed: () => set({ recentlyPlayed: [] }),
     }),
     {

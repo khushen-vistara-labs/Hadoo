@@ -10,15 +10,17 @@ type SettingsStore = {
   themeId: ThemeId;
   accentOverride?: string;
   providerStates: Record<MusicProvider, boolean>;
+  preferredHomeProvider: MusicProvider;
   audioQuality: "auto" | "low" | "medium" | "high";
   toggleProvider: (provider: MusicProvider) => void;
+  setPreferredHomeProvider: (provider: MusicProvider) => void;
   setTheme: (themeId: ThemeId) => void;
   setAccentOverride: (color?: string) => void;
   setAudioQuality: (value: "auto" | "low" | "medium" | "high") => void;
 };
 
 const providerStates: Record<MusicProvider, boolean> = {
-  mock: true,
+  mock: false,
   local: false,
   youtube_music_experimental: true,
   jiosaavn_experimental: false,
@@ -31,6 +33,7 @@ export const useSettingsStore = create<SettingsStore>()(
       themeId: "midnight",
       accentOverride: undefined,
       providerStates,
+      preferredHomeProvider: "youtube_music_experimental",
       audioQuality: "auto",
       toggleProvider: (provider) => {
         const next = !get().providerStates[provider];
@@ -42,6 +45,7 @@ export const useSettingsStore = create<SettingsStore>()(
           },
         });
       },
+      setPreferredHomeProvider: (preferredHomeProvider) => set({ preferredHomeProvider }),
       setTheme: (themeId) => set({ themeId }),
       setAccentOverride: (accentOverride) => set({ accentOverride }),
       setAudioQuality: (audioQuality) => set({ audioQuality }),

@@ -1,4 +1,5 @@
 import type { MusicProvider } from "@/types/source";
+import type { ArtworkLike } from "@/types/artwork";
 
 export type TrackQuality = "low" | "medium" | "high" | "lossless" | "unknown";
 
@@ -19,7 +20,7 @@ export type Track = {
   artist: string;
   artists?: string[];
   album?: string;
-  artwork?: string;
+  artwork?: ArtworkLike;
   duration?: number;
   streamUrl?: string;
   sourceUrl?: string;

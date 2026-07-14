@@ -2,8 +2,10 @@ import type { MusicSource } from "@/modules/sources/MusicSource";
 import { pipedYouTubeClient } from "@/modules/sources/PipedYouTubeClient";
 import type { ImportResult } from "@/modules/sources/sourceModels";
 import { buildScopedTrackId } from "@/modules/sources/sourceUtils";
+import { fetchYouTubeMusicHomeSections } from "@/modules/sources/youtube/musicHome";
 import { youtubeResolver } from "@/modules/sources/youtube/resolver";
 import { extractYouTubePlaylistId, extractYouTubeVideoId, isYouTubeUrl } from "@/modules/sources/youtubeUrl";
+import type { HomeSection } from "@/types/home";
 import type { StreamSource, Track } from "@/types/track";
 import { SourceUnavailableError } from "@/utils/errors";
 
@@ -134,6 +136,10 @@ export class ExperimentalYouTubeMusicSource implements MusicSource {
   async getRelated(track: Track): Promise<Track[]> {
     void track;
     return [];
+  }
+
+  async getHomeSections(): Promise<HomeSection[]> {
+    return fetchYouTubeMusicHomeSections();
   }
 
   async getLyrics(_track: Track) {

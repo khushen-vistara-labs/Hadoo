@@ -8,6 +8,7 @@ import { extractScopedLocalId, isProbablyUrl, selectPreferredStream } from "@/mo
 import { logger } from "@/services/logger";
 import type { AudioQualityPreference, MusicProvider, ProviderStatus } from "@/types/source";
 import type { ImportResult } from "@/modules/sources/sourceModels";
+import type { HomeSection } from "@/types/home";
 import type { StreamResult, Track } from "@/types/track";
 import { SourceUnavailableError, StreamResolveError } from "@/utils/errors";
 
@@ -167,6 +168,36 @@ export class SourceRegistry {
       return [];
     }
     return source.getRelated(track);
+  }
+
+  async getHomeSections(preferredProvider?: MusicProvider): Promise<HomeSection[]> {
+    const orderedProviders = preferredProvider
+      ? [preferredProvider, ...[...this.enabled].filter((provider) => provider !== preferredProvider)]
+      : [...this.enabled];
+    let lastError: unknown;
+
+    for (const provider of orderedProviders) {
+      const source = this.sources.get(provider);
+      if (!source?.getHomeSections) {
+        continue;
+      }
+
+      try {
+        const sections = await source.getHomeSections();
+        if (sections.length) {
+          return sections;
+        }
+      } catch (error) {
+        lastError = error;
+        logger.warn("Provider home load failed", provider, error);
+      }
+    }
+
+    if (lastError) {
+      throw lastError;
+    }
+
+    return [];
   }
 }
 

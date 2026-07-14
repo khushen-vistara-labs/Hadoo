@@ -1,10 +1,12 @@
 import type { LyricLine, StreamSource, Track } from "@/types/track";
+import type { ArtworkLike } from "@/types/artwork";
+import type { HomeSection } from "@/types/home";
 
 export type ImportedCollection = {
   id: string;
   title: string;
   sourceUrl: string;
-  artwork?: string;
+  artwork?: ArtworkLike;
 };
 
 export type ImportResult = {
@@ -27,7 +29,11 @@ export interface CollectionImporter {
   importFromUrl(url: string): Promise<ImportResult>;
 }
 
-export type SourceCapabilities = Partial<UrlTrackResolver & StreamProvider & CollectionImporter> & {
+export interface HomeContentProvider {
+  getHomeSections?(): Promise<HomeSection[]>;
+}
+
+export type SourceCapabilities = Partial<UrlTrackResolver & StreamProvider & CollectionImporter & HomeContentProvider> & {
   getLyrics?(track: Track): Promise<LyricLine[]>;
   getRelated?(track: Track): Promise<Track[]>;
 };

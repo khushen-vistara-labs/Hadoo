@@ -11,6 +11,7 @@ import { setupTrackPlayer } from "@/modules/player/trackPlayerSetup";
 import { useSettingsStore } from "@/modules/settings/settingsStore";
 import { sourceRegistry } from "@/modules/sources/SourceRegistry";
 import { logger } from "@/services/logger";
+import { getPreferredArtworkUrl } from "@/utils/artwork";
 import type { RepeatMode } from "@/types/player";
 import type { Track } from "@/types/track";
 import { StreamResolveError } from "@/utils/errors";
@@ -22,6 +23,8 @@ const repeatMap: Record<RepeatMode, NativeRepeatMode> = {
 };
 
 let listenersAttached = false;
+
+const MIN_RESUME_PROGRESS_SECONDS = 15;
 
 const shouldFireEndOfTrackTimer = (event: {
   index?: number;
@@ -38,6 +41,20 @@ const shouldFireEndOfTrackTimer = (event: {
 };
 
 export const playerService = {
+  syncResumeSession() {
+    const { currentTrack, progress, duration } = usePlayerStore.getState();
+    if (!currentTrack || progress < MIN_RESUME_PROGRESS_SECONDS) {
+      return;
+    }
+
+    useLibraryStore.getState().updateResumeSession({
+      track: currentTrack,
+      position: progress,
+      duration: duration || currentTrack.duration || 0,
+      updatedAt: Date.now(),
+    });
+  },
+
   async setup() {
     await setupTrackPlayer();
     if (!listenersAttached) {
@@ -55,6 +72,7 @@ export const playerService = {
       });
       TrackPlayer.addEventListener(Event.PlaybackProgressUpdated, async (event) => {
         usePlayerStore.getState().setProgress(event.position, event.duration);
+        playerService.syncResumeSession();
         const expiresAt = useSleepTimerStore.getState().expiresAt;
         if (expiresAt != null && Date.now() >= expiresAt) {
           await playerService.stopForSleepTimer();
@@ -108,7 +126,7 @@ export const playerService = {
           url: stream.url,
           title: queueTrack.title,
           artist: queueTrack.artist,
-          artwork: queueTrack.artwork,
+          artwork: getPreferredArtworkUrl(queueTrack.artwork, "fullscreen"),
           album: queueTrack.album,
           duration: queueTrack.duration,
           headers: stream.headers,
@@ -139,6 +157,12 @@ export const playerService = {
       usePlayerStore.getState().setProgress(0, track.duration ?? 0);
       usePlayerStore.getState().setError(undefined);
       useLibraryStore.getState().addRecent(track);
+      useLibraryStore.getState().updateResumeSession({
+        track,
+        position: 0,
+        duration: track.duration ?? 0,
+        updatedAt: Date.now(),
+      });
     } catch (error) {
       logger.error("Failed to play track", error);
       const message =
@@ -150,9 +174,17 @@ export const playerService = {
     }
   },
 
+  async resumeStoredTrack(track: Track, position: number) {
+    await this.playTrack(track, [track]);
+    if (position > 0) {
+      await this.seek(position);
+    }
+  },
+
   async pause() {
     await TrackPlayer.pause();
     usePlayerStore.getState().setPlaying(false);
+    this.syncResumeSession();
   },
 
   async stopForSleepTimer() {
@@ -162,6 +194,7 @@ export const playerService = {
   },
 
   async dismissMiniPlayer() {
+    this.syncResumeSession();
     await TrackPlayer.reset();
     usePlayerStore.getState().reset();
     useSleepTimerStore.getState().clearTimer();
@@ -186,6 +219,7 @@ export const playerService = {
     await TrackPlayer.seekTo(position);
     const duration = usePlayerStore.getState().duration;
     usePlayerStore.getState().setProgress(position, duration);
+    this.syncResumeSession();
   },
 
   async toggleRepeat() {
@@ -218,6 +252,11 @@ export const playerService = {
     }
 
     const queue = usePlayerStore.getState().queue;
-    usePlayerStore.getState().setCurrentTrack(queue[activeIndex] ?? null);
+    const currentTrack = queue[activeIndex] ?? null;
+    usePlayerStore.getState().setCurrentTrack(currentTrack);
+    if (currentTrack) {
+      useLibraryStore.getState().addRecent(currentTrack);
+      playerService.syncResumeSession();
+    }
   },
 };

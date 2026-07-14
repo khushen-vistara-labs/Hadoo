@@ -1,24 +1,59 @@
 import { Tabs } from "expo-router";
+import { StyleSheet, View } from "react-native";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { SymbolIcon } from "@/components/ui/SymbolIcon";
 import { useTheme } from "@/hooks/useTheme";
 
 export default function TabsLayout() {
   const theme = useTheme();
+  const insets = useSafeAreaInsets();
+  const bottomInset = Math.max(insets.bottom, 8);
+  const tabBarHeight = 56 + bottomInset;
 
   return (
     <Tabs
       screenOptions={{
         headerShown: false,
+        tabBarShowLabel: false,
         tabBarStyle: {
-          backgroundColor: theme.surface,
+          position: "absolute",
+          left: 16,
+          right: 16,
+          bottom: 14,
+          height: tabBarHeight,
+          paddingBottom: bottomInset,
+          paddingTop: 8,
+          paddingHorizontal: 10,
           borderTopColor: theme.border,
-          height: 72,
-          paddingBottom: 10,
-          paddingTop: 10,
+          backgroundColor: theme.surface,
+          borderRadius: 28,
+          borderWidth: 1,
+          elevation: 10,
+          shadowColor: "#000",
+          shadowOpacity: 0.22,
+          shadowRadius: 24,
+          shadowOffset: {
+            width: 0,
+            height: 10,
+          },
         },
         tabBarActiveTintColor: theme.accent,
         tabBarInactiveTintColor: theme.textMuted,
+        tabBarItemStyle: {
+          height: 48,
+          borderRadius: 18,
+          justifyContent: "center",
+          alignItems: "center",
+          paddingVertical: 0,
+          paddingBottom: 0,
+          paddingTop: 0,
+        },
+        tabBarIconStyle: {
+          marginBottom: 0,
+          marginTop: 0,
+        },
+        tabBarBackground: () => <View style={[StyleSheet.absoluteFill, styles.tabBarBackground]} />,
       }}
     >
       <Tabs.Screen
@@ -52,3 +87,10 @@ export default function TabsLayout() {
     </Tabs>
   );
 }
+
+const styles = StyleSheet.create({
+  tabBarBackground: {
+    borderRadius: 28,
+    overflow: "hidden",
+  },
+});
