@@ -8,7 +8,7 @@ export default function QueueScreen() {
   const player = usePlayer();
 
   return (
-    <Screen>
+    <Screen contentContainerStyle={{ paddingBottom: 132 }}>
       <Text variant="title">Queue</Text>
       {player.queue.map((track) => (
         <TrackRow key={track.id} track={track} onPress={() => playerService.playTrack(track, player.queue)} />
