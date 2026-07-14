@@ -1,7 +1,6 @@
 import { create } from "zustand";
 import { createJSONStorage, persist } from "zustand/middleware";
 
-import { mockPlaylists } from "@/data/mockPlaylists";
 import { appStorage } from "@/store/persistence";
 import type { Playlist } from "@/types/playlist";
 import type { Track } from "@/types/track";
@@ -15,7 +14,7 @@ type PlaylistStore = {
 export const usePlaylistStore = create<PlaylistStore>()(
   persist(
     (set, get) => ({
-      playlists: mockPlaylists,
+      playlists: [],
       addTrackToPlaylist: (playlistId, track) => {
         set({
           playlists: get().playlists.map((playlist) =>

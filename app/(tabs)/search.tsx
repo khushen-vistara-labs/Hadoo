@@ -14,14 +14,13 @@ import type { ProviderFilter } from "@/types/source";
 
 const filters: { id: ProviderFilter; label: string }[] = [
   { id: "all", label: "All" },
-  { id: "mock", label: "Mock" },
   { id: "youtube_music_experimental", label: "YouTube" },
   { id: "jiosaavn_experimental", label: "JioSaavn Experimental" },
   { id: "local", label: "Local" },
 ];
 
 export default function SearchScreen() {
-  const [query, setQuery] = useState("solar");
+  const [query, setQuery] = useState("");
   const [provider, setProvider] = useState<ProviderFilter>("all");
   const theme = useTheme();
   const { data, isLoading, isError } = useSourceSearch(query, provider);

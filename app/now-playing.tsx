@@ -1,9 +1,10 @@
 import { LinearGradient } from "expo-linear-gradient";
 import { router } from "expo-router";
-import { Image, Pressable, ScrollView, StyleSheet, View, useWindowDimensions } from "react-native";
+import { Pressable, ScrollView, StyleSheet, View, useWindowDimensions } from "react-native";
 import { useMemo, useState } from "react";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
+import { CachedArtwork } from "@/components/artwork/CachedArtwork";
 import { ProgressBar } from "@/components/ui/ProgressBar";
 import { Screen } from "@/components/ui/Screen";
 import { SymbolIcon } from "@/components/ui/SymbolIcon";
@@ -143,11 +144,15 @@ export default function NowPlayingScreen() {
                     { backgroundColor: theme.card, borderRadius: artworkRadius },
                   ]}
                 >
-                  {player.currentTrack?.artwork ? (
-                    <Image source={{ uri: player.currentTrack.artwork }} style={styles.artwork} resizeMode="cover" />
-                  ) : (
-                    <View style={[styles.artwork, { backgroundColor: theme.card }]} />
-                  )}
+                  <CachedArtwork
+                    artwork={player.currentTrack?.artwork}
+                    category="album"
+                    variant="fullscreen"
+                    fit="contain"
+                    width={artworkSize - artworkInset * 2}
+                    height={artworkSize - artworkInset * 2}
+                    borderRadius={artworkRadius}
+                  />
                 </View>
               </LinearGradient>
             </View>
@@ -320,7 +325,14 @@ export default function NowPlayingScreen() {
                 <View style={styles.menuHeader}>
                   <View style={styles.menuArtworkWrap}>
                     {player.currentTrack?.artwork ? (
-                      <Image source={{ uri: player.currentTrack.artwork }} style={styles.menuArtwork} resizeMode="cover" />
+                    <CachedArtwork
+                      artwork={player.currentTrack.artwork}
+                      category="track"
+                      variant="thumbnail"
+                      width={48}
+                      height={48}
+                      borderRadius={14}
+                    />
                     ) : (
                       <View style={[styles.menuArtwork, { backgroundColor: theme.surface }]} />
                     )}

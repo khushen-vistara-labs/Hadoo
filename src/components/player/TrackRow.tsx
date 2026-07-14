@@ -1,5 +1,6 @@
-import { Image, Pressable, StyleSheet, View } from "react-native";
+import { Pressable, StyleSheet, View } from "react-native";
 
+import { CachedArtwork } from "@/components/artwork/CachedArtwork";
 import { providerLabels } from "@/constants/providers";
 import { useTheme } from "@/hooks/useTheme";
 import { Text } from "@/components/ui/Text";
@@ -25,11 +26,7 @@ export const TrackRow = ({ track, onPress }: Props) => {
         },
       ]}
     >
-      {track.artwork ? (
-        <Image source={{ uri: track.artwork }} style={styles.artwork} />
-      ) : (
-        <View style={[styles.artwork, { backgroundColor: theme.surfaceAlt }]} />
-      )}
+      <CachedArtwork artwork={track.artwork} category="track" variant="thumbnail" width={50} height={50} borderRadius={14} />
       <View style={styles.meta}>
         <Text numberOfLines={1}>{track.title}</Text>
         <Text muted numberOfLines={1}>

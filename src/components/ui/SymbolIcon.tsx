@@ -5,6 +5,9 @@ type SymbolName =
   | "search"
   | "library"
   | "settings"
+  | "time"
+  | "folder"
+  | "disc"
   | "play"
   | "pause"
   | "back"
@@ -40,6 +43,9 @@ const glyphs: Record<SymbolName, keyof typeof Ionicons.glyphMap> = {
   search: "search",
   library: "library",
   settings: "settings",
+  time: "time-outline",
+  folder: "folder-open-outline",
+  disc: "disc-outline",
   play: "play",
   pause: "pause",
   back: "play-skip-back",
