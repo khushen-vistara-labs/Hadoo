@@ -43,6 +43,10 @@ If your phone is already connected by USB and developer options are enabled, tha
 
 Detailed device setup and troubleshooting lives in [docs/running-on-android-device.md](/Users/icemonkey/code/Hadoo/docs/running-on-android-device.md).
 
+## Contributing
+
+Contributor requirements for commit messages, PR titles, PR template sections, required checks, and code owners are documented in [CONTRIBUTING.md](/Users/icemonkey/code/Hadoo/CONTRIBUTING.md).
+
 ## Notes
 
 - This project targets Expo development builds, not Expo Go.
