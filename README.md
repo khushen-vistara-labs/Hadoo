@@ -1,6 +1,6 @@
 # Hadoo
 
-Private personal-use music app scaffold built with Expo development builds, React Native, TypeScript, Expo Router, Zustand, TanStack Query, AsyncStorage persistence, and a modular source-provider architecture.
+Personal music app for searching, organizing, and playing tracks across modular source providers, built with Expo development builds, React Native, TypeScript, Expo Router, Zustand, TanStack Query, and AsyncStorage persistence.
 
 ## Run
 
