@@ -8,8 +8,8 @@ import { Screen } from "@/components/ui/Screen";
 import { SymbolIcon } from "@/components/ui/SymbolIcon";
 import { Text } from "@/components/ui/Text";
 import { providerLabels } from "@/constants/providers";
-import { useHomeSections } from "@/hooks/useHomeSections";
 import { usePlayer } from "@/hooks/usePlayer";
+import { usePersonalizedHome } from "@/hooks/usePersonalizedHome";
 import { useTheme } from "@/hooks/useTheme";
 import { useLibraryStore } from "@/modules/library/libraryStore";
 import { playerService } from "@/modules/player/playerService";
@@ -44,7 +44,7 @@ type ContinueCardData = {
 
 type QuickAction = {
   id: string;
-  icon: "moon" | "folder" | "download" | "settings";
+  icon: "moon" | "download" | "settings";
   label: string;
   subtitle: string;
   onPress: () => void;
@@ -58,10 +58,6 @@ const chunkTracks = (tracks: Track[], size: number) => {
   return chunks;
 };
 
-const findRecommendationSection = (sections: HomeSection[]) =>
-  sections.find((section) => /recommend|mix|quick picks|listen again|for you/i.test(section.title)) ??
-  sections.find((section) => section.items.length > 0);
-
 const buildPlayableQueue = (section: HomeSection) =>
   section.items.map((item) => item.track).filter(Boolean) as Track[];
 
@@ -73,7 +69,7 @@ export default function HomeScreen() {
   const likedSongs = useLibraryStore((state) => state.likedSongs);
   const providerStates = useSettingsStore((state) => state.providerStates);
   const [refreshing, setRefreshing] = useState(false);
-  const homeQuery = useHomeSections();
+  const personalizedHome = usePersonalizedHome();
 
   const providerHealth = useMemo(
     () =>
@@ -93,12 +89,15 @@ export default function HomeScreen() {
   const continueRatio =
     continueDuration > 0 ? Math.min(Math.max(continueProgress / continueDuration, 0), 1) : 0;
 
-  const providerSections = useMemo(() => homeQuery.data ?? [], [homeQuery.data]);
-  const recommendationSection = findRecommendationSection(providerSections);
+  const providerSections = useMemo(
+    () => personalizedHome.recommendationResult.rankedProviderSections,
+    [personalizedHome.recommendationResult.rankedProviderSections],
+  );
+  const recommendationSection = personalizedHome.recommendationResult.primarySection;
   const recentColumns = chunkTracks(recentlyPlayed.slice(0, 9), 3);
   const recommendationTracks = recommendationSection ? buildPlayableQueue(recommendationSection) : [];
   const recommendationColumns = chunkTracks(recommendationTracks.slice(0, 9), 3);
-  const dynamicSections = providerSections.filter((section) => section.id !== recommendationSection?.id).slice(0, 4);
+  const dynamicSections = providerSections.slice(0, 4);
 
   const playMediaItem = (item: MediaItem, section: HomeSection) => {
     if (item.track) {
@@ -143,7 +142,7 @@ export default function HomeScreen() {
 
       slides.push({
         id: `provider-${section.id}-${leadItem.id}`,
-        eyebrow: index === 0 ? "Featured from Provider" : section.title,
+        eyebrow: index === 0 ? "Taste-ranked provider shelf" : section.title,
         title: leadItem.title,
         subtitle: leadItem.subtitle ?? section.subtitle ?? providerLabels[section.provider],
         artwork: leadItem.artwork,
@@ -180,13 +179,6 @@ export default function HomeScreen() {
       onPress: () => router.push("/sleep-timer"),
     },
     {
-      id: "local",
-      icon: "folder",
-      label: "Local Songs",
-      subtitle: "Library entry point",
-      onPress: () => router.push("/library"),
-    },
-    {
       id: "downloads",
       icon: "download",
       label: "Downloads",
@@ -205,7 +197,12 @@ export default function HomeScreen() {
   const handleRefresh = async () => {
     setRefreshing(true);
     try {
-      await Promise.all([playerService.syncState(), playerService.syncCurrentTrack(), homeQuery.refetch()]);
+      await Promise.all([
+        playerService.syncState(),
+        playerService.syncCurrentTrack(),
+        personalizedHome.providerQuery.refetch(),
+        personalizedHome.seedQuery.refetch(),
+      ]);
     } finally {
       setRefreshing(false);
     }
@@ -229,6 +226,44 @@ export default function HomeScreen() {
 
         <QuickActionRow actions={quickActions} />
 
+        <TrackListRail
+          title="Recently Played"
+          subtitle="Resume from your local history."
+          columns={recentColumns}
+          emptyTitle="No recent playback yet"
+          emptyBody="Once you play real tracks, this shelf becomes your instant resume area."
+        />
+
+        {recommendationSection ? (
+          recommendationSection.cardType === "track_list" && recommendationTracks.length ? (
+            <TrackListRail
+              title={recommendationSection.title}
+              subtitle={recommendationSection.subtitle ?? personalizedHome.recommendationResult.rationale}
+              columns={recommendationColumns}
+              loading={personalizedHome.providerQuery.isLoading || personalizedHome.seedQuery.isLoading}
+              emptyTitle="Still shaping your recommendations"
+              emptyBody="We loaded your profile, but the providers did not expose enough playable matches yet."
+            />
+          ) : (
+            <MediaRail section={recommendationSection} onPressItem={(item) => playMediaItem(item, recommendationSection)} />
+          )
+        ) : (
+          <TrackListRail
+            title="Recommended For You"
+            subtitle={personalizedHome.recommendationResult.rationale}
+            columns={[]}
+            loading={personalizedHome.providerQuery.isLoading || personalizedHome.seedQuery.isLoading}
+            emptyTitle={
+              personalizedHome.providerQuery.isError ? "Could not load provider recommendations" : "No personalized matches yet"
+            }
+            emptyBody={
+              personalizedHome.providerQuery.isError
+                ? "The active provider homepage request failed. Check source settings or pull to refresh."
+                : "We will fall back to the strongest provider shelves until your profile and history have more to work with."
+            }
+          />
+        )}
+
         {heroSlides.length ? (
           <ScrollView
             horizontal
@@ -243,45 +278,6 @@ export default function HomeScreen() {
             ))}
           </ScrollView>
         ) : null}
-
-        <TrackListRail
-          title="Recently Played"
-          subtitle="Resume from your local history."
-          columns={recentColumns}
-          emptyTitle="No recent playback yet"
-          emptyBody="Once you play real tracks, this shelf becomes your instant resume area."
-        />
-
-        {recommendationSection ? (
-          recommendationSection.cardType === "track_list" && recommendationTracks.length ? (
-            <TrackListRail
-              title={recommendationSection.title}
-              subtitle={
-                recommendationSection.subtitle ??
-                "Pulled from your active home provider. YouTube Music is wired first; JioSaavn can plug into the same contract."
-              }
-              columns={recommendationColumns}
-              loading={homeQuery.isLoading}
-              emptyTitle="No playable recommendations in this shelf"
-              emptyBody="This provider shelf loaded, but it did not expose track items we can queue yet."
-            />
-          ) : (
-            <MediaRail section={recommendationSection} onPressItem={(item) => playMediaItem(item, recommendationSection)} />
-          )
-        ) : (
-          <TrackListRail
-            title="Recommended For You"
-            subtitle="Pulled from your active home provider. YouTube Music is wired first; JioSaavn can plug into the same contract."
-            columns={[]}
-            loading={homeQuery.isLoading}
-            emptyTitle={homeQuery.isError ? "Could not load provider recommendations" : "No provider recommendations yet"}
-            emptyBody={
-              homeQuery.isError
-                ? "The active provider homepage request failed. Check source settings or pull to refresh."
-                : "The provider returned no homepage shelves we could normalize."
-            }
-          />
-        )}
 
         {dynamicSections.map((section) =>
           section.cardType === "track_list" ? (
@@ -302,13 +298,6 @@ export default function HomeScreen() {
           title="Browse Your Space"
           subtitle="Pinned utility destinations from your own library."
           items={[
-            {
-              id: "local-space",
-              title: "Local Songs",
-              detail: "Ready for local library integration",
-              icon: "folder",
-              onPress: () => router.push("/library"),
-            },
             {
               id: "downloads-space",
               title: "Downloads",
@@ -567,7 +556,7 @@ const HorizontalInfoRail = ({
     id: string;
     title: string;
     detail: string;
-    icon: "folder" | "download" | "library";
+    icon: "download" | "library";
     onPress: () => void;
   }[];
 }) => {
