@@ -14,7 +14,7 @@ export default function SourceSettingsScreen() {
     <Screen>
       <Text variant="title">Source Settings</Text>
       <Card>
-        <Text muted>Experimental providers stay isolated so they can fail cleanly without taking the app down.</Text>
+        <Text muted>Experimental providers stay isolated so they can fail cleanly. Playback falls back through YouTube Music, then YouTube, when a stream-capable source cannot resolve.</Text>
       </Card>
       {statuses.map((status) => (
         <ProviderStatusRow

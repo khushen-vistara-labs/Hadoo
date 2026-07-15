@@ -174,7 +174,7 @@ export const playerService = {
     } catch (error) {
       logger.error("Failed to play track", error);
       const message =
-        track.provider === "youtube_music_experimental"
+        track.provider === "youtube_music_experimental" || track.provider === "youtube_experimental"
           ? "YouTube resolved a stream, but playback handoff failed."
           : "Could not play this track.";
       usePlayerStore.getState().setError(message);

@@ -1,10 +1,18 @@
 import { CachedMusicSource } from "@/modules/sources/CachedMusicSource";
 import { ExperimentalJioSaavnSource } from "@/modules/sources/ExperimentalJioSaavnSource";
+import { ExperimentalYouTubeSource } from "@/modules/sources/ExperimentalYouTubeSource";
 import { ExperimentalYouTubeMusicSource } from "@/modules/sources/ExperimentalYouTubeMusicSource";
 import { LocalFilesMusicSource } from "@/modules/sources/LocalFilesMusicSource";
 import type { MusicSource } from "@/modules/sources/MusicSource";
 import { MockMusicSource } from "@/modules/sources/MockMusicSource";
-import { extractScopedLocalId, isProbablyUrl, selectPreferredStream } from "@/modules/sources/sourceUtils";
+import { PlaceholderCatalogSource } from "@/modules/sources/PlaceholderCatalogSource";
+import {
+  buildTrackSearchQuery,
+  extractScopedLocalId,
+  findBestTrackCandidate,
+  isProbablyUrl,
+  selectPreferredStream,
+} from "@/modules/sources/sourceUtils";
 import { logger } from "@/services/logger";
 import type { AudioQualityPreference, MusicProvider, ProviderStatus } from "@/types/source";
 import type { ImportResult } from "@/modules/sources/sourceModels";
@@ -21,12 +29,19 @@ type ProviderHealth = {
 export class SourceRegistry {
   private sources = new Map<MusicProvider, MusicSource>();
   private enabled = new Set<MusicProvider>();
+  private playbackFallbackOrder: MusicProvider[] = ["youtube_music_experimental", "youtube_experimental"];
 
   constructor() {
     [
       new MockMusicSource(),
       new LocalFilesMusicSource(),
+      new ExperimentalYouTubeSource(),
       new ExperimentalYouTubeMusicSource(),
+      new PlaceholderCatalogSource({ id: "spotify_experimental", name: "Spotify Experimental" }),
+      new PlaceholderCatalogSource({ id: "soundcloud_experimental", name: "SoundCloud Experimental" }),
+      new PlaceholderCatalogSource({ id: "deezer_experimental", name: "Deezer Experimental" }),
+      new PlaceholderCatalogSource({ id: "tidal_experimental", name: "Tidal Experimental" }),
+      new PlaceholderCatalogSource({ id: "amazon_music_experimental", name: "Amazon Music Experimental" }),
       new ExperimentalJioSaavnSource(),
       new CachedMusicSource(),
     ].forEach((source) => this.register(source));
@@ -136,22 +151,43 @@ export class SourceRegistry {
     }
 
     const source = this.sources.get(track.provider);
-    if (!source) {
-      throw new SourceUnavailableError("This source is unavailable right now.");
+    const fallbackProviders = this.getPlaybackFallbackProviders(track.provider);
+    let lastError: unknown;
+
+    if (source?.getStreams) {
+      try {
+        const resolved = await this.resolveTrackStream(track, preference, source);
+        if (resolved) {
+          return resolved;
+        }
+      } catch (error) {
+        lastError = error;
+        logger.warn("Primary provider stream resolution failed", track.provider, error);
+      }
     }
 
-    const localId = extractScopedLocalId(track);
-    if (!localId || !source.getStreams) {
-      throw new StreamResolveError("This track cannot be resolved for playback.");
+    for (const provider of fallbackProviders) {
+      try {
+        const resolved = await this.resolveFallbackStream(track, provider, preference);
+        if (resolved) {
+          logger.info("Resolved playback through fallback provider", {
+            requestedProvider: track.provider,
+            fallbackProvider: provider,
+            title: track.title,
+          });
+          return resolved;
+        }
+      } catch (error) {
+        lastError = error;
+        logger.warn("Fallback provider stream resolution failed", provider, error);
+      }
     }
 
-    const streams = await source.getStreams(localId);
-    const selected = selectPreferredStream(streams, preference);
-    if (!selected) {
-      throw new StreamResolveError("No usable streams are available for this track.");
+    if (lastError instanceof Error) {
+      throw lastError;
     }
 
-    return selected;
+    throw new StreamResolveError("This track cannot be resolved for playback.");
   }
 
   async getLyrics(track: Track) {
@@ -198,6 +234,50 @@ export class SourceRegistry {
     }
 
     return [];
+  }
+
+  private getPlaybackFallbackProviders(origin: MusicProvider) {
+    return this.playbackFallbackOrder.filter(
+      (provider) => provider !== origin && this.enabled.has(provider) && this.sources.has(provider),
+    );
+  }
+
+  private async resolveTrackStream(
+    track: Track,
+    preference: AudioQualityPreference,
+    source: MusicSource,
+  ): Promise<StreamResult | undefined> {
+    const localId = extractScopedLocalId(track);
+    if (!localId || !source.getStreams) {
+      return undefined;
+    }
+
+    const streams = await source.getStreams(localId);
+    return selectPreferredStream(streams, preference);
+  }
+
+  private async resolveFallbackStream(
+    track: Track,
+    provider: MusicProvider,
+    preference: AudioQualityPreference,
+  ): Promise<StreamResult | undefined> {
+    const source = this.sources.get(provider);
+    if (!source?.search || !source.getStreams) {
+      return undefined;
+    }
+
+    const query = buildTrackSearchQuery(track);
+    if (!query) {
+      return undefined;
+    }
+
+    const candidates = await source.search(query);
+    const match = findBestTrackCandidate(track, candidates);
+    if (!match) {
+      return undefined;
+    }
+
+    return this.resolveTrackStream(match, preference, source);
   }
 }
 

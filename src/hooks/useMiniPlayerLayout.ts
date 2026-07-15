@@ -26,11 +26,14 @@ export const useMiniPlayerLayout = () => {
   const tabBarHeight = TAB_BAR_BASE_HEIGHT + bottomInset;
   const miniPlayerBottomOffset = isTabScreen ? TAB_SCREEN_PLAYER_BOTTOM_OFFSET : Math.max(insets.bottom + 16, 24);
   const miniPlayerHeight = isTabScreen ? TAB_SCREEN_PLAYER_HEIGHT : STACK_SCREEN_PLAYER_HEIGHT;
+  const tabScreenBaseSpacing = tabBarHeight + TAB_BAR_BOTTOM_GAP + 16;
   const contentBottomSpacing = isVisible
     ? isTabScreen
-      ? tabBarHeight + TAB_BAR_BOTTOM_GAP + miniPlayerHeight + 16
+      ? tabScreenBaseSpacing + miniPlayerHeight
       : miniPlayerBottomOffset + miniPlayerHeight + 16
-    : 0;
+    : isTabScreen
+      ? tabScreenBaseSpacing
+      : 0;
 
   return {
     isVisible,
