@@ -18,7 +18,8 @@ export const useMiniPlayerLayout = () => {
     pathname === "/" ||
     pathname.startsWith("/search") ||
     pathname.startsWith("/library") ||
-    pathname.startsWith("/settings");
+    pathname.startsWith("/settings") ||
+    pathname.startsWith("/playlist/");
   const isNowPlaying = pathname === "/now-playing";
   const isVisible = Boolean(currentTrack) && !isNowPlaying;
   const bottomInset = Math.max(insets.bottom, 8);

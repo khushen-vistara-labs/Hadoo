@@ -6,6 +6,8 @@ export type PlaybackSnapshot = {
   currentTrack: Track | null;
   queue: Track[];
   isPlaying: boolean;
+  isLoading: boolean;
+  loadingLabel?: string;
   progress: number;
   duration: number;
   shuffle: boolean;

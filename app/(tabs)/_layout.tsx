@@ -84,6 +84,12 @@ export default function TabsLayout() {
           tabBarIcon: ({ color, size }) => <SymbolIcon name="settings" color={color} size={size} />,
         }}
       />
+      <Tabs.Screen
+        name="playlist/[id]"
+        options={{
+          href: null,
+        }}
+      />
     </Tabs>
   );
 }

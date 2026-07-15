@@ -2,9 +2,14 @@ import type { MusicSource } from "@/modules/sources/MusicSource";
 import { pipedYouTubeClient } from "@/modules/sources/PipedYouTubeClient";
 import type { ImportResult } from "@/modules/sources/sourceModels";
 import { buildScopedTrackId } from "@/modules/sources/sourceUtils";
-import { fetchYouTubeMusicHomeSections } from "@/modules/sources/youtube/musicHome";
+import { fetchYouTubeMusicCollection, fetchYouTubeMusicHomeSections } from "@/modules/sources/youtube/musicHome";
 import { youtubeResolver } from "@/modules/sources/youtube/resolver";
-import { extractYouTubePlaylistId, extractYouTubeVideoId, isYouTubeUrl } from "@/modules/sources/youtubeUrl";
+import {
+  extractYouTubeBrowseId,
+  extractYouTubePlaylistId,
+  extractYouTubeVideoId,
+  isYouTubeUrl,
+} from "@/modules/sources/youtubeUrl";
 import type { HomeSection } from "@/types/home";
 import type { StreamSource, Track } from "@/types/track";
 import { SourceUnavailableError } from "@/utils/errors";
@@ -19,7 +24,7 @@ export class ExperimentalYouTubeMusicSource implements MusicSource {
   }
 
   canImportUrl(url: string) {
-    return Boolean(extractYouTubePlaylistId(url));
+    return Boolean(extractYouTubePlaylistId(url) || extractYouTubeBrowseId(url));
   }
 
   async search(query: string): Promise<Track[]> {
@@ -95,42 +100,47 @@ export class ExperimentalYouTubeMusicSource implements MusicSource {
 
   async importFromUrl(url: string): Promise<ImportResult> {
     const playlistId = extractYouTubePlaylistId(url);
-    if (!playlistId) {
-      throw new SourceUnavailableError("This YouTube collection link could not be parsed.");
+    if (playlistId) {
+      const payload = await pipedYouTubeClient.getPlaylist(playlistId);
+      const tracks = (payload.relatedStreams ?? [])
+        .map((item) => {
+          const localId = extractYouTubeVideoId(`https://www.youtube.com${item.url}`);
+          if (!localId) {
+            return undefined;
+          }
+
+          return {
+            id: buildScopedTrackId(this.id, localId),
+            provider: this.id,
+            localId,
+            title: item.title,
+            artist: item.uploader ?? "Unknown artist",
+            artists: item.uploader ? [item.uploader] : undefined,
+            artwork: item.thumbnail,
+            duration: item.duration,
+            sourceUrl: `https://www.youtube.com/watch?v=${localId}&list=${playlistId}`,
+            providerTrackId: localId,
+          } satisfies Track;
+        })
+        .filter(Boolean) as Track[];
+
+      return {
+        collection: {
+          id: `${this.id}::playlist::${playlistId}`,
+          title: payload.name,
+          sourceUrl: url,
+          artwork: payload.bannerUrl,
+        },
+        tracks,
+      };
     }
 
-    const payload = await pipedYouTubeClient.getPlaylist(playlistId);
-    const tracks = (payload.relatedStreams ?? [])
-      .map((item) => {
-        const localId = extractYouTubeVideoId(`https://www.youtube.com${item.url}`);
-        if (!localId) {
-          return undefined;
-        }
+    const browseId = extractYouTubeBrowseId(url);
+    if (browseId) {
+      return fetchYouTubeMusicCollection(browseId);
+    }
 
-        return {
-          id: buildScopedTrackId(this.id, localId),
-          provider: this.id,
-          localId,
-          title: item.title,
-          artist: item.uploader ?? "Unknown artist",
-          artists: item.uploader ? [item.uploader] : undefined,
-          artwork: item.thumbnail,
-          duration: item.duration,
-          sourceUrl: `https://www.youtube.com/watch?v=${localId}&list=${playlistId}`,
-          providerTrackId: localId,
-        } satisfies Track;
-      })
-      .filter(Boolean) as Track[];
-
-    return {
-      collection: {
-        id: `${this.id}::playlist::${playlistId}`,
-        title: payload.name,
-        sourceUrl: url,
-        artwork: payload.bannerUrl,
-      },
-      tracks,
-    };
+    throw new SourceUnavailableError("This YouTube collection link could not be parsed.");
   }
 
   async getRelated(track: Track): Promise<Track[]> {

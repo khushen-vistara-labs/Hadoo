@@ -57,3 +57,16 @@ export const extractYouTubePlaylistId = (value: string) => {
   const list = url.searchParams.get("list");
   return list?.trim() || undefined;
 };
+
+export const extractYouTubeBrowseId = (value: string) => {
+  const url = safeUrl(value);
+  if (!url || !YOUTUBE_HOSTS.has(url.hostname.toLowerCase())) {
+    return undefined;
+  }
+
+  const pathSegments = url.pathname.split("/").filter(Boolean);
+  const browseIndex = pathSegments.findIndex((segment) => segment === "browse");
+  const candidate = browseIndex >= 0 ? pathSegments[browseIndex + 1] : undefined;
+
+  return candidate?.trim() || undefined;
+};

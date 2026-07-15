@@ -3,6 +3,8 @@ import type { HomeSection, MediaItem } from "@/types/home";
 import type { Track } from "@/types/track";
 
 import { buildScopedTrackId } from "@/modules/sources/sourceUtils";
+import type { ImportResult } from "@/modules/sources/sourceModels";
+import { SourceUnavailableError } from "@/utils/errors";
 
 const YT_MUSIC_URL = "https://music.youtube.com";
 const YT_MUSIC_BROWSE_URL = `${YT_MUSIC_URL}/youtubei/v1/browse`;
@@ -18,6 +20,8 @@ type Run = {
   text?: string;
   navigationEndpoint?: Record<string, unknown>;
 };
+
+const DURATION_LABEL_PATTERN = /\b(?:(\d{1,2}):)?(\d{1,2}):(\d{2})\b/;
 
 const extractTextRuns = (value: unknown): string | undefined => {
   if (!value || typeof value !== "object") {
@@ -111,6 +115,45 @@ const extractRunsFromFlexColumn = (renderer: Record<string, unknown>) => {
     .filter(Boolean) as string[];
 };
 
+const parseDurationLabel = (value?: string) => {
+  if (!value) {
+    return undefined;
+  }
+
+  const match = value.match(DURATION_LABEL_PATTERN);
+  if (!match) {
+    return undefined;
+  }
+
+  const hours = Number(match[1] ?? 0);
+  const minutes = Number(match[2] ?? 0);
+  const seconds = Number(match[3] ?? 0);
+  return hours * 3600 + minutes * 60 + seconds;
+};
+
+const cleanMetadataText = (value?: string) => {
+  if (!value) {
+    return undefined;
+  }
+
+  const withoutDuration = value.replace(DURATION_LABEL_PATTERN, "");
+  const normalized = withoutDuration.replace(/\s*[•|]\s*/g, " • ").replace(/\s{2,}/g, " ").trim();
+  const trimmed = normalized.replace(/^[•|,\-\s]+|[•|,\-\s]+$/g, "").trim();
+  return trimmed || undefined;
+};
+
+const extractDurationFromRenderer = (renderer: Record<string, unknown>, runs: string[]) => {
+  const fixedColumns = Array.isArray(renderer.fixedColumns) ? renderer.fixedColumns : [];
+  const fixedTexts = fixedColumns
+    .map((column) => {
+      const inner = column as { musicResponsiveListItemFixedColumnRenderer?: { text?: unknown } };
+      return extractTextRuns(inner.musicResponsiveListItemFixedColumnRenderer?.text);
+    })
+    .filter(Boolean) as string[];
+
+  return [...fixedTexts, ...runs].map(parseDurationLabel).find((value) => value != null);
+};
+
 const deriveKindFromBrowseId = (browseId?: string): MediaItem["kind"] => {
   if (!browseId) {
     return "playlist";
@@ -145,6 +188,8 @@ const mapResponsiveListItem = (renderer: Record<string, unknown>): MediaItem | u
 
   const artwork = normalizeArtwork(renderer.thumbnail);
   if (videoId) {
+    const duration = extractDurationFromRenderer(renderer, runs);
+    const album = cleanMetadataText(runs[2]);
     const track: Track = {
       id: buildScopedTrackId("youtube_music_experimental", videoId),
       provider: "youtube_music_experimental",
@@ -153,8 +198,9 @@ const mapResponsiveListItem = (renderer: Record<string, unknown>): MediaItem | u
       title,
       artist: runs[1] ?? "Unknown artist",
       artists: runs[1] ? [runs[1]] : undefined,
-      album: runs[2],
+      album,
       artwork: artwork?.urlHigh ?? artwork?.url,
+      duration,
       sourceUrl: `https://music.youtube.com/watch?v=${videoId}`,
     };
 
@@ -266,6 +312,102 @@ const findSectionListContents = (payload: Record<string, unknown>) => {
     ?.contents ?? []) as unknown[];
 };
 
+const collectTrackMediaItems = (value: unknown): MediaItem[] => {
+  if (!value || typeof value !== "object") {
+    return [];
+  }
+
+  if (Array.isArray(value)) {
+    return value.flatMap(collectTrackMediaItems);
+  }
+
+  const record = value as {
+    musicResponsiveListItemRenderer?: Record<string, unknown>;
+    musicTwoRowItemRenderer?: Record<string, unknown>;
+  };
+  const mapped = mapShelfContentItem(record);
+  const nested = Object.values(record).flatMap(collectTrackMediaItems);
+
+  if (!mapped?.track) {
+    return nested;
+  }
+
+  return [mapped, ...nested];
+};
+
+const extractCollectionTitle = (payload: Record<string, unknown>) =>
+  extractTextRuns(
+    (payload.header as { musicDetailHeaderRenderer?: { title?: unknown } } | undefined)?.musicDetailHeaderRenderer?.title,
+  ) ??
+  extractTextRuns(
+    (payload.header as { musicEditablePlaylistDetailHeaderRenderer?: { title?: unknown } } | undefined)
+      ?.musicEditablePlaylistDetailHeaderRenderer?.title,
+  ) ??
+  extractTextRuns(
+    (payload.header as { musicResponsiveHeaderRenderer?: { title?: unknown } } | undefined)?.musicResponsiveHeaderRenderer
+      ?.title,
+  );
+
+const fetchBrowsePayload = async (browseId: string) => {
+  const response = await fetch(`${YT_MUSIC_BROWSE_URL}?prettyPrint=false`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "accept-language": "en-US,en;q=0.9",
+    },
+    body: JSON.stringify({
+      context: {
+        client: {
+          clientName: "WEB_REMIX",
+          clientVersion: DEFAULT_CLIENT_VERSION,
+          hl: "en",
+          gl: "US",
+        },
+        user: {},
+      },
+      browseId,
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`YouTube Music browse failed with ${response.status}`);
+  }
+
+  return (await response.json()) as Record<string, unknown>;
+};
+
+export const fetchYouTubeMusicCollection = async (browseId: string): Promise<ImportResult> => {
+  const payload = await fetchBrowsePayload(browseId);
+  const trackItems = collectTrackMediaItems(payload).filter((item, index, items) => {
+    if (!item.track) {
+      return false;
+    }
+
+    return items.findIndex((candidate) => candidate.track?.id === item.track?.id) === index;
+  });
+  const tracks = trackItems.map((item) => item.track).filter(Boolean) as Track[];
+  const title = extractCollectionTitle(payload) ?? browseId;
+  const artwork =
+    normalizeArtwork(payload.header) ??
+    normalizeArtwork(payload.background) ??
+    normalizeArtwork(payload.contents) ??
+    trackItems[0]?.artwork;
+
+  if (!tracks.length) {
+    throw new SourceUnavailableError("This YouTube Music collection did not contain any playable tracks.");
+  }
+
+  return {
+    collection: {
+      id: `youtube_music_experimental::browse::${browseId}`,
+      title,
+      sourceUrl: `${YT_MUSIC_URL}/browse/${browseId}`,
+      artwork,
+    },
+    tracks,
+  };
+};
+
 const extractContinuationToken = (renderer: Record<string, unknown>) => {
   const continuations =
     (renderer.continuations as {
@@ -317,31 +459,7 @@ const mapShelf = (renderer: Record<string, unknown>, index: number): HomeSection
 };
 
 export const fetchYouTubeMusicHomeSections = async (): Promise<HomeSection[]> => {
-  const response = await fetch(`${YT_MUSIC_BROWSE_URL}?prettyPrint=false`, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "accept-language": "en-US,en;q=0.9",
-    },
-    body: JSON.stringify({
-      context: {
-        client: {
-          clientName: "WEB_REMIX",
-          clientVersion: DEFAULT_CLIENT_VERSION,
-          hl: "en",
-          gl: "US",
-        },
-        user: {},
-      },
-      browseId: "FEmusic_home",
-    }),
-  });
-
-  if (!response.ok) {
-    throw new Error(`YouTube Music browse failed with ${response.status}`);
-  }
-
-  const payload = (await response.json()) as Record<string, unknown>;
+  const payload = await fetchBrowsePayload("FEmusic_home");
   const sections = findSectionListContents(payload)
     .map((item, index) => {
       const renderer = item as {

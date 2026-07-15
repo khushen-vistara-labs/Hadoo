@@ -15,6 +15,7 @@ import { useMiniPlayerLayout } from "@/hooks/useMiniPlayerLayout";
 import { useTheme } from "@/hooks/useTheme";
 import { useTasteProfileStore } from "@/modules/recommendations/tasteProfileStore";
 import { sourceRegistry } from "@/modules/sources/SourceRegistry";
+import { navigationService } from "@/services/navigationService";
 import { useSettingsStore } from "@/modules/settings/settingsStore";
 
 const LANGUAGE_OPTIONS = [
@@ -234,7 +235,7 @@ export default function OnboardingScreen() {
               moods,
               eras,
             });
-            router.replace(isEditMode ? "/settings" : "/");
+            navigationService.replace(isEditMode ? "/settings" : "/", isEditMode ? "Saving profile…" : "Opening Discover…");
           }}
         >
           <LinearGradient
@@ -283,7 +284,7 @@ export default function OnboardingScreen() {
                 : "A short setup to make Discover feel personal from the start."}
             </Text>
           </View>
-          {isEditMode ? <Button label="Close" tone="secondary" onPress={() => router.replace("/settings")} /> : null}
+          {isEditMode ? <Button label="Close" tone="secondary" onPress={() => navigationService.replace("/settings", "Opening settings…")} /> : null}
         </View>
 
         <ProgressHeader

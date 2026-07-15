@@ -86,16 +86,24 @@ export const playerService = {
 
   async playTrack(track: Track, queue?: Track[]) {
     try {
+      usePlayerStore.getState().setLoading(true, "Loading track…");
       await this.setup();
       const nextQueue = queue ?? [track];
       const audioQuality = useSettingsStore.getState().audioQuality;
-      const resolvedQueue = await Promise.all(
+      const settledQueue = await Promise.allSettled(
         nextQueue.map(async (item) => ({
           track: item,
           stream: await sourceRegistry.getStreamUrl(item, audioQuality),
         })),
       );
+      const resolvedQueue = settledQueue
+        .filter((result): result is PromiseFulfilledResult<{ track: Track; stream: Awaited<ReturnType<typeof sourceRegistry.getStreamUrl>> }> => result.status === "fulfilled")
+        .map((result) => result.value);
       const selected = resolvedQueue.find((item) => item.track.id === track.id);
+
+      if (!selected) {
+        throw new StreamResolveError("Could not resolve this track for playback.");
+      }
 
       logger.info("Player: resolved queue", resolvedQueue.length);
       logger.info("Player: final resolved stream url", selected?.stream.url ?? "missing");
@@ -133,7 +141,7 @@ export const playerService = {
         })),
       );
       logger.info("Player: add success");
-      const index = nextQueue.findIndex((item) => item.id === track.id);
+      const index = resolvedQueue.findIndex((item) => item.track.id === track.id);
       if (index > 0) {
         logger.info("Player: skip start", index);
         await TrackPlayer.skip(index);
@@ -151,7 +159,7 @@ export const playerService = {
         })),
       );
       usePlayerStore.getState().setCurrentTrack(
-        resolvedQueue.find((item) => item.track.id === track.id)?.track ?? track,
+        selected.track,
       );
       usePlayerStore.getState().setPlaying(true);
       usePlayerStore.getState().setProgress(0, track.duration ?? 0);
@@ -171,6 +179,8 @@ export const playerService = {
           : "Could not play this track.";
       usePlayerStore.getState().setError(message);
       throw new StreamResolveError(message);
+    } finally {
+      usePlayerStore.getState().setLoading(false);
     }
   },
 
