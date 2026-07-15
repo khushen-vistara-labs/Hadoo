@@ -133,7 +133,7 @@ export default function PlayerSettingsScreen() {
               </View>
               <View style={styles.rowMeta}>
                 <Text>Equalizer</Text>
-                <Text muted>Placeholder for future advanced tuning.</Text>
+                <Text muted>More playback controls can live here.</Text>
               </View>
               <SymbolIcon name="forward" size={18} color={theme.textMuted} />
             </View>

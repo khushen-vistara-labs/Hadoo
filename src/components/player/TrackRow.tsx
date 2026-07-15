@@ -1,3 +1,4 @@
+import { memo } from "react";
 import { Pressable, StyleSheet, View } from "react-native";
 
 import { CachedArtwork } from "@/components/artwork/CachedArtwork";
@@ -12,7 +13,7 @@ type Props = {
   onPress: () => void;
 };
 
-export const TrackRow = ({ track, onPress }: Props) => {
+export const TrackRow = memo(({ track, onPress }: Props) => {
   const theme = useTheme();
 
   return (
@@ -41,7 +42,9 @@ export const TrackRow = ({ track, onPress }: Props) => {
       </View>
     </Pressable>
   );
-};
+});
+
+TrackRow.displayName = "TrackRow";
 
 const styles = StyleSheet.create({
   row: {

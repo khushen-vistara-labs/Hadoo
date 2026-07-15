@@ -11,6 +11,7 @@ import { SelectableArtistChips } from "@/components/onboarding/SelectableArtistC
 import { Button } from "@/components/ui/Button";
 import { Screen } from "@/components/ui/Screen";
 import { Text } from "@/components/ui/Text";
+import { useMiniPlayerLayout } from "@/hooks/useMiniPlayerLayout";
 import { useTheme } from "@/hooks/useTheme";
 import { useTasteProfileStore } from "@/modules/recommendations/tasteProfileStore";
 import { sourceRegistry } from "@/modules/sources/SourceRegistry";
@@ -81,6 +82,7 @@ export default function OnboardingScreen() {
   const [debouncedArtistQuery, setDebouncedArtistQuery] = useState("");
   const isEditMode = mode === "edit";
   const activeArtistProvider = providerStates[preferredHomeProvider] ? preferredHomeProvider : "all";
+  const { contentBottomSpacing } = useMiniPlayerLayout();
 
   useEffect(() => {
     const timeout = setTimeout(() => {
@@ -115,7 +117,7 @@ export default function OnboardingScreen() {
         <OnboardingStepContainer
           eyebrow="Taste Profile"
           title="Languages first"
-          body="Choose the languages you want your home feed to lean on. You can change this later."
+          body="Choose the languages you want your home feed to lean on."
           ctaLabel="Next"
           onNext={() => setStepIndex(1)}
           disableNext={!languages.length}
@@ -216,7 +218,7 @@ export default function OnboardingScreen() {
     },
     {
       title: "Build your home feed",
-      subtitle: "Your first Discover view will use these selections immediately, then blend them with real listening behavior later.",
+      subtitle: "These picks shape your first recommendations, then give way to real listening over time.",
       content: (
         <OnboardingStepContainer
           eyebrow="Ready"
@@ -268,14 +270,17 @@ export default function OnboardingScreen() {
 
   return (
     <Screen scroll={false}>
-      <ScrollView contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
+      <ScrollView
+        contentContainerStyle={[styles.content, { paddingBottom: styles.content.paddingBottom + contentBottomSpacing }]}
+        showsVerticalScrollIndicator={false}
+      >
         <View style={styles.header}>
           <View style={styles.headerCopy}>
             <Text variant="title">{isEditMode ? "Edit Taste Profile" : "Make Discover yours"}</Text>
             <Text muted>
               {isEditMode
-                ? "Refresh your recommendation seed without touching themes or provider settings."
-                : "A short first-run setup so the homepage starts with your taste, not random shelves."}
+                ? "Update the signals that shape your recommendations."
+                : "A short setup to make Discover feel personal from the start."}
             </Text>
           </View>
           {isEditMode ? <Button label="Close" tone="secondary" onPress={() => router.replace("/settings")} /> : null}
@@ -290,7 +295,7 @@ export default function OnboardingScreen() {
 
         {steps[stepIndex].content}
 
-        {!isEditMode && stepIndex === 0 ? <Text muted style={styles.secondaryLink}>Theme settings stay exactly as they are.</Text> : null}
+        {!isEditMode && stepIndex === 0 ? <Text muted style={styles.secondaryLink}>You can change all of this later.</Text> : null}
       </ScrollView>
     </Screen>
   );

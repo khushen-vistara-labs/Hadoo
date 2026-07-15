@@ -2,6 +2,7 @@ import type { PropsWithChildren } from "react";
 import { ScrollView, StyleSheet, View, type StyleProp, type ViewStyle } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
+import { useMiniPlayerLayout } from "@/hooks/useMiniPlayerLayout";
 import { useTheme } from "@/hooks/useTheme";
 
 type ScreenProps = PropsWithChildren<{
@@ -11,8 +12,19 @@ type ScreenProps = PropsWithChildren<{
 
 export const Screen = ({ children, scroll = true, contentContainerStyle }: ScreenProps) => {
   const theme = useTheme();
+  const { contentBottomSpacing } = useMiniPlayerLayout();
+  const flattenedContentStyle = StyleSheet.flatten(contentContainerStyle) ?? {};
+  const { paddingBottom, ...restContentStyle } = flattenedContentStyle;
   const content = scroll ? (
-    <ScrollView contentContainerStyle={[styles.content, styles.scrollContent, contentContainerStyle]}>
+    <ScrollView
+      contentContainerStyle={[
+        styles.content,
+        restContentStyle,
+        {
+          paddingBottom: styles.scrollContent.paddingBottom + (typeof paddingBottom === "number" ? paddingBottom : 0) + contentBottomSpacing,
+        },
+      ]}
+    >
       {children}
     </ScrollView>
   ) : (

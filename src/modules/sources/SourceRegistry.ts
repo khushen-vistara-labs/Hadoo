@@ -137,7 +137,7 @@ export class SourceRegistry {
 
     const source = this.sources.get(track.provider);
     if (!source) {
-      throw new SourceUnavailableError("This source is currently unavailable.");
+      throw new SourceUnavailableError("This source is unavailable right now.");
     }
 
     const localId = extractScopedLocalId(track);
@@ -157,7 +157,7 @@ export class SourceRegistry {
   async getLyrics(track: Track) {
     const source = this.sources.get(track.provider);
     if (!source?.getLyrics) {
-      return [{ text: "Lyrics are not available for this source yet." }];
+      return [{ text: "Lyrics are not available for this source." }];
     }
     return source.getLyrics(track);
   }
