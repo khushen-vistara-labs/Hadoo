@@ -1,4 +1,3 @@
-import { router } from "expo-router";
 import { LinearGradient } from "expo-linear-gradient";
 import { useMemo, useState } from "react";
 import { Pressable, RefreshControl, ScrollView, StyleSheet, View } from "react-native";
@@ -18,11 +17,13 @@ import { playerService } from "@/modules/player/playerService";
 import { usePlaylistStore } from "@/modules/playlists/playlistStore";
 import { sourceRegistry } from "@/modules/sources/SourceRegistry";
 import { useSettingsStore } from "@/modules/settings/settingsStore";
+import { navigationService } from "@/services/navigationService";
 import { toastService } from "@/services/toastService";
 import type { ArtworkLike } from "@/types/artwork";
 import type { HomeSection, MediaItem } from "@/types/home";
 import type { MusicProvider } from "@/types/source";
 import type { Track } from "@/types/track";
+import { formatCount } from "@/utils/formatCount";
 import { formatDuration } from "@/utils/formatDuration";
 
 type HeroSlide = {
@@ -63,6 +64,28 @@ const chunkTracks = (tracks: Track[], size: number) => {
 
 const buildPlayableQueue = (section: HomeSection) =>
   section.items.map((item) => item.track).filter(Boolean) as Track[];
+
+const buildCollectionRoute = (item: MediaItem) => {
+  const sourceUrl =
+    item.sourceUrl ??
+    (item.playlistId ? `https://music.youtube.com/playlist?list=${item.playlistId}` : undefined) ??
+    (item.browseId ? `https://music.youtube.com/browse/${item.browseId}` : undefined);
+
+  if (!sourceUrl) {
+    return undefined;
+  }
+
+  return {
+    pathname: "/playlist/[id]" as const,
+    params: {
+      id: item.id,
+      sourceUrl,
+      provider: item.provider,
+      title: item.title,
+      subtitle: item.subtitle,
+    },
+  };
+};
 
 export default function HomeScreen() {
   const theme = useTheme();
@@ -112,7 +135,13 @@ export default function HomeScreen() {
       return;
     }
 
-    toastService.show("Collection views are not available yet.");
+    const route = buildCollectionRoute(item);
+    if (route) {
+      navigationService.push(route, "Opening collection…");
+      return;
+    }
+
+    toastService.show("This collection cannot be opened yet.");
   };
 
   const continueCard = useMemo<ContinueCardData | undefined>(() => {
@@ -128,7 +157,7 @@ export default function HomeScreen() {
       progress: continueRatio,
       onPress: () => {
         if (currentTrack) {
-          router.push("/now-playing");
+          navigationService.push("/now-playing", "Opening player…");
           return;
         }
 
@@ -162,10 +191,10 @@ export default function HomeScreen() {
         id: "library-fallback",
         eyebrow: "Library",
         title: "Liked Songs",
-        subtitle: `${likedSongs.length} saved tracks.`,
+        subtitle: `${formatCount(likedSongs.length, "saved track")}.`,
         artwork: likedSongs[0]?.artwork ?? recentlyPlayed[0]?.artwork,
         cta: "Open",
-        onPress: () => router.push("/library"),
+        onPress: () => navigationService.push("/library", "Opening library…"),
       });
     }
 
@@ -181,19 +210,19 @@ export default function HomeScreen() {
       id: "sleep",
       icon: "moon",
       label: "Sleep Timer",
-      onPress: () => router.push("/sleep-timer"),
+      onPress: () => navigationService.push("/sleep-timer", "Opening sleep timer…"),
     },
     {
       id: "downloads",
       icon: "download",
       label: "Downloads",
-      onPress: () => router.push("/library"),
+      onPress: () => navigationService.push("/library", "Opening library…"),
     },
     {
       id: "sources",
       icon: "settings",
       label: "Sources",
-      onPress: () => router.push("/source-settings"),
+      onPress: () => navigationService.push("/source-settings", "Opening sources…"),
     },
   ];
 
@@ -304,20 +333,20 @@ export default function HomeScreen() {
               title: "Playlists",
               detail: `${playlists.length} ${playlists.length === 1 ? "playlist" : "playlists"}`,
               icon: "list",
-              onPress: () => router.push("/library"),
+              onPress: () => navigationService.push("/library", "Opening library…"),
             },
             {
               id: "downloads-space",
               title: "Downloads",
               icon: "download",
-              onPress: () => router.push("/library"),
+              onPress: () => navigationService.push("/library", "Opening library…"),
             },
             {
               id: "liked-space",
               title: "Liked Songs",
-              detail: `${likedSongs.length} saved tracks`,
+              detail: formatCount(likedSongs.length, "saved track"),
               icon: "library",
-              onPress: () => router.push("/library"),
+              onPress: () => navigationService.push("/library", "Opening library…"),
             },
           ]}
         />
@@ -347,7 +376,7 @@ const TopDiscoverBar = ({ warningCount }: { warningCount: number }) => {
       <View style={styles.topBarActions}>
         <Pressable
           style={[styles.topIconButton, { backgroundColor: theme.surface }]}
-          onPress={() => router.push("/source-settings")}
+          onPress={() => navigationService.push("/source-settings", "Opening sources…")}
         >
           <SymbolIcon name="sparkles" size={18} color={theme.text} />
           {warningCount > 0 ? (
@@ -358,7 +387,7 @@ const TopDiscoverBar = ({ warningCount }: { warningCount: number }) => {
         </Pressable>
         <Pressable
           style={[styles.topIconButton, { backgroundColor: theme.surface }]}
-          onPress={() => router.push("/sleep-timer")}
+          onPress={() => navigationService.push("/sleep-timer", "Opening sleep timer…")}
         >
           <SymbolIcon name="moon" size={18} color={theme.text} />
         </Pressable>

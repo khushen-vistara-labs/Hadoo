@@ -7,9 +7,11 @@ import { useEffect } from "react";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
 
 import { MiniPlayer } from "@/components/player/MiniPlayer";
+import { AppLoadingOverlay } from "@/components/ui/AppLoadingOverlay";
 import { queryClient } from "@/data/queryClient";
 import { playerService } from "@/modules/player/playerService";
 import { useTasteProfileStore } from "@/modules/recommendations/tasteProfileStore";
+import { navigationService } from "@/services/navigationService";
 
 export default function RootLayout() {
   const [, fontError] = useFonts({
@@ -40,6 +42,14 @@ export default function RootLayout() {
     }
   }, [hasHydrated, onboardingCompleted, pathname]);
 
+  useEffect(() => {
+    const timeout = setTimeout(() => {
+      navigationService.stop();
+    }, 350);
+
+    return () => clearTimeout(timeout);
+  }, [pathname]);
+
   if (!hasHydrated) {
     return null;
   }
@@ -53,13 +63,13 @@ export default function RootLayout() {
           <Stack.Screen name="onboarding" options={{ presentation: "card" }} />
           <Stack.Screen name="now-playing" options={{ presentation: "modal" }} />
           <Stack.Screen name="queue" options={{ presentation: "modal" }} />
-          <Stack.Screen name="playlist/[id]" options={{ presentation: "card" }} />
           <Stack.Screen name="lyrics" options={{ presentation: "modal" }} />
           <Stack.Screen name="sleep-timer" options={{ presentation: "modal" }} />
           <Stack.Screen name="player-settings" options={{ presentation: "card" }} />
           <Stack.Screen name="source-settings" options={{ presentation: "card" }} />
         </Stack>
         {pathname !== "/now-playing" ? <MiniPlayer /> : null}
+        <AppLoadingOverlay />
       </QueryClientProvider>
     </GestureHandlerRootView>
   );

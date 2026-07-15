@@ -1,6 +1,5 @@
-import { router } from "expo-router";
 import { LinearGradient } from "expo-linear-gradient";
-import { Pressable, StyleSheet, View } from "react-native";
+import { ActivityIndicator, Pressable, StyleSheet, View } from "react-native";
 
 import { CachedArtwork } from "@/components/artwork/CachedArtwork";
 import { SymbolIcon } from "@/components/ui/SymbolIcon";
@@ -8,11 +7,12 @@ import { Text } from "@/components/ui/Text";
 import { useMiniPlayerLayout } from "@/hooks/useMiniPlayerLayout";
 import { usePlayer } from "@/hooks/usePlayer";
 import { useTheme } from "@/hooks/useTheme";
+import { navigationService } from "@/services/navigationService";
 import { playerService } from "@/modules/player/playerService";
 import { formatDuration } from "@/utils/formatDuration";
 
 export const MiniPlayer = () => {
-  const { currentTrack, isPlaying, progress, duration } = usePlayer();
+  const { currentTrack, isPlaying, isLoading, progress, duration } = usePlayer();
   const theme = useTheme();
   const { isTabScreen, miniPlayerBottomOffset } = useMiniPlayerLayout();
 
@@ -23,7 +23,7 @@ export const MiniPlayer = () => {
   const progressRatio = duration > 0 ? Math.min(Math.max(progress / duration, 0), 1) : 0;
 
   return (
-    <Pressable onPress={() => router.push("/now-playing")} style={[styles.wrapper, { bottom: miniPlayerBottomOffset }]}>
+    <Pressable onPress={() => navigationService.push("/now-playing", "Opening player…")} style={[styles.wrapper, { bottom: miniPlayerBottomOffset }]}>
       <View style={[styles.shell, { backgroundColor: theme.surface, borderColor: theme.border }]}>
         <LinearGradient colors={["rgba(255,255,255,0.06)", "rgba(255,255,255,0.02)"]} style={styles.card}>
           {currentTrack.artwork ? (
@@ -56,15 +56,20 @@ export const MiniPlayer = () => {
             <View style={styles.actions}>
               <Pressable
                 hitSlop={8}
+                disabled={isLoading}
                 onPress={(event) => {
                   event.stopPropagation();
                   void (isPlaying ? playerService.pause() : playerService.resume());
                 }}
                 style={[styles.actionButton, { backgroundColor: theme.surfaceAlt }]}
               >
-                <SymbolIcon name={isPlaying ? "pause" : "play"} size={18} color={theme.text} />
+                {isLoading ? (
+                  <ActivityIndicator size="small" color={theme.accent} />
+                ) : (
+                  <SymbolIcon name={isPlaying ? "pause" : "play"} size={18} color={theme.text} />
+                )}
               </Pressable>
-              {!isPlaying ? (
+              {!isPlaying && !isLoading ? (
                 <Pressable
                   hitSlop={8}
                   onPress={(event) => {

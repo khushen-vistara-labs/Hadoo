@@ -1,6 +1,6 @@
 import { LinearGradient } from "expo-linear-gradient";
 import { router } from "expo-router";
-import { Pressable, ScrollView, StyleSheet, View, useWindowDimensions } from "react-native";
+import { ActivityIndicator, Pressable, ScrollView, StyleSheet, View, useWindowDimensions } from "react-native";
 import { useMemo, useState } from "react";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
@@ -14,6 +14,7 @@ import { providerLabels } from "@/constants/providers";
 import { usePlayer } from "@/hooks/usePlayer";
 import { useTheme } from "@/hooks/useTheme";
 import { playerService } from "@/modules/player/playerService";
+import { navigationService } from "@/services/navigationService";
 import { formatDuration } from "@/utils/formatDuration";
 import type { Track } from "@/types/track";
 
@@ -44,6 +45,7 @@ export default function NowPlayingScreen() {
   const insets = useSafeAreaInsets();
   const { width } = useWindowDimensions();
   const [seekDraft, setSeekDraft] = useState<number | null>(null);
+  const [isSeeking, setIsSeeking] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [liked, setLiked] = useState(false);
   const [playlistTrack, setPlaylistTrack] = useState<Track | null>(null);
@@ -120,7 +122,7 @@ export default function NowPlayingScreen() {
             <View style={styles.headerActions}>
               <Pressable
                 hitSlop={10}
-                onPress={() => router.push("/player-settings")}
+                onPress={() => navigationService.push("/player-settings", "Opening player settings…")}
                 style={styles.headerButton}
               >
                 <SymbolIcon name="equalizer" size={18} color={theme.text} />
@@ -202,22 +204,27 @@ export default function NowPlayingScreen() {
           <View style={styles.progressGroup}>
             <ProgressBar
               progress={progress}
-              interactive={duration > 0}
+              interactive={duration > 0 && !player.isLoading && !isSeeking}
               onScrubStart={() => setSeekDraft(player.progress)}
               onScrubChange={(nextProgress) => setSeekDraft(nextProgress * duration)}
               onScrubComplete={async (nextProgress) => {
                 const nextPosition = nextProgress * duration;
                 try {
+                  setIsSeeking(true);
                   setSeekDraft(nextPosition);
                   await playerService.seek(nextPosition);
                 } finally {
+                  setIsSeeking(false);
                   setSeekDraft(null);
                 }
               }}
             />
             <View style={styles.timeRow}>
               <Text muted>{formatDuration(elapsed)}</Text>
-              <Text muted>{duration ? `-${formatDuration(Math.max(duration - elapsed, 0))}` : "--:--"}</Text>
+              <View style={styles.timeRight}>
+                {isSeeking ? <ActivityIndicator size="small" color={theme.accent} /> : null}
+                <Text muted>{duration ? `-${formatDuration(Math.max(duration - elapsed, 0))}` : "--:--"}</Text>
+              </View>
             </View>
           </View>
           <View style={styles.transportStage}>
@@ -228,7 +235,7 @@ export default function NowPlayingScreen() {
               style={styles.transportDeck}
             >
               <Pressable
-                disabled={!canControlPlayback}
+                disabled={!canControlPlayback || player.isLoading || isSeeking}
                 hitSlop={10}
                 onPress={() => playerService.toggleShuffle()}
                 style={styles.sideControl}
@@ -236,7 +243,7 @@ export default function NowPlayingScreen() {
                 <SymbolIcon name="shuffle" size={20} color={player.shuffle ? theme.accent : theme.textMuted} />
               </Pressable>
               <Pressable
-                disabled={!canControlPlayback}
+                disabled={!canControlPlayback || player.isLoading || isSeeking}
                 hitSlop={10}
                 onPress={() => playerService.skipPrevious()}
                 style={styles.transportButton}
@@ -245,7 +252,7 @@ export default function NowPlayingScreen() {
               </Pressable>
               <View style={styles.transportCenterSpacer} />
               <Pressable
-                disabled={!canControlPlayback}
+                disabled={!canControlPlayback || player.isLoading || isSeeking}
                 hitSlop={10}
                 onPress={() => playerService.skipNext()}
                 style={styles.transportButton}
@@ -253,7 +260,7 @@ export default function NowPlayingScreen() {
                 <SymbolIcon name="next" size={26} color={canControlPlayback ? theme.text : theme.textMuted} />
               </Pressable>
               <Pressable
-                disabled={!canControlPlayback}
+                disabled={!canControlPlayback || player.isLoading || isSeeking}
                 hitSlop={10}
                 onPress={() => playerService.toggleRepeat()}
                 style={styles.sideControl}
@@ -275,11 +282,15 @@ export default function NowPlayingScreen() {
               ]}
             >
               <Pressable
-                disabled={!canControlPlayback}
+                disabled={!canControlPlayback || isSeeking}
                 style={styles.primaryActionPress}
                 onPress={() => (player.isPlaying ? playerService.pause() : playerService.resume())}
               >
-                <SymbolIcon name={player.isPlaying ? "pause" : "play"} size={30} color={theme.background} />
+                {player.isLoading || isSeeking ? (
+                  <ActivityIndicator size="small" color={theme.background} />
+                ) : (
+                  <SymbolIcon name={player.isPlaying ? "pause" : "play"} size={30} color={theme.background} />
+                )}
               </Pressable>
             </LinearGradient>
           </View>
@@ -290,7 +301,7 @@ export default function NowPlayingScreen() {
                 key={action.label}
                 onPress={() => {
                   if (action.route) {
-                    router.push(action.route);
+                    navigationService.push(action.route, "Opening…");
                   }
                 }}
                 style={[
@@ -554,6 +565,11 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     justifyContent: "space-between",
     alignItems: "center",
+  },
+  timeRight: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
   },
   transportStage: {
     alignItems: "center",

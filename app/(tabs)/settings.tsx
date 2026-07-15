@@ -1,4 +1,3 @@
-import { router } from "expo-router";
 import { Pressable, StyleSheet, View } from "react-native";
 
 import { Card } from "@/components/ui/Card";
@@ -10,6 +9,7 @@ import { sourceRegistry } from "@/modules/sources/SourceRegistry";
 import { useLibraryStore } from "@/modules/library/libraryStore";
 import { useTasteProfileStore } from "@/modules/recommendations/tasteProfileStore";
 import { useSettingsStore } from "@/modules/settings/settingsStore";
+import { navigationService } from "@/services/navigationService";
 
 export default function SettingsScreen() {
   const themeId = useSettingsStore((state) => state.themeId);
@@ -80,7 +80,7 @@ export default function SettingsScreen() {
       </Card>
       <Card>
         <Text variant="headline">Sources</Text>
-        <Pressable onPress={() => router.push("/source-settings")} style={styles.settingsLink}>
+        <Pressable onPress={() => navigationService.push("/source-settings", "Opening sources…")} style={styles.settingsLink}>
           <Text>Open source settings</Text>
         </Pressable>
         <View style={{ gap: 10 }}>
@@ -102,7 +102,7 @@ export default function SettingsScreen() {
             ? `Languages: ${tasteProfile.languages.length}, genres: ${tasteProfile.genres.length}, artists: ${tasteProfile.artists.length}.`
             : "Set up your taste profile to personalize recommendations."}
         </Text>
-        <Pressable onPress={() => router.push("/onboarding?mode=edit")} style={styles.settingsLink}>
+        <Pressable onPress={() => navigationService.push("/onboarding?mode=edit", "Opening profile…")} style={styles.settingsLink}>
           <Text>{tasteProfile.onboardingCompleted ? "Edit taste profile" : "Start taste onboarding"}</Text>
         </Pressable>
       </Card>
