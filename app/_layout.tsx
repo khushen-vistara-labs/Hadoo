@@ -12,7 +12,10 @@ import { playerService } from "@/modules/player/playerService";
 import { useTasteProfileStore } from "@/modules/recommendations/tasteProfileStore";
 
 export default function RootLayout() {
-  const [, fontError] = useFonts(Ionicons.font);
+  const [, fontError] = useFonts({
+    ...Ionicons.font,
+    CuteDisplay: require("../assets/fonts/Skia.ttf"),
+  });
   const pathname = usePathname();
   const hasHydrated = useTasteProfileStore((state) => state.hasHydrated);
   const onboardingCompleted = useTasteProfileStore((state) => state.tasteProfile.onboardingCompleted);

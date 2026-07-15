@@ -6,6 +6,6 @@ export type Playlist = {
   title: string;
   description?: string;
   artwork?: ArtworkLike;
-  trackIds: string[];
-  tracks?: Track[];
+  tracks: Track[];
+  updatedAt: number;
 };

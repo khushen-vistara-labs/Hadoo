@@ -1,6 +1,7 @@
 import type { PropsWithChildren } from "react";
-import { StyleSheet, Text as RNText, type TextProps } from "react-native";
+import { Platform, StyleSheet, Text as RNText, type TextProps } from "react-native";
 
+import { typography } from "@/constants/typography";
 import { useTheme } from "@/hooks/useTheme";
 
 type Props = PropsWithChildren<
@@ -31,21 +32,31 @@ export const Text = ({ children, style, variant = "body", muted = false, ...prop
 const styles = StyleSheet.create({
   base: {
     fontSize: 15,
+    lineHeight: 20,
+    fontFamily: typography.bodyFamilyLight,
   },
   title: {
-    fontSize: 28,
-    fontWeight: "700",
+    fontSize: 23,
+    lineHeight: 33,
+    fontFamily: typography.displayFamily,
+    letterSpacing: 0.05,
+    paddingTop: Platform.OS === "android" ? 3 : 0,
   },
   headline: {
-    fontSize: 19,
-    fontWeight: "700",
+    fontSize: 16,
+    lineHeight: 24,
+    fontFamily: typography.displayFamily,
+    letterSpacing: 0.05,
+    paddingTop: Platform.OS === "android" ? 1 : 0,
   },
   body: {
     fontSize: 15,
+    lineHeight: 20,
   },
   caption: {
-    fontSize: 12,
+    fontSize: 11,
     textTransform: "uppercase",
-    letterSpacing: 0.8,
+    letterSpacing: 1.1,
+    fontFamily: typography.bodyFamilyMedium,
   },
 });

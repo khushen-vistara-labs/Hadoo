@@ -1,5 +1,5 @@
 import { router } from "expo-router";
-import { Pressable, View } from "react-native";
+import { Pressable, StyleSheet, View } from "react-native";
 
 import { Card } from "@/components/ui/Card";
 import { ProviderStatusRow } from "@/components/ui/ProviderStatusRow";
@@ -25,16 +25,62 @@ export default function SettingsScreen() {
       <Text variant="title">Settings</Text>
       <Card>
         <Text variant="headline">Themes</Text>
-        {Object.values(themePresets).map((theme) => (
-          <Pressable key={theme.id} onPress={() => setTheme(theme.id)}>
-            <Text>{theme.name}</Text>
-            <Text muted>{theme.id === themeId ? "Active" : "Tap to apply"}</Text>
-          </Pressable>
-        ))}
+        <View style={styles.themeGrid}>
+          {Object.values(themePresets).map((preset) => {
+            const active = preset.id === themeId;
+
+            return (
+              <Pressable
+                key={preset.id}
+                onPress={() => setTheme(preset.id)}
+                style={[
+                  styles.themePreview,
+                  {
+                    backgroundColor: preset.background,
+                    borderColor: active ? preset.accent : preset.border,
+                  },
+                ]}
+              >
+                <View style={styles.themePreviewTop}>
+                  <View style={styles.themePreviewCopy}>
+                    <Text style={{ color: preset.text }}>{preset.name}</Text>
+                    <Text muted style={{ color: active ? preset.accent : preset.textMuted }}>
+                      {active ? "Active" : "Tap to apply"}
+                    </Text>
+                  </View>
+                  <View
+                    style={[
+                      styles.themeStatusDot,
+                      {
+                        backgroundColor: active ? preset.accent : preset.surfaceAlt,
+                        borderColor: active ? preset.accent : preset.border,
+                      },
+                    ]}
+                  />
+                </View>
+
+                <View style={[styles.themeStage, { backgroundColor: preset.card, borderColor: preset.border }]}>
+                  <View style={styles.themeSwatchRow}>
+                    <View style={[styles.themeSwatchLarge, { backgroundColor: preset.surface }]} />
+                    <View style={styles.themeSwatchColumn}>
+                      <View style={[styles.themeSwatchSmall, { backgroundColor: preset.surfaceAlt }]} />
+                      <View style={[styles.themeSwatchSmall, { backgroundColor: preset.surface }]} />
+                    </View>
+                  </View>
+                  <View style={styles.themeAccentRow}>
+                    <View style={[styles.themeAccentChip, { backgroundColor: preset.accent }]} />
+                    <View style={[styles.themeAccentChip, { backgroundColor: preset.accentAlt }]} />
+                    <View style={[styles.themeAccentChipMuted, { backgroundColor: preset.surfaceAlt, borderColor: preset.border }]} />
+                  </View>
+                </View>
+              </Pressable>
+            );
+          })}
+        </View>
       </Card>
       <Card>
         <Text variant="headline">Sources</Text>
-        <Pressable onPress={() => router.push("/source-settings")}>
+        <Pressable onPress={() => router.push("/source-settings")} style={styles.settingsLink}>
           <Text>Open source settings</Text>
         </Pressable>
         <View style={{ gap: 10 }}>
@@ -54,9 +100,9 @@ export default function SettingsScreen() {
         <Text muted>
           {tasteProfile.onboardingCompleted
             ? `Languages: ${tasteProfile.languages.length}, genres: ${tasteProfile.genres.length}, artists: ${tasteProfile.artists.length}.`
-            : "Complete onboarding to seed your Discover recommendations."}
+            : "Set up your taste profile to personalize recommendations."}
         </Text>
-        <Pressable onPress={() => router.push("/onboarding?mode=edit")}>
+        <Pressable onPress={() => router.push("/onboarding?mode=edit")} style={styles.settingsLink}>
           <Text>{tasteProfile.onboardingCompleted ? "Edit taste profile" : "Start taste onboarding"}</Text>
         </Pressable>
       </Card>
@@ -67,15 +113,85 @@ export default function SettingsScreen() {
       <Card>
         <Text variant="headline">Personalization</Text>
         <Text muted>
-          Continue listening and recently played stay first. Taste-driven recommendations blend with playback history over time.
+          Recommendations start with your taste profile, then adapt to what you actually play.
         </Text>
       </Card>
       <Card>
         <Text variant="headline">Maintenance</Text>
-        <Pressable onPress={clearRecentlyPlayed}>
+        <Pressable onPress={clearRecentlyPlayed} style={styles.settingsLink}>
           <Text>Clear recently played</Text>
         </Pressable>
       </Card>
     </Screen>
   );
 }
+
+const styles = StyleSheet.create({
+  themeGrid: {
+    gap: 14,
+  },
+  themePreview: {
+    borderWidth: 1,
+    borderRadius: 24,
+    padding: 16,
+    gap: 14,
+  },
+  themePreviewTop: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    justifyContent: "space-between",
+    gap: 12,
+  },
+  themePreviewCopy: {
+    flex: 1,
+    gap: 4,
+  },
+  themeStatusDot: {
+    width: 14,
+    height: 14,
+    borderRadius: 999,
+    borderWidth: 1,
+    marginTop: 4,
+  },
+  themeStage: {
+    borderWidth: 1,
+    borderRadius: 18,
+    padding: 12,
+    gap: 12,
+  },
+  themeSwatchRow: {
+    flexDirection: "row",
+    gap: 10,
+  },
+  themeSwatchLarge: {
+    flex: 1.2,
+    height: 64,
+    borderRadius: 14,
+  },
+  themeSwatchColumn: {
+    flex: 1,
+    gap: 10,
+  },
+  themeSwatchSmall: {
+    height: 27,
+    borderRadius: 12,
+  },
+  themeAccentRow: {
+    flexDirection: "row",
+    gap: 10,
+  },
+  themeAccentChip: {
+    width: 34,
+    height: 12,
+    borderRadius: 999,
+  },
+  themeAccentChipMuted: {
+    width: 34,
+    height: 12,
+    borderRadius: 999,
+    borderWidth: 1,
+  },
+  settingsLink: {
+    paddingVertical: 2,
+  },
+});

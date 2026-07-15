@@ -36,7 +36,8 @@ type SymbolName =
   | "refresh"
   | "sparkles"
   | "person"
-  | "checkCircle";
+  | "checkCircle"
+  | "playlist";
 
 const glyphs: Record<SymbolName, keyof typeof Ionicons.glyphMap> = {
   home: "home",
@@ -75,6 +76,7 @@ const glyphs: Record<SymbolName, keyof typeof Ionicons.glyphMap> = {
   sparkles: "sparkles-outline",
   person: "person-outline",
   checkCircle: "checkmark-circle",
+  playlist: "list",
 };
 
 type Props = {

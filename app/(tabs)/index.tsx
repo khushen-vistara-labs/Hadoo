@@ -4,15 +4,18 @@ import { useMemo, useState } from "react";
 import { Pressable, RefreshControl, ScrollView, StyleSheet, View } from "react-native";
 
 import { CachedArtwork } from "@/components/artwork/CachedArtwork";
+import { AddToPlaylistSheet } from "@/components/playlists/AddToPlaylistSheet";
 import { Screen } from "@/components/ui/Screen";
 import { SymbolIcon } from "@/components/ui/SymbolIcon";
 import { Text } from "@/components/ui/Text";
 import { providerLabels } from "@/constants/providers";
+import { useMiniPlayerLayout } from "@/hooks/useMiniPlayerLayout";
 import { usePlayer } from "@/hooks/usePlayer";
 import { usePersonalizedHome } from "@/hooks/usePersonalizedHome";
 import { useTheme } from "@/hooks/useTheme";
 import { useLibraryStore } from "@/modules/library/libraryStore";
 import { playerService } from "@/modules/player/playerService";
+import { usePlaylistStore } from "@/modules/playlists/playlistStore";
 import { sourceRegistry } from "@/modules/sources/SourceRegistry";
 import { useSettingsStore } from "@/modules/settings/settingsStore";
 import { toastService } from "@/services/toastService";
@@ -46,7 +49,7 @@ type QuickAction = {
   id: string;
   icon: "moon" | "download" | "settings";
   label: string;
-  subtitle: string;
+  subtitle?: string;
   onPress: () => void;
 };
 
@@ -67,8 +70,11 @@ export default function HomeScreen() {
   const recentlyPlayed = useLibraryStore((state) => state.recentlyPlayed);
   const resumeSession = useLibraryStore((state) => state.resumeSession);
   const likedSongs = useLibraryStore((state) => state.likedSongs);
+  const playlists = usePlaylistStore((state) => state.playlists);
   const providerStates = useSettingsStore((state) => state.providerStates);
   const [refreshing, setRefreshing] = useState(false);
+  const [playlistTrack, setPlaylistTrack] = useState<Track | null>(null);
+  const { contentBottomSpacing } = useMiniPlayerLayout();
   const personalizedHome = usePersonalizedHome();
 
   const providerHealth = useMemo(
@@ -106,7 +112,7 @@ export default function HomeScreen() {
       return;
     }
 
-    toastService.show("Detail views for provider collections are not wired yet.");
+    toastService.show("Collection views are not available yet.");
   };
 
   const continueCard = useMemo<ContinueCardData | undefined>(() => {
@@ -142,11 +148,11 @@ export default function HomeScreen() {
 
       slides.push({
         id: `provider-${section.id}-${leadItem.id}`,
-        eyebrow: index === 0 ? "Taste-ranked provider shelf" : section.title,
+        eyebrow: index === 0 ? "Picked for You" : section.title,
         title: leadItem.title,
         subtitle: leadItem.subtitle ?? section.subtitle ?? providerLabels[section.provider],
         artwork: leadItem.artwork,
-        cta: leadItem.track ? "Play Now" : "Open Shelf",
+        cta: leadItem.track ? "Play" : "Open",
         onPress: () => playMediaItem(leadItem, section),
       });
     });
@@ -156,9 +162,9 @@ export default function HomeScreen() {
         id: "library-fallback",
         eyebrow: "Library",
         title: "Liked Songs",
-        subtitle: `${likedSongs.length} saved tracks ready to replay.`,
+        subtitle: `${likedSongs.length} saved tracks.`,
         artwork: likedSongs[0]?.artwork ?? recentlyPlayed[0]?.artwork,
-        cta: "Open Library",
+        cta: "Open",
         onPress: () => router.push("/library"),
       });
     }
@@ -175,21 +181,18 @@ export default function HomeScreen() {
       id: "sleep",
       icon: "moon",
       label: "Sleep Timer",
-      subtitle: "Wind down playback",
       onPress: () => router.push("/sleep-timer"),
     },
     {
       id: "downloads",
       icon: "download",
       label: "Downloads",
-      subtitle: "Offline area",
       onPress: () => router.push("/library"),
     },
     {
       id: "sources",
       icon: "settings",
       label: "Sources",
-      subtitle: "Provider controls",
       onPress: () => router.push("/source-settings"),
     },
   ];
@@ -211,7 +214,7 @@ export default function HomeScreen() {
   return (
     <Screen scroll={false}>
       <ScrollView
-        contentContainerStyle={styles.content}
+        contentContainerStyle={[styles.content, { paddingBottom: styles.content.paddingBottom + contentBottomSpacing }]}
         refreshControl={
           <RefreshControl
             refreshing={refreshing}
@@ -228,21 +231,21 @@ export default function HomeScreen() {
 
         <TrackListRail
           title="Recently Played"
-          subtitle="Resume from your local history."
           columns={recentColumns}
-          emptyTitle="No recent playback yet"
-          emptyBody="Once you play real tracks, this shelf becomes your instant resume area."
+          onAddToPlaylist={(track) => setPlaylistTrack(track)}
+          emptyTitle="Nothing played yet"
+          emptyBody="Start playing and your recent tracks will appear here."
         />
 
         {recommendationSection ? (
           recommendationSection.cardType === "track_list" && recommendationTracks.length ? (
             <TrackListRail
               title={recommendationSection.title}
-              subtitle={recommendationSection.subtitle ?? personalizedHome.recommendationResult.rationale}
+              subtitle={recommendationSection.subtitle}
               columns={recommendationColumns}
               loading={personalizedHome.providerQuery.isLoading || personalizedHome.seedQuery.isLoading}
-              emptyTitle="Still shaping your recommendations"
-              emptyBody="We loaded your profile, but the providers did not expose enough playable matches yet."
+              emptyTitle="Recommendations are still taking shape"
+              emptyBody="We have your profile, but there are not enough playable matches yet."
             />
           ) : (
             <MediaRail section={recommendationSection} onPressItem={(item) => playMediaItem(item, recommendationSection)} />
@@ -250,16 +253,15 @@ export default function HomeScreen() {
         ) : (
           <TrackListRail
             title="Recommended For You"
-            subtitle={personalizedHome.recommendationResult.rationale}
             columns={[]}
             loading={personalizedHome.providerQuery.isLoading || personalizedHome.seedQuery.isLoading}
             emptyTitle={
-              personalizedHome.providerQuery.isError ? "Could not load provider recommendations" : "No personalized matches yet"
+              personalizedHome.providerQuery.isError ? "Could not load recommendations" : "No recommendations yet"
             }
             emptyBody={
               personalizedHome.providerQuery.isError
-                ? "The active provider homepage request failed. Check source settings or pull to refresh."
-                : "We will fall back to the strongest provider shelves until your profile and history have more to work with."
+                ? "The active source did not load. Check your source settings or refresh."
+                : "We will lean on source shelves until your listening history gets stronger."
             }
           />
         )}
@@ -284,10 +286,10 @@ export default function HomeScreen() {
             <TrackListRail
               key={section.id}
               title={section.title}
-              subtitle={section.subtitle ?? providerLabels[section.provider]}
+              subtitle={section.subtitle}
               columns={chunkTracks(buildPlayableQueue(section).slice(0, 9), 3)}
               emptyTitle="No playable tracks in this shelf"
-              emptyBody="This provider section exists but did not expose track items we can queue yet."
+              emptyBody="This section loaded, but there are no playable tracks here yet."
             />
           ) : (
             <MediaRail key={section.id} section={section} onPressItem={(item) => playMediaItem(item, section)} />
@@ -296,12 +298,17 @@ export default function HomeScreen() {
 
         <HorizontalInfoRail
           title="Browse Your Space"
-          subtitle="Pinned utility destinations from your own library."
           items={[
+            {
+              id: "playlists-space",
+              title: "Playlists",
+              detail: `${playlists.length} ${playlists.length === 1 ? "playlist" : "playlists"}`,
+              icon: "list",
+              onPress: () => router.push("/library"),
+            },
             {
               id: "downloads-space",
               title: "Downloads",
-              detail: "Reserved for offline playback",
               icon: "download",
               onPress: () => router.push("/library"),
             },
@@ -315,6 +322,12 @@ export default function HomeScreen() {
           ]}
         />
       </ScrollView>
+      <AddToPlaylistSheet
+        visible={Boolean(playlistTrack)}
+        track={playlistTrack}
+        onClose={() => setPlaylistTrack(null)}
+        bottomOffset={92}
+      />
     </Screen>
   );
 }
@@ -328,7 +341,7 @@ const TopDiscoverBar = ({ warningCount }: { warningCount: number }) => {
         <Text variant="title" style={styles.discoverTitle}>
           Discover
         </Text>
-        <Text muted>Provider shelves and local playback, together.</Text>
+        <Text muted>Your sources, listening history, and picks in one place.</Text>
       </View>
 
       <View style={styles.topBarActions}>
@@ -443,9 +456,11 @@ const QuickActionRow = ({ actions }: { actions: QuickAction[] }) => {
             <SymbolIcon name={action.icon} size={18} color={theme.accent} />
           </View>
           <Text>{action.label}</Text>
-          <Text muted style={styles.quickSubtitle}>
-            {action.subtitle}
-          </Text>
+          {action.subtitle ? (
+            <Text muted style={styles.quickSubtitle}>
+              {action.subtitle}
+            </Text>
+          ) : null}
         </Pressable>
       ))}
     </ScrollView>
@@ -456,13 +471,15 @@ const TrackListRail = ({
   title,
   subtitle,
   columns,
+  onAddToPlaylist,
   loading,
   emptyTitle,
   emptyBody,
 }: {
   title: string;
-  subtitle: string;
+  subtitle?: string;
   columns: Track[][];
+  onAddToPlaylist?: (track: Track) => void;
   loading?: boolean;
   emptyTitle: string;
   emptyBody: string;
@@ -477,7 +494,7 @@ const TrackListRail = ({
           {columns.map((tracks, index) => (
             <View key={`${title}-${index}`} style={styles.trackColumn}>
               {tracks.map((track) => (
-                <TrackRailRow key={`${title}-${track.id}`} track={track} queue={tracks} />
+                <TrackRailRow key={`${title}-${track.id}`} track={track} queue={tracks} onAddToPlaylist={onAddToPlaylist} />
               ))}
             </View>
           ))}
@@ -489,7 +506,7 @@ const TrackListRail = ({
   );
 };
 
-const TrackRailRow = ({ track, queue }: { track: Track; queue: Track[] }) => {
+const TrackRailRow = ({ track, queue, onAddToPlaylist }: { track: Track; queue: Track[]; onAddToPlaylist?: (track: Track) => void }) => {
   const theme = useTheme();
 
   return (
@@ -508,7 +525,21 @@ const TrackRailRow = ({ track, queue }: { track: Track; queue: Track[] }) => {
         <Text variant="caption" style={{ color: theme.accent }}>
           {providerLabels[track.provider]}
         </Text>
-        <Text muted>{formatDuration(track.duration)}</Text>
+        <View style={styles.trackRailActions}>
+          <Text muted>{formatDuration(track.duration)}</Text>
+          {onAddToPlaylist ? (
+            <Pressable
+              hitSlop={8}
+              onPress={(event) => {
+                event.stopPropagation();
+                onAddToPlaylist(track);
+              }}
+              style={[styles.trackAddButton, { backgroundColor: theme.surfaceAlt }]}
+            >
+              <SymbolIcon name="add" size={14} color={theme.accent} />
+            </Pressable>
+          ) : null}
+        </View>
       </View>
     </Pressable>
   );
@@ -551,12 +582,12 @@ const HorizontalInfoRail = ({
   items,
 }: {
   title: string;
-  subtitle: string;
+  subtitle?: string;
   items: {
     id: string;
     title: string;
-    detail: string;
-    icon: "download" | "library";
+    detail?: string;
+    icon: "download" | "library" | "list";
     onPress: () => void;
   }[];
 }) => {
@@ -574,9 +605,11 @@ const HorizontalInfoRail = ({
             <Text variant="headline" numberOfLines={2} style={styles.infoTitle}>
               {item.title}
             </Text>
-            <Text muted numberOfLines={2}>
-              {item.detail}
-            </Text>
+            {item.detail ? (
+              <Text muted numberOfLines={2}>
+                {item.detail}
+              </Text>
+            ) : null}
           </Pressable>
         ))}
       </ScrollView>
@@ -584,10 +617,10 @@ const HorizontalInfoRail = ({
   );
 };
 
-const SectionHeader = ({ title, subtitle }: { title: string; subtitle: string }) => (
+const SectionHeader = ({ title, subtitle }: { title: string; subtitle?: string }) => (
   <View style={styles.sectionHeader}>
     <Text variant="headline">{title}</Text>
-    <Text muted>{subtitle}</Text>
+    {subtitle ? <Text muted>{subtitle}</Text> : null}
   </View>
 );
 
@@ -828,6 +861,18 @@ const styles = StyleSheet.create({
   trackRailSide: {
     alignItems: "flex-end",
     gap: 6,
+  },
+  trackRailActions: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+  },
+  trackAddButton: {
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    alignItems: "center",
+    justifyContent: "center",
   },
   infoRail: {
     gap: 14,

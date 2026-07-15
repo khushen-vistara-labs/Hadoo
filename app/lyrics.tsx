@@ -17,7 +17,7 @@ export default function LyricsScreen() {
   return (
     <Screen>
       <Text variant="title">Lyrics</Text>
-      <Text muted>Synced lyric highlighting can plug into player progress later.</Text>
+      <Text muted>Lyrics for the current track.</Text>
       <Card>
         {lyricsQuery.data?.length ? (
           lyricsQuery.data.map((line, index) => (

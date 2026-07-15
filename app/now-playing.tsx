@@ -5,6 +5,7 @@ import { useMemo, useState } from "react";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { CachedArtwork } from "@/components/artwork/CachedArtwork";
+import { AddToPlaylistSheet } from "@/components/playlists/AddToPlaylistSheet";
 import { ProgressBar } from "@/components/ui/ProgressBar";
 import { Screen } from "@/components/ui/Screen";
 import { SymbolIcon } from "@/components/ui/SymbolIcon";
@@ -14,18 +15,19 @@ import { usePlayer } from "@/hooks/usePlayer";
 import { useTheme } from "@/hooks/useTheme";
 import { playerService } from "@/modules/player/playerService";
 import { formatDuration } from "@/utils/formatDuration";
+import type { Track } from "@/types/track";
 
 const menuItems = [
-  { icon: "next", title: "Play Next", hint: "Later" },
-  { icon: "list", title: "Add to Queue", hint: "Later" },
-  { icon: "heartOutline", title: "Add to Favorites", hint: "Later" },
-  { icon: "add", title: "Add to Playlist", hint: "Later" },
-  { icon: "sparkles", title: "Smart Replace", hint: "Later" },
-  { icon: "refresh", title: "Get Latest Metadata", hint: "Later" },
-  { icon: "checkCircle", title: "Available Offline", hint: "Later" },
-  { icon: "share", title: "Share", hint: "Later" },
-  { icon: "link", title: "Open Original Link", hint: "Later" },
-  { icon: "person", title: "Go to Artist", hint: "Later" },
+  { icon: "next", title: "Play Next", hint: "Coming soon" },
+  { icon: "list", title: "Add to Queue", hint: "Coming soon" },
+  { icon: "heartOutline", title: "Add to Favorites", hint: "Coming soon" },
+  { icon: "add", title: "Add to Playlist", hint: "Available now" },
+  { icon: "sparkles", title: "Smart Replace", hint: "Coming soon" },
+  { icon: "refresh", title: "Refresh Metadata", hint: "Coming soon" },
+  { icon: "checkCircle", title: "Available Offline", hint: "Coming soon" },
+  { icon: "share", title: "Share", hint: "Coming soon" },
+  { icon: "link", title: "Open Original Link", hint: "Coming soon" },
+  { icon: "person", title: "Go to Artist", hint: "Coming soon" },
 ] as const;
 
 const quickActions = [
@@ -44,12 +46,13 @@ export default function NowPlayingScreen() {
   const [seekDraft, setSeekDraft] = useState<number | null>(null);
   const [menuOpen, setMenuOpen] = useState(false);
   const [liked, setLiked] = useState(false);
+  const [playlistTrack, setPlaylistTrack] = useState<Track | null>(null);
   const duration = player.duration || player.currentTrack?.duration || 0;
   const elapsed = seekDraft ?? player.progress;
   const progress = duration ? elapsed / duration : 0;
   const contextLabel = useMemo(() => {
     if (!player.currentTrack) {
-      return "Ready to play";
+      return "Nothing playing";
     }
 
     if (player.currentTrack.album) {
@@ -71,6 +74,15 @@ export default function NowPlayingScreen() {
   const primaryActionRadius = primaryActionSize / 2;
   const verticalGap = Math.max(width * 0.016, 6);
   const lowerSectionTop = Math.max(width * 0.01, 2);
+
+  const openPlaylistSheet = () => {
+    if (!player.currentTrack) {
+      return;
+    }
+
+    setPlaylistTrack(player.currentTrack);
+    setMenuOpen(false);
+  };
 
   return (
     <Screen scroll={false} contentContainerStyle={styles.screenContent}>
@@ -358,7 +370,14 @@ export default function NowPlayingScreen() {
                   {menuItems.slice(2).map((item) => (
                     <Pressable
                       key={item.title}
-                      onPress={() => setMenuOpen(false)}
+                      onPress={() => {
+                        if (item.title === "Add to Playlist") {
+                          openPlaylistSheet();
+                          return;
+                        }
+
+                        setMenuOpen(false);
+                      }}
                       style={styles.menuRow}
                     >
                       <View style={[styles.menuRowIcon, { backgroundColor: theme.surfaceAlt }]}>
@@ -382,6 +401,7 @@ export default function NowPlayingScreen() {
             </View>
           </View>
         ) : null}
+        <AddToPlaylistSheet visible={Boolean(playlistTrack)} track={playlistTrack} onClose={() => setPlaylistTrack(null)} />
       </View>
     </Screen>
   );

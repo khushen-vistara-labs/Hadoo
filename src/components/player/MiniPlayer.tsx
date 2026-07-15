@@ -1,11 +1,11 @@
-import { router, usePathname } from "expo-router";
+import { router } from "expo-router";
 import { LinearGradient } from "expo-linear-gradient";
 import { Pressable, StyleSheet, View } from "react-native";
-import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { CachedArtwork } from "@/components/artwork/CachedArtwork";
 import { SymbolIcon } from "@/components/ui/SymbolIcon";
 import { Text } from "@/components/ui/Text";
+import { useMiniPlayerLayout } from "@/hooks/useMiniPlayerLayout";
 import { usePlayer } from "@/hooks/usePlayer";
 import { useTheme } from "@/hooks/useTheme";
 import { playerService } from "@/modules/player/playerService";
@@ -14,29 +14,29 @@ import { formatDuration } from "@/utils/formatDuration";
 export const MiniPlayer = () => {
   const { currentTrack, isPlaying, progress, duration } = usePlayer();
   const theme = useTheme();
-  const pathname = usePathname();
-  const insets = useSafeAreaInsets();
+  const { isTabScreen, miniPlayerBottomOffset } = useMiniPlayerLayout();
 
   if (!currentTrack) {
     return null;
   }
 
-  const isTabScreen =
-    pathname === "/" ||
-    pathname.startsWith("/search") ||
-    pathname.startsWith("/library") ||
-    pathname.startsWith("/settings");
-  const bottomOffset = isTabScreen ? 98 : Math.max(insets.bottom + 16, 24);
   const progressRatio = duration > 0 ? Math.min(Math.max(progress / duration, 0), 1) : 0;
 
   return (
-    <Pressable onPress={() => router.push("/now-playing")} style={[styles.wrapper, { bottom: bottomOffset }]}>
+    <Pressable onPress={() => router.push("/now-playing")} style={[styles.wrapper, { bottom: miniPlayerBottomOffset }]}>
       <View style={[styles.shell, { backgroundColor: theme.surface, borderColor: theme.border }]}>
         <LinearGradient colors={["rgba(255,255,255,0.06)", "rgba(255,255,255,0.02)"]} style={styles.card}>
           {currentTrack.artwork ? (
-            <CachedArtwork artwork={currentTrack.artwork} category="track" variant="thumbnail" width={52} height={52} borderRadius={18} />
+            <CachedArtwork
+              artwork={currentTrack.artwork}
+              category="track"
+              variant="thumbnail"
+              width={isTabScreen ? 46 : 52}
+              height={isTabScreen ? 46 : 52}
+              borderRadius={isTabScreen ? 16 : 18}
+            />
           ) : (
-            <LinearGradient colors={["#1D314A", "#0A1626"]} style={styles.thumbFallback}>
+            <LinearGradient colors={["#1D314A", "#0A1626"]} style={[styles.thumbFallback, isTabScreen ? styles.thumbFallbackCompact : null]}>
               <SymbolIcon name="disc" size={22} color={theme.accent} />
             </LinearGradient>
           )}
@@ -52,7 +52,7 @@ export const MiniPlayer = () => {
           </View>
 
           <View style={styles.rightCluster}>
-            <Text muted>{formatDuration(duration || currentTrack.duration)}</Text>
+            {!isTabScreen ? <Text muted>{formatDuration(duration || currentTrack.duration)}</Text> : null}
             <View style={styles.actions}>
               <Pressable
                 hitSlop={8}
@@ -91,7 +91,7 @@ const styles = StyleSheet.create({
     right: 16,
   },
   shell: {
-    borderRadius: 28,
+    borderRadius: 26,
     borderWidth: 1,
     overflow: "hidden",
     shadowColor: "#000",
@@ -108,7 +108,7 @@ const styles = StyleSheet.create({
     alignItems: "center",
     gap: 12,
     paddingHorizontal: 14,
-    paddingVertical: 12,
+    paddingVertical: 10,
   },
   thumb: {
     width: 52,
@@ -122,12 +122,17 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
   },
+  thumbFallbackCompact: {
+    width: 46,
+    height: 46,
+    borderRadius: 16,
+  },
   meta: {
     flex: 1,
-    gap: 5,
+    gap: 4,
   },
   progressRail: {
-    height: 4,
+    height: 3,
     borderRadius: 999,
     overflow: "hidden",
     backgroundColor: "rgba(255,255,255,0.10)",
@@ -138,7 +143,7 @@ const styles = StyleSheet.create({
   },
   rightCluster: {
     alignItems: "flex-end",
-    gap: 8,
+    gap: 6,
   },
   actions: {
     flexDirection: "row",
