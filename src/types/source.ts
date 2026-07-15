@@ -1,7 +1,13 @@
 export type MusicProvider =
   | "mock"
   | "local"
+  | "youtube_experimental"
   | "youtube_music_experimental"
+  | "spotify_experimental"
+  | "amazon_music_experimental"
+  | "tidal_experimental"
+  | "deezer_experimental"
+  | "soundcloud_experimental"
   | "jiosaavn_experimental"
   | "cached";
 

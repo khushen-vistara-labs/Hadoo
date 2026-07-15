@@ -22,7 +22,13 @@ type SettingsStore = {
 const providerStates: Record<MusicProvider, boolean> = {
   mock: false,
   local: false,
+  youtube_experimental: true,
   youtube_music_experimental: true,
+  spotify_experimental: false,
+  amazon_music_experimental: false,
+  tidal_experimental: false,
+  deezer_experimental: false,
+  soundcloud_experimental: false,
   jiosaavn_experimental: false,
   cached: false,
 };

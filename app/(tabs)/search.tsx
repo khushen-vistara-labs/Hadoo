@@ -21,7 +21,13 @@ import { formatDuration } from "@/utils/formatDuration";
 
 const filters: { id: ProviderFilter; label: string }[] = [
   { id: "all", label: "All" },
-  { id: "youtube_music_experimental", label: "YouTube" },
+  { id: "youtube_music_experimental", label: "YouTube Music" },
+  { id: "youtube_experimental", label: "YouTube" },
+  { id: "spotify_experimental", label: "Spotify" },
+  { id: "soundcloud_experimental", label: "SoundCloud" },
+  { id: "deezer_experimental", label: "Deezer" },
+  { id: "tidal_experimental", label: "Tidal" },
+  { id: "amazon_music_experimental", label: "Amazon Music" },
   { id: "jiosaavn_experimental", label: "JioSaavn Experimental" },
   { id: "local", label: "Local" },
 ];
