@@ -7,6 +7,7 @@ import { useEffect } from "react";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
 
 import { MiniPlayer } from "@/components/player/MiniPlayer";
+import { AppBootstrapScreen } from "@/components/ui/AppBootstrapScreen";
 import { AppLoadingOverlay } from "@/components/ui/AppLoadingOverlay";
 import { queryClient } from "@/data/queryClient";
 import { playerService } from "@/modules/player/playerService";
@@ -14,7 +15,7 @@ import { useTasteProfileStore } from "@/modules/recommendations/tasteProfileStor
 import { navigationService } from "@/services/navigationService";
 
 export default function RootLayout() {
-  const [, fontError] = useFonts({
+  const [fontsLoaded, fontError] = useFonts({
     ...Ionicons.font,
     CuteDisplay: require("../assets/fonts/Skia.ttf"),
   });
@@ -50,8 +51,8 @@ export default function RootLayout() {
     return () => clearTimeout(timeout);
   }, [pathname]);
 
-  if (!hasHydrated) {
-    return null;
+  if (!hasHydrated || (!fontsLoaded && !fontError)) {
+    return <AppBootstrapScreen />;
   }
 
   return (

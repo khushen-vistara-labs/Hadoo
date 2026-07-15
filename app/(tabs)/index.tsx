@@ -4,6 +4,7 @@ import { Pressable, RefreshControl, ScrollView, StyleSheet, View } from "react-n
 
 import { CachedArtwork } from "@/components/artwork/CachedArtwork";
 import { AddToPlaylistSheet } from "@/components/playlists/AddToPlaylistSheet";
+import { BrandLogo } from "@/components/ui/BrandLogo";
 import { Screen } from "@/components/ui/Screen";
 import { SymbolIcon } from "@/components/ui/SymbolIcon";
 import { Text } from "@/components/ui/Text";
@@ -366,11 +367,14 @@ const TopDiscoverBar = ({ warningCount }: { warningCount: number }) => {
 
   return (
     <View style={styles.topBar}>
-      <View style={styles.topBarCopy}>
-        <Text variant="title" style={styles.discoverTitle}>
-          Discover
-        </Text>
-        <Text muted>Your sources, listening history, and picks in one place.</Text>
+      <View style={styles.topBarHeading}>
+        <BrandLogo size={52} style={styles.brandTile} />
+        <View style={styles.topBarCopy}>
+          <Text variant="title" style={styles.discoverTitle}>
+            Discover
+          </Text>
+          <Text muted>Your sources, listening history, and picks in one place.</Text>
+        </View>
       </View>
 
       <View style={styles.topBarActions}>
@@ -710,12 +714,22 @@ const styles = StyleSheet.create({
     justifyContent: "space-between",
     gap: 12,
   },
+  topBarHeading: {
+    flex: 1,
+    flexDirection: "row",
+    alignItems: "flex-start",
+    gap: 12,
+  },
+  brandTile: {
+    borderRadius: 16,
+    backgroundColor: "#FFFFFF",
+  },
   topBarCopy: {
     flex: 1,
     gap: 4,
   },
   discoverTitle: {
-    fontSize: 38,
+    fontSize: 32,
   },
   topBarActions: {
     flexDirection: "row",

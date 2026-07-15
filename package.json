@@ -6,6 +6,9 @@
   "scripts": {
     "start": "expo start --dev-client",
     "android": "expo run:android",
+    "android:release": "./android/gradlew -p android assembleRelease",
+    "android:install-release": "./android/gradlew -p android installRelease",
+    "android:bundle-release": "./android/gradlew -p android bundleRelease",
     "ios": "expo run:ios",
     "lint": "expo lint",
     "test": "node -e \"console.log('No automated tests configured yet.')\"",
