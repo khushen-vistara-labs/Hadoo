@@ -2,6 +2,8 @@
 
 This project runs as an Expo development build. It does not run inside Expo Go because it depends on native modules such as `react-native-track-player`.
 
+This guide covers the development-build workflow. If you want an install that runs on the phone without Metro or a USB cable, use the standalone release flow in [standalone-android-build.md](/Users/icemonkey/code/Hadoo/docs/standalone-android-build.md).
+
 ## Prerequisites
 
 - A Mac with Android SDK / platform tools installed
@@ -65,6 +67,8 @@ npm run start
 
 Then open the installed app on the device.
 
+If you want to avoid the USB cable during development, you can keep using the installed dev client and start Metro on the same Wi-Fi network. The app still depends on Metro in that mode, so it is not fully standalone.
+
 ## iOS
 
 For iOS simulator or device builds on macOS:
@@ -77,4 +81,7 @@ npm run ios
 
 - `npm run start`: starts Expo in dev-client mode
 - `npm run android`: builds and runs the Android native app
+- `npm run android:release`: builds a standalone release APK
+- `npm run android:install-release`: installs the standalone release APK on a connected device
+- `npm run android:bundle-release`: builds a release AAB for store distribution
 - `npm run ios`: builds and runs the iOS native app

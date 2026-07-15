@@ -43,6 +43,19 @@ If your phone is already connected by USB and developer options are enabled, tha
 
 Detailed device setup and troubleshooting lives in [docs/running-on-android-device.md](/Users/icemonkey/code/Hadoo/docs/running-on-android-device.md).
 
+### Building A Standalone Android App
+
+If you want the phone app to run without your Mac, build and install the release APK instead of the Expo dev client:
+
+```bash
+npm run android:release
+npm run android:install-release
+```
+
+That produces a bundled Android app that does not connect to Metro at runtime.
+
+Release signing and APK / AAB details live in [docs/standalone-android-build.md](/Users/icemonkey/code/Hadoo/docs/standalone-android-build.md).
+
 ## Contributing
 
 Contributor requirements for commit messages, PR titles, PR template sections, required checks, and code owners are documented in [CONTRIBUTING.md](/Users/icemonkey/code/Hadoo/CONTRIBUTING.md).
@@ -50,6 +63,7 @@ Contributor requirements for commit messages, PR titles, PR template sections, r
 ## Notes
 
 - This project targets Expo development builds, not Expo Go.
+- Android release builds bundle the JavaScript so the installed release APK can run without Metro.
 - `react-native-track-player` is wired through `index.js` and `src/modules/player/playbackService.ts`.
 - Experimental providers are isolated under `src/modules/sources/` and can return clean failures without crashing the UI.
 - State persistence uses AsyncStorage through Zustand middleware.

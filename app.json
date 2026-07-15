@@ -5,9 +5,15 @@
     "description": "A personal music app for searching, organizing, and playing tracks across modular source providers.",
     "scheme": "hadoo",
     "version": "0.1.0",
+    "icon": "./assets/images/hadoo-logo.png",
     "orientation": "portrait",
     "userInterfaceStyle": "dark",
     "newArchEnabled": false,
+    "splash": {
+      "image": "./assets/images/hadoo-logo.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#FFFFFF"
+    },
     "plugins": [
       "expo-router",
       [
@@ -23,10 +29,16 @@
       "typedRoutes": true
     },
     "android": {
-      "package": "com.icemonkey.hadoo"
+      "package": "com.icemonkey.hadoo",
+      "icon": "./assets/images/hadoo-logo.png",
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/images/hadoo-logo.png",
+        "backgroundColor": "#FFFFFF"
+      }
     },
     "ios": {
       "bundleIdentifier": "com.icemonkey.hadoo",
+      "icon": "./assets/images/hadoo-logo.png",
       "supportsTablet": false
     }
   }
