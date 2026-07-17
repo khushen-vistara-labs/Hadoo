@@ -57,6 +57,10 @@ export default function NowPlayingScreen() {
       return "Nothing playing";
     }
 
+    if (player.currentTrack.playbackProvider && player.currentTrack.fallbackFromProvider) {
+      return `Playing via ${providerLabels[player.currentTrack.playbackProvider]}`;
+    }
+
     if (player.currentTrack.album) {
       return player.currentTrack.album;
     }
@@ -183,6 +187,17 @@ export default function NowPlayingScreen() {
                     ? `${player.currentTrack.artist}${detailSuffix(player.currentTrack.album)}`
                     : "Choose something from home or search."}
                 </Text>
+                {player.currentTrack?.playbackProvider && player.currentTrack.fallbackFromProvider ? (
+                  <Text muted numberOfLines={1} style={styles.subtitle}>
+                    {`Requested from ${providerLabels[player.currentTrack.fallbackFromProvider]} · matched by ${
+                      player.currentTrack.playbackMatchKind === "cached_fallback"
+                        ? "cache"
+                        : player.currentTrack.playbackMatchKind === "isrc"
+                          ? "ISRC"
+                          : "metadata"
+                    }`}
+                  </Text>
+                ) : null}
               </View>
               <Pressable
                 hitSlop={8}

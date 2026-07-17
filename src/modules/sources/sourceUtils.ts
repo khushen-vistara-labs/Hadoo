@@ -38,6 +38,18 @@ export const buildTrackSearchQuery = (track: Track) => {
   return [track.title, artist].filter(Boolean).join(" ").trim();
 };
 
+export const buildCanonicalTrackKey = (track: Track) => {
+  const isrc = normalizeTrackText(track.isrc);
+  if (isrc) {
+    return `isrc:${isrc}`;
+  }
+
+  const title = normalizeTrackText(track.title);
+  const artist = normalizeTrackText(track.artists?.[0] ?? track.artist);
+  const durationBucket = track.duration != null ? Math.round(track.duration / 5) * 5 : 0;
+  return `meta:${title}|${artist}|${durationBucket}`;
+};
+
 const scoreTextAffinity = (left?: string, right?: string) => {
   const normalizedLeft = normalizeTrackText(left);
   const normalizedRight = normalizeTrackText(right);
@@ -61,6 +73,10 @@ const scoreTextAffinity = (left?: string, right?: string) => {
 };
 
 export const scoreTrackCandidate = (seed: Track, candidate: Track) => {
+  if (seed.isrc && candidate.isrc && normalizeTrackText(seed.isrc) === normalizeTrackText(candidate.isrc)) {
+    return 10_000;
+  }
+
   const titleScore = scoreTextAffinity(seed.title, candidate.title) * 60;
   const artistScore = scoreTextAffinity(seed.artists?.[0] ?? seed.artist, candidate.artists?.[0] ?? candidate.artist) * 30;
   const albumScore = scoreTextAffinity(seed.album, candidate.album) * 10;

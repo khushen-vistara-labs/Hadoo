@@ -12,6 +12,8 @@ export type StreamSource = {
   mimeType?: string;
 };
 
+export type PlaybackMatchKind = "cached_fallback" | "isrc" | "metadata_search";
+
 export type Track = {
   id: string;
   provider: MusicProvider;
@@ -20,6 +22,9 @@ export type Track = {
   artist: string;
   artists?: string[];
   album?: string;
+  genres?: string[];
+  isrc?: string;
+  upc?: string;
   artwork?: ArtworkLike;
   duration?: number;
   streamUrl?: string;
@@ -28,11 +33,16 @@ export type Track = {
   providerTrackId?: string;
   providerAlbumId?: string;
   providerArtistId?: string;
+  playbackProvider?: MusicProvider;
+  fallbackFromProvider?: MusicProvider;
+  playbackMatchKind?: PlaybackMatchKind;
   isExplicit?: boolean;
   quality?: TrackQuality;
 };
 
-export type StreamResult = StreamSource;
+export type StreamResult = StreamSource & {
+  resolvedTrack?: Track;
+};
 
 export type LyricLine = {
   time?: number;

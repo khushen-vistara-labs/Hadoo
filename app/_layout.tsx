@@ -1,6 +1,7 @@
 import { QueryClientProvider } from "@tanstack/react-query";
 import { Ionicons } from "@expo/vector-icons";
 import { useFonts } from "expo-font";
+import * as SplashScreen from "expo-splash-screen";
 import { Stack, router, usePathname } from "expo-router";
 import { StatusBar } from "expo-status-bar";
 import { useEffect } from "react";
@@ -14,6 +15,10 @@ import { playerService } from "@/modules/player/playerService";
 import { useTasteProfileStore } from "@/modules/recommendations/tasteProfileStore";
 import { navigationService } from "@/services/navigationService";
 
+void SplashScreen.preventAutoHideAsync().catch(() => {
+  // Ignore duplicate calls during fast refresh.
+});
+
 export default function RootLayout() {
   const [fontsLoaded, fontError] = useFonts({
     ...Ionicons.font,
@@ -22,6 +27,7 @@ export default function RootLayout() {
   const pathname = usePathname();
   const hasHydrated = useTasteProfileStore((state) => state.hasHydrated);
   const onboardingCompleted = useTasteProfileStore((state) => state.tasteProfile.onboardingCompleted);
+  const isBootstrapping = !hasHydrated || (!fontsLoaded && !fontError);
 
   useEffect(() => {
     void playerService.setup();
@@ -51,14 +57,23 @@ export default function RootLayout() {
     return () => clearTimeout(timeout);
   }, [pathname]);
 
-  if (!hasHydrated || (!fontsLoaded && !fontError)) {
-    return <AppBootstrapScreen />;
-  }
+  useEffect(() => {
+    if (isBootstrapping) {
+      return;
+    }
+
+    void SplashScreen.hideAsync().catch(() => {
+      // Ignore hide failures and continue boot.
+    });
+  }, [isBootstrapping]);
 
   return (
     <GestureHandlerRootView style={{ flex: 1 }}>
       <QueryClientProvider client={queryClient}>
-        <StatusBar style="light" />
+        <StatusBar
+          backgroundColor={isBootstrapping ? "#FFFFFF" : "transparent"}
+          style={isBootstrapping ? "dark" : "light"}
+        />
         <Stack screenOptions={{ headerShown: false }}>
           <Stack.Screen name="(tabs)" />
           <Stack.Screen name="onboarding" options={{ presentation: "card" }} />
@@ -69,8 +84,9 @@ export default function RootLayout() {
           <Stack.Screen name="player-settings" options={{ presentation: "card" }} />
           <Stack.Screen name="source-settings" options={{ presentation: "card" }} />
         </Stack>
-        {pathname !== "/now-playing" ? <MiniPlayer /> : null}
+        {!isBootstrapping && pathname !== "/now-playing" ? <MiniPlayer /> : null}
         <AppLoadingOverlay />
+        {isBootstrapping ? <AppBootstrapScreen /> : null}
       </QueryClientProvider>
     </GestureHandlerRootView>
   );

@@ -373,7 +373,6 @@ const TopDiscoverBar = ({ warningCount }: { warningCount: number }) => {
           <Text variant="title" style={styles.discoverTitle}>
             Discover
           </Text>
-          <Text muted>Your sources, listening history, and picks in one place.</Text>
         </View>
       </View>
 

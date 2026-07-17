@@ -98,8 +98,12 @@ export const playerService = {
       );
       const resolvedQueue = settledQueue
         .filter((result): result is PromiseFulfilledResult<{ track: Track; stream: Awaited<ReturnType<typeof sourceRegistry.getStreamUrl>> }> => result.status === "fulfilled")
-        .map((result) => result.value);
-      const selected = resolvedQueue.find((item) => item.track.id === track.id);
+        .map((result) => ({
+          track: result.value.stream.resolvedTrack ?? result.value.track,
+          originalTrack: result.value.track,
+          stream: result.value.stream,
+        }));
+      const selected = resolvedQueue.find((item) => item.originalTrack.id === track.id);
 
       if (!selected) {
         throw new StreamResolveError("Could not resolve this track for playback.");
@@ -152,21 +156,32 @@ export const playerService = {
       logger.info("Player: play called");
 
       usePlayerStore.getState().setQueue(
-        resolvedQueue.map(({ track: queueTrack, stream }) => ({
+        resolvedQueue.map(({ track: queueTrack, originalTrack, stream }) => ({
           ...queueTrack,
+          fallbackFromProvider: queueTrack.fallbackFromProvider ?? originalTrack.provider,
           streamUrl: stream.url,
           quality: stream.quality ?? queueTrack.quality,
         })),
       );
       usePlayerStore.getState().setCurrentTrack(
-        selected.track,
+        {
+          ...selected.track,
+          fallbackFromProvider: selected.track.fallbackFromProvider ?? selected.originalTrack.provider,
+          streamUrl: selected.stream.url,
+          quality: selected.stream.quality ?? selected.track.quality,
+        },
       );
       usePlayerStore.getState().setPlaying(true);
       usePlayerStore.getState().setProgress(0, track.duration ?? 0);
       usePlayerStore.getState().setError(undefined);
       useLibraryStore.getState().addRecent(track);
       useLibraryStore.getState().updateResumeSession({
-        track,
+        track: {
+          ...selected.track,
+          fallbackFromProvider: selected.track.fallbackFromProvider ?? selected.originalTrack.provider,
+          streamUrl: selected.stream.url,
+          quality: selected.stream.quality ?? selected.track.quality,
+        },
         position: 0,
         duration: track.duration ?? 0,
         updatedAt: Date.now(),
