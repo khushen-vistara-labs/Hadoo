@@ -12,8 +12,9 @@ import {
   buildCanonicalTrackKey,
   buildTrackSearchQuery,
   extractScopedLocalId,
-  findBestTrackCandidate,
   isProbablyUrl,
+  isStreamExpired,
+  rankTrackCandidates,
   selectPreferredStream,
 } from "@/modules/sources/sourceUtils";
 import { logger } from "@/services/logger";
@@ -21,7 +22,7 @@ import type { AudioQualityPreference, MusicProvider, ProviderStatus } from "@/ty
 import type { ImportResult } from "@/modules/sources/sourceModels";
 import type { HomeSection } from "@/types/home";
 import type { StreamResult, Track } from "@/types/track";
-import { SourceUnavailableError, StreamResolveError } from "@/utils/errors";
+import { StreamResolveError } from "@/utils/errors";
 
 type ProviderHealth = {
   provider: MusicProvider;
@@ -149,8 +150,15 @@ export class SourceRegistry {
       return { url: track.fileUrl, quality: track.quality ?? "high" };
     }
 
-    if (track.streamUrl?.startsWith("http")) {
-      return { url: track.streamUrl, quality: track.quality ?? "unknown" };
+    if (track.streamUrl?.startsWith("http") && !isStreamExpired({ expiresAt: track.streamExpiresAt })) {
+      return {
+        url: track.streamUrl,
+        quality: track.quality ?? "unknown",
+        headers: track.streamHeaders,
+        format: track.streamFormat,
+        mimeType: track.streamMimeType,
+        expiresAt: track.streamExpiresAt,
+      };
     }
 
     const source = this.sources.get(track.provider);
@@ -281,12 +289,16 @@ export class SourceRegistry {
 
     const cached = this.resolveCachedFallbackTrack(track, provider, canonicalKey);
     if (cached) {
-      const stream = await this.resolveTrackStream(cached, preference, source);
-      if (stream) {
-        return {
-          ...stream,
-          resolvedTrack: cached,
-        };
+      try {
+        const stream = await this.resolveTrackStream(cached, preference, source);
+        if (stream) {
+          return {
+            ...stream,
+            resolvedTrack: cached,
+          };
+        }
+      } catch (error) {
+        logger.warn("Cached fallback stream is no longer playable", provider, cached.localId, error);
       }
     }
 
@@ -296,28 +308,42 @@ export class SourceRegistry {
     }
 
     const candidates = await source.search(query);
-    const match = findBestTrackCandidate(track, candidates);
-    if (!match) {
+    const matches = rankTrackCandidates(track, candidates).slice(0, 4);
+    if (!matches.length) {
       return undefined;
     }
+    let lastError: unknown;
 
-    const matchKind = track.isrc && match.isrc && track.isrc === match.isrc ? "isrc" : "metadata_search";
-    const matchedTrack: Track = {
-      ...match,
-      playbackProvider: provider,
-      fallbackFromProvider: track.provider,
-      playbackMatchKind: matchKind,
-    };
-    const stream = await this.resolveTrackStream(matchedTrack, preference, source);
-    if (!stream) {
-      return undefined;
+    for (const match of matches) {
+      const matchKind = track.isrc && match.isrc && track.isrc === match.isrc ? "isrc" : "metadata_search";
+      const matchedTrack: Track = {
+        ...match,
+        playbackProvider: provider,
+        fallbackFromProvider: track.provider,
+        playbackMatchKind: matchKind,
+      };
+
+      try {
+        const stream = await this.resolveTrackStream(matchedTrack, preference, source);
+        if (!stream) {
+          continue;
+        }
+
+        this.cacheFallbackMatch(canonicalKey, matchedTrack, matchKind);
+        return {
+          ...stream,
+          resolvedTrack: matchedTrack,
+        };
+      } catch (error) {
+        lastError = error;
+        logger.warn("Fallback candidate was not playable", provider, matchedTrack.localId, error);
+      }
     }
 
-    this.cacheFallbackMatch(canonicalKey, matchedTrack, matchKind);
-    return {
-      ...stream,
-      resolvedTrack: matchedTrack,
-    };
+    if (lastError instanceof Error) {
+      throw lastError;
+    }
+    return undefined;
   }
 
   private resolveCachedFallbackTrack(track: Track, provider: MusicProvider, canonicalKey: string): Track | undefined {

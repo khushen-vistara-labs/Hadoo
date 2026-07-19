@@ -89,20 +89,15 @@ export const scoreTrackCandidate = (seed: Track, candidate: Track) => {
   return titleScore + artistScore + albumScore + durationScore;
 };
 
-export const findBestTrackCandidate = (seed: Track, candidates: Track[], minimumScore = 45) => {
-  let best: Track | undefined;
-  let bestScore = minimumScore;
+export const rankTrackCandidates = (seed: Track, candidates: Track[], minimumScore = 45) =>
+  candidates
+    .map((candidate) => ({ candidate, score: scoreTrackCandidate(seed, candidate) }))
+    .filter(({ score }) => score > minimumScore)
+    .sort((left, right) => right.score - left.score)
+    .map(({ candidate }) => candidate);
 
-  candidates.forEach((candidate) => {
-    const score = scoreTrackCandidate(seed, candidate);
-    if (score > bestScore) {
-      best = candidate;
-      bestScore = score;
-    }
-  });
-
-  return best;
-};
+export const findBestTrackCandidate = (seed: Track, candidates: Track[], minimumScore = 45) =>
+  rankTrackCandidates(seed, candidates, minimumScore)[0];
 
 export const isStreamExpired = (stream: Pick<StreamSource, "expiresAt">, minimumRemainingMs = 60_000) => {
   if (!stream.expiresAt) {

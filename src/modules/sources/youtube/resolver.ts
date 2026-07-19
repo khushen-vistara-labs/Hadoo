@@ -2,6 +2,7 @@ import { logger } from "@/services/logger";
 import type { StreamSource, TrackQuality } from "@/types/track";
 import { StreamResolveError } from "@/utils/errors";
 
+import { pipedYouTubeClient } from "@/modules/sources/PipedYouTubeClient";
 import { extractExpiresAt, resolveCipheredUrl } from "@/modules/sources/youtube/cipher";
 import {
   fetchInnertubePlayerResponses,
@@ -125,7 +126,14 @@ const normalizeStream = (
 
 const chooseBestPlayerResponse = (
   responses: { client: InnertubeClientProfile; payload: YouTubePlayerResponse }[],
-) => responses.find((item) => collectFormats(item.payload).some(isAudioFormat)) ?? responses[0];
+) =>
+  responses.find(
+    (item) =>
+      item.payload.playabilityStatus?.status === "OK" && collectFormats(item.payload).some(isAudioFormat),
+  ) ??
+  responses.find((item) => item.payload.playabilityStatus?.status === "OK") ??
+  responses.find((item) => collectFormats(item.payload).some(isAudioFormat)) ??
+  responses[0];
 
 export const youtubeResolver = {
   async getTrackDetails(videoId: string): Promise<NormalizedTrackDetails> {
@@ -154,46 +162,81 @@ export const youtubeResolver = {
   },
 
   async getStreams(videoId: string): Promise<ResolvedStream[]> {
-    logger.info("YouTube resolver: watch page", videoId);
-    const watchPage = await fetchYouTubeWatchPage(videoId);
-    logger.info("YouTube resolver: player JS", watchPage.playerUrl ?? "missing");
-    const playerJs = await fetchYouTubePlayerJs(watchPage.playerUrl);
-    logger.info("YouTube resolver: innertube player", videoId, playerJs.signatureTimestamp);
-    const responses = await fetchInnertubePlayerResponses(watchPage, videoId, playerJs.signatureTimestamp);
-    const selectedResponse = chooseBestPlayerResponse(responses);
-    const client = selectedResponse?.client;
-    const payload = selectedResponse?.payload;
+    let primaryError: unknown;
 
-    if (!payload) {
-      throw new StreamResolveError("YouTube player response did not contain any usable payloads.");
+    try {
+      logger.info("YouTube resolver: watch page", videoId);
+      const watchPage = await fetchYouTubeWatchPage(videoId);
+      logger.info("YouTube resolver: player JS", watchPage.playerUrl ?? "missing");
+      const playerJs = await fetchYouTubePlayerJs(watchPage.playerUrl);
+      logger.info("YouTube resolver: innertube player", videoId, playerJs.signatureTimestamp);
+      const responses = await fetchInnertubePlayerResponses(watchPage, videoId, playerJs.signatureTimestamp);
+      const selectedResponse = chooseBestPlayerResponse(responses);
+      const client = selectedResponse?.client;
+      const payload = selectedResponse?.payload;
+
+      if (!payload) {
+        throw new StreamResolveError("YouTube player response did not contain any usable payloads.");
+      }
+      if (!client) {
+        throw new StreamResolveError("YouTube player response did not retain client context.");
+      }
+
+      const playabilityStatus = payload.playabilityStatus?.status;
+      if (playabilityStatus && playabilityStatus !== "OK") {
+        throw new StreamResolveError(
+          payload.playabilityStatus?.reason ?? `YouTube player returned ${playabilityStatus}.`,
+        );
+      }
+
+      const audioFormats = collectFormats(payload).filter(isAudioFormat);
+      logger.info("YouTube resolver: audio format candidates", videoId, audioFormats.length);
+
+      const streams = audioFormats
+        .map((format) => normalizeStream(format, client, playerJs.decipher))
+        .filter(Boolean) as ResolvedStream[];
+
+      logger.info("YouTube resolver: deciphered audio streams", videoId, streams.length);
+
+      if (!streams.length) {
+        throw new StreamResolveError("No playable YouTube audio streams were returned.");
+      }
+
+      const sorted = streams.sort((left, right) => (right.bitrate ?? 0) - (left.bitrate ?? 0));
+      logger.info("YouTube resolver: selected stream", sorted[0]?.url?.slice(0, 120) ?? "missing");
+      logger.info("YouTube resolver: selected stream headers", sorted[0]?.headers ?? {});
+      return sorted;
+    } catch (error) {
+      primaryError = error;
+      logger.warn("YouTube Innertube stream resolution failed; trying Piped", videoId, error);
     }
-    if (!client) {
-      throw new StreamResolveError("YouTube player response did not retain client context.");
+
+    try {
+      const payload = await pipedYouTubeClient.getStreams(videoId);
+      const streams = (payload.audioStreams ?? [])
+        .filter((stream) => /^https?:\/\//i.test(stream.url))
+        .map((stream) => ({
+          url: stream.url,
+          bitrate: stream.bitrate,
+          quality: mapBitrateToQuality(stream.bitrate),
+          format: stream.format,
+          mimeType: stream.mimeType,
+          codec: stream.codec,
+          expiresAt: extractExpiresAt(stream.url),
+        } satisfies ResolvedStream))
+        .sort((left, right) => (right.bitrate ?? 0) - (left.bitrate ?? 0));
+
+      if (streams.length) {
+        logger.info("YouTube resolver: Piped audio stream fallback", videoId, streams.length);
+        return streams;
+      }
+    } catch (fallbackError) {
+      logger.warn("YouTube Piped stream fallback failed", videoId, fallbackError);
     }
 
-    const playabilityStatus = payload.playabilityStatus?.status;
-    if (playabilityStatus && playabilityStatus !== "OK") {
-      throw new StreamResolveError(
-        payload.playabilityStatus?.reason ?? `YouTube player returned ${playabilityStatus}.`,
-      );
+    if (primaryError instanceof Error) {
+      throw primaryError;
     }
-
-    const audioFormats = collectFormats(payload).filter(isAudioFormat);
-    logger.info("YouTube resolver: audio format candidates", videoId, audioFormats.length);
-
-    const streams = audioFormats
-      .map((format) => normalizeStream(format, client, playerJs.decipher))
-      .filter(Boolean) as ResolvedStream[];
-
-    logger.info("YouTube resolver: deciphered audio streams", videoId, streams.length);
-
-    if (!streams.length) {
-      throw new StreamResolveError("No playable YouTube audio streams were returned.");
-    }
-
-    const sorted = streams.sort((left, right) => (right.bitrate ?? 0) - (left.bitrate ?? 0));
-    logger.info("YouTube resolver: selected stream", sorted[0]?.url?.slice(0, 120) ?? "missing");
-    logger.info("YouTube resolver: selected stream headers", sorted[0]?.headers ?? {});
-    return sorted;
+    throw new StreamResolveError("No playable YouTube audio streams were returned.");
   },
 };

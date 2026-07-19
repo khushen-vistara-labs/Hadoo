@@ -28,6 +28,10 @@ export type Track = {
   artwork?: ArtworkLike;
   duration?: number;
   streamUrl?: string;
+  streamHeaders?: Record<string, string>;
+  streamFormat?: string;
+  streamMimeType?: string;
+  streamExpiresAt?: number;
   sourceUrl?: string;
   fileUrl?: string;
   providerTrackId?: string;

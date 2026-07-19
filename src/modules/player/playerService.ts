@@ -5,6 +5,7 @@ import TrackPlayer, {
 } from "react-native-track-player";
 
 import { useLibraryStore } from "@/modules/library/libraryStore";
+import { downloadService } from "@/modules/downloads/downloadService";
 import { usePlayerStore } from "@/modules/player/playerStore";
 import { useSleepTimerStore } from "@/modules/player/sleepTimerStore";
 import { setupTrackPlayer } from "@/modules/player/trackPlayerSetup";
@@ -91,10 +92,24 @@ export const playerService = {
       const nextQueue = queue ?? [track];
       const audioQuality = useSettingsStore.getState().audioQuality;
       const settledQueue = await Promise.allSettled(
-        nextQueue.map(async (item) => ({
-          track: item,
-          stream: await sourceRegistry.getStreamUrl(item, audioQuality),
-        })),
+        nextQueue.map(async (item) => {
+          const offlineTrack = await downloadService.getPlayableTrack(item);
+          if (offlineTrack?.fileUrl) {
+            return {
+              track: item,
+              stream: {
+                url: offlineTrack.fileUrl,
+                quality: offlineTrack.quality ?? "high",
+                resolvedTrack: offlineTrack,
+              },
+            };
+          }
+
+          return {
+            track: item,
+            stream: await sourceRegistry.getStreamUrl(downloadService.getNetworkTrack(item), audioQuality),
+          };
+        }),
       );
       const resolvedQueue = settledQueue
         .filter((result): result is PromiseFulfilledResult<{ track: Track; stream: Awaited<ReturnType<typeof sourceRegistry.getStreamUrl>> }> => result.status === "fulfilled")
@@ -145,7 +160,7 @@ export const playerService = {
         })),
       );
       logger.info("Player: add success");
-      const index = resolvedQueue.findIndex((item) => item.track.id === track.id);
+      const index = resolvedQueue.findIndex((item) => item.originalTrack.id === track.id);
       if (index > 0) {
         logger.info("Player: skip start", index);
         await TrackPlayer.skip(index);
@@ -160,6 +175,10 @@ export const playerService = {
           ...queueTrack,
           fallbackFromProvider: queueTrack.fallbackFromProvider ?? originalTrack.provider,
           streamUrl: stream.url,
+          streamHeaders: stream.headers,
+          streamFormat: stream.format,
+          streamMimeType: stream.mimeType,
+          streamExpiresAt: stream.expiresAt,
           quality: stream.quality ?? queueTrack.quality,
         })),
       );
@@ -168,6 +187,10 @@ export const playerService = {
           ...selected.track,
           fallbackFromProvider: selected.track.fallbackFromProvider ?? selected.originalTrack.provider,
           streamUrl: selected.stream.url,
+          streamHeaders: selected.stream.headers,
+          streamFormat: selected.stream.format,
+          streamMimeType: selected.stream.mimeType,
+          streamExpiresAt: selected.stream.expiresAt,
           quality: selected.stream.quality ?? selected.track.quality,
         },
       );
@@ -180,6 +203,10 @@ export const playerService = {
           ...selected.track,
           fallbackFromProvider: selected.track.fallbackFromProvider ?? selected.originalTrack.provider,
           streamUrl: selected.stream.url,
+          streamHeaders: selected.stream.headers,
+          streamFormat: selected.stream.format,
+          streamMimeType: selected.stream.mimeType,
+          streamExpiresAt: selected.stream.expiresAt,
           quality: selected.stream.quality ?? selected.track.quality,
         },
         position: 0,

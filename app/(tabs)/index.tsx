@@ -13,6 +13,7 @@ import { useMiniPlayerLayout } from "@/hooks/useMiniPlayerLayout";
 import { usePlayer } from "@/hooks/usePlayer";
 import { usePersonalizedHome } from "@/hooks/usePersonalizedHome";
 import { useTheme } from "@/hooks/useTheme";
+import { useDownloadStore } from "@/modules/downloads/downloadStore";
 import { useLibraryStore } from "@/modules/library/libraryStore";
 import { playerService } from "@/modules/player/playerService";
 import { usePlaylistStore } from "@/modules/playlists/playlistStore";
@@ -95,6 +96,7 @@ export default function HomeScreen() {
   const resumeSession = useLibraryStore((state) => state.resumeSession);
   const likedSongs = useLibraryStore((state) => state.likedSongs);
   const playlists = usePlaylistStore((state) => state.playlists);
+  const downloadCount = useDownloadStore((state) => Object.keys(state.downloads).length);
   const providerStates = useSettingsStore((state) => state.providerStates);
   const [refreshing, setRefreshing] = useState(false);
   const [playlistTrack, setPlaylistTrack] = useState<Track | null>(null);
@@ -217,7 +219,8 @@ export default function HomeScreen() {
       id: "downloads",
       icon: "download",
       label: "Downloads",
-      onPress: () => navigationService.push("/library", "Opening library…"),
+      subtitle: downloadCount ? String(downloadCount) : undefined,
+      onPress: () => navigationService.push("/downloads", "Opening downloads…"),
     },
     {
       id: "sources",
@@ -339,8 +342,9 @@ export default function HomeScreen() {
             {
               id: "downloads-space",
               title: "Downloads",
+              detail: formatCount(downloadCount, "offline track"),
               icon: "download",
-              onPress: () => navigationService.push("/library", "Opening library…"),
+              onPress: () => navigationService.push("/downloads", "Opening downloads…"),
             },
             {
               id: "liked-space",

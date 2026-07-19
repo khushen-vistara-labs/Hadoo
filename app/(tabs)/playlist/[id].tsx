@@ -7,15 +7,20 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { CachedArtwork } from "@/components/artwork/CachedArtwork";
 import { AddToPlaylistSheet } from "@/components/playlists/AddToPlaylistSheet";
+import { ProgressBar } from "@/components/ui/ProgressBar";
 import { Screen } from "@/components/ui/Screen";
 import { SymbolIcon } from "@/components/ui/SymbolIcon";
 import { Text } from "@/components/ui/Text";
 import { providerLabels } from "@/constants/providers";
 import { useMiniPlayerLayout } from "@/hooks/useMiniPlayerLayout";
 import { useTheme } from "@/hooks/useTheme";
+import { downloadService, type DownloadBatchProgress } from "@/modules/downloads/downloadService";
+import { findDownloadForTrack, useDownloadStore } from "@/modules/downloads/downloadStore";
 import { playerService } from "@/modules/player/playerService";
 import { usePlaylistStore } from "@/modules/playlists/playlistStore";
 import { sourceRegistry } from "@/modules/sources/SourceRegistry";
+import { buildCanonicalTrackKey } from "@/modules/sources/sourceUtils";
+import { navigationService } from "@/services/navigationService";
 import { toastService } from "@/services/toastService";
 import type { ArtworkLike } from "@/types/artwork";
 import type { Playlist } from "@/types/playlist";
@@ -35,6 +40,7 @@ type CollectionTrackRowProps = {
 
 const CollectionTrackRow = memo(({ index, queue, track, onLongPress }: CollectionTrackRowProps) => {
   const theme = useTheme();
+  const isDownloaded = useDownloadStore((state) => Boolean(findDownloadForTrack(track, state.downloads)));
   const rowGlowColors = [`${theme.accent}12`, `${theme.accentAlt}0D`, "transparent"] as const;
 
   return (
@@ -84,10 +90,19 @@ const CollectionTrackRow = memo(({ index, queue, track, onLongPress }: Collectio
         </View>
       </View>
       <View style={styles.rowSide}>
+        {isDownloaded ? <SymbolIcon name="checkCircle" size={16} color={theme.accent} /> : null}
         <Text muted>{formatDuration(track.duration)}</Text>
-        <View style={[styles.morePill, { backgroundColor: `${theme.surface}A8`, borderColor: `${theme.border}44` }]}>
+        <Pressable
+          accessibilityLabel={`Options for ${track.title}`}
+          hitSlop={8}
+          onPress={(event) => {
+            event.stopPropagation();
+            onLongPress(track);
+          }}
+          style={[styles.morePill, { backgroundColor: `${theme.surface}A8`, borderColor: `${theme.border}44` }]}
+        >
           <SymbolIcon name="menu" size={14} color={theme.textMuted} />
-        </View>
+        </Pressable>
       </View>
     </Pressable>
   );
@@ -113,6 +128,8 @@ export default function PlaylistDetailsScreen() {
   const { contentBottomSpacing } = useMiniPlayerLayout();
   const [selectedTrack, setSelectedTrack] = useState<Track | null>(null);
   const [playlistTrack, setPlaylistTrack] = useState<Track | null>(null);
+  const [playlistDownloadProgress, setPlaylistDownloadProgress] = useState<DownloadBatchProgress>();
+  const downloadsById = useDownloadStore((state) => state.downloads);
 
   const playlist = usePlaylistStore((state) => state.playlists.find((item) => item.id === id));
   const removeTrackFromPlaylist = usePlaylistStore((state) => state.removeTrackFromPlaylist);
@@ -133,7 +150,18 @@ export default function PlaylistDetailsScreen() {
   const title = playlist?.title ?? fallbackTitle ?? remoteCollection?.title ?? "Playlist";
   const subtitle = playlist?.description ?? fallbackSubtitle;
   const artwork = (playlist?.artwork ?? remoteCollection?.artwork) as ArtworkLike | undefined;
-  const tracks = (playlist?.tracks ?? remoteCollectionQuery.data?.tracks ?? []) as Track[];
+  const tracks = useMemo(
+    () => (playlist?.tracks ?? remoteCollectionQuery.data?.tracks ?? []) as Track[],
+    [playlist?.tracks, remoteCollectionQuery.data?.tracks],
+  );
+  const uniquePlaylistTracks = useMemo(
+    () => [...new Map(tracks.map((track) => [buildCanonicalTrackKey(track), track])).values()],
+    [tracks],
+  );
+  const downloadedTrackCount = uniquePlaylistTracks.filter((track) =>
+    Boolean(findDownloadForTrack(track, downloadsById)),
+  ).length;
+  const isPlaylistDownloaded = uniquePlaylistTracks.length > 0 && downloadedTrackCount === uniquePlaylistTracks.length;
   const isRemoteCollection = !playlist && Boolean(sourceUrl);
   const providers = useMemo(
     () => [...new Set(tracks.map((track) => track.provider))],
@@ -142,6 +170,39 @@ export default function PlaylistDetailsScreen() {
   const primaryProvider = providers.length === 1 ? providerLabels[providers[0]] : "Mixed sources";
   const leadArtist = tracks[0]?.artist;
   const heroSubtitle = subtitle ?? leadArtist ?? primaryProvider;
+
+  const handlePlaylistDownload = async () => {
+    if (!playlist || playlistDownloadProgress) {
+      return;
+    }
+    if (!uniquePlaylistTracks.length) {
+      toastService.show("Add a few tracks before downloading this playlist.");
+      return;
+    }
+    if (isPlaylistDownloaded) {
+      navigationService.push("/downloads", "Opening downloads…");
+      return;
+    }
+
+    try {
+      const result = await downloadService.downloadTracks(uniquePlaylistTracks, setPlaylistDownloadProgress);
+      if (result.failed) {
+        toastService.show(
+          `Downloaded ${result.downloaded}; ${result.failed} ${result.failed === 1 ? "track" : "tracks"} failed.`,
+        );
+      } else if (!result.downloaded) {
+        toastService.show("Every track in this playlist is already downloaded.");
+      } else {
+        toastService.show(
+          `Downloaded ${formatCount(result.downloaded, "track")}${result.skipped ? `; skipped ${result.skipped} already saved` : ""}.`,
+        );
+      }
+    } catch {
+      toastService.show("Could not finish downloading this playlist.");
+    } finally {
+      setPlaylistDownloadProgress(undefined);
+    }
+  };
 
   if (!playlist && !sourceUrl) {
     return (
@@ -197,6 +258,9 @@ export default function PlaylistDetailsScreen() {
         ListHeaderComponent={
           <CollectionHeader
             artwork={artwork}
+            downloadedTrackCount={downloadedTrackCount}
+            downloadTargetCount={uniquePlaylistTracks.length}
+            downloadProgress={playlistDownloadProgress}
             heroSubtitle={heroSubtitle}
             isLocalPlaylist={Boolean(playlist)}
             onDelete={() => {
@@ -217,6 +281,7 @@ export default function PlaylistDetailsScreen() {
                 toastService.show("Could not start this collection.");
               });
             }}
+            onDownloadAll={() => void handlePlaylistDownload()}
             title={title}
             trackCount={tracks.length}
           />
@@ -273,17 +338,25 @@ export default function PlaylistDetailsScreen() {
 
 const CollectionHeader = ({
   artwork,
+  downloadedTrackCount,
+  downloadTargetCount,
+  downloadProgress,
   heroSubtitle,
   isLocalPlaylist,
   onDelete,
+  onDownloadAll,
   onPlayAll,
   title,
   trackCount,
 }: {
   artwork?: ArtworkLike;
+  downloadedTrackCount: number;
+  downloadTargetCount: number;
+  downloadProgress?: DownloadBatchProgress;
   heroSubtitle?: string;
   isLocalPlaylist: boolean;
   onDelete: () => void;
+  onDownloadAll: () => void;
   onPlayAll: () => void;
   title: string;
   trackCount: number;
@@ -323,6 +396,11 @@ const CollectionHeader = ({
           <View style={[styles.metaChip, { backgroundColor: `${theme.background}B0`, borderColor: `${theme.border}55` }]}>
             <Text muted numberOfLines={1}>{heroSubtitle || "Ready to play"}</Text>
           </View>
+          {isLocalPlaylist && downloadedTrackCount ? (
+            <View style={[styles.metaChip, { backgroundColor: `${theme.accent}16`, borderColor: `${theme.accent}44` }]}>
+              <Text style={{ color: theme.accent }}>{downloadedTrackCount} offline</Text>
+            </View>
+          ) : null}
         </View>
 
         <View style={styles.heroActions}>
@@ -331,11 +409,53 @@ const CollectionHeader = ({
             <Text style={{ color: theme.background }}>Play All</Text>
           </Pressable>
           {isLocalPlaylist ? (
-            <Pressable onPress={onDelete} style={[styles.secondaryAction, { backgroundColor: `${theme.background}C2`, borderColor: `${theme.border}88` }]}>
-              <Text muted>Delete</Text>
-            </Pressable>
+            <>
+              <Pressable
+                disabled={Boolean(downloadProgress)}
+                onPress={onDownloadAll}
+                style={[
+                  styles.downloadButton,
+                  {
+                    backgroundColor: `${theme.background}C2`,
+                    borderColor: downloadedTrackCount === downloadTargetCount && downloadTargetCount > 0 ? `${theme.accent}66` : `${theme.border}88`,
+                  },
+                ]}
+              >
+                {downloadProgress ? (
+                  <ActivityIndicator size="small" color={theme.accent} />
+                ) : (
+                  <SymbolIcon
+                    name={downloadedTrackCount === downloadTargetCount && downloadTargetCount > 0 ? "checkCircle" : "download"}
+                    size={16}
+                    color={theme.accent}
+                  />
+                )}
+                <Text style={{ color: theme.accent }}>
+                  {downloadProgress
+                    ? `${downloadProgress.completed}/${downloadProgress.total}`
+                    : downloadedTrackCount === downloadTargetCount && downloadTargetCount > 0
+                      ? "Downloaded"
+                      : downloadedTrackCount
+                        ? "Download Rest"
+                        : "Download All"}
+                </Text>
+              </Pressable>
+              <Pressable onPress={onDelete} style={[styles.secondaryAction, { backgroundColor: `${theme.background}C2`, borderColor: `${theme.border}88` }]}>
+                <Text muted>Delete</Text>
+              </Pressable>
+            </>
           ) : null}
         </View>
+        {downloadProgress ? (
+          <View style={styles.downloadProgress}>
+            <ProgressBar
+              progress={downloadProgress.total ? downloadProgress.completed / downloadProgress.total : 0}
+            />
+            <Text muted variant="caption">
+              Saving playlist · {downloadProgress.completed} of {downloadProgress.total}
+            </Text>
+          </View>
+        ) : null}
       </LinearGradient>
 
       <View style={styles.listIntro}>
@@ -363,6 +483,8 @@ const TrackDetailsSheet = ({
   const theme = useTheme();
   const insets = useSafeAreaInsets();
   const { contentBottomSpacing } = useMiniPlayerLayout();
+  const selectedDownload = useDownloadStore((state) => findDownloadForTrack(selectedTrack, state.downloads));
+  const selectedDownloadTask = useDownloadStore((state) => state.tasks[selectedTrack.id]);
 
   return (
     <View style={styles.overlay}>
@@ -438,6 +560,32 @@ const TrackDetailsSheet = ({
             Actions
           </Text>
           <View style={styles.sheetActionList}>
+            <Pressable
+              onPress={() => {
+                if (selectedDownload || selectedDownloadTask?.status === "queued" || selectedDownloadTask?.status === "downloading" || selectedDownloadTask?.status === "resolving") {
+                  onClose();
+                  navigationService.push("/downloads", "Opening downloads…");
+                  return;
+                }
+                void downloadService.downloadTrack(selectedTrack).then(
+                  () => toastService.show(`Downloaded ${selectedTrack.title}.`),
+                  () => toastService.show("Download failed. Check your connection and try again."),
+                );
+              }}
+              style={[styles.sheetActionButton, { borderColor: theme.accent, backgroundColor: `${theme.accent}14` }]}
+            >
+              <Text style={{ color: theme.accent }}>
+                {selectedDownload
+                  ? "Manage download"
+                  : selectedDownloadTask?.status === "queued"
+                    ? `Queued #${selectedDownloadTask.queuePosition ?? 1}`
+                    : selectedDownloadTask?.status === "downloading" || selectedDownloadTask?.status === "resolving"
+                    ? "Downloading…"
+                    : selectedDownloadTask?.status === "failed"
+                      ? "Retry download"
+                      : "Download"}
+              </Text>
+            </Pressable>
             <Pressable
               onPress={() => onAddToPlaylist(selectedTrack)}
               style={[styles.sheetActionButton, { borderColor: theme.accent, backgroundColor: `${theme.accent}14` }]}
@@ -542,6 +690,7 @@ const styles = StyleSheet.create({
   },
   heroActions: {
     flexDirection: "row",
+    flexWrap: "wrap",
     alignItems: "center",
     gap: 10,
   },
@@ -558,6 +707,18 @@ const styles = StyleSheet.create({
     borderRadius: 999,
     paddingHorizontal: 14,
     paddingVertical: 12,
+  },
+  downloadButton: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 7,
+    borderWidth: 1,
+    borderRadius: 999,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+  },
+  downloadProgress: {
+    gap: 2,
   },
   listIntro: {
     gap: 0,
