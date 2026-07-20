@@ -7,13 +7,17 @@ import { CachedArtwork } from "@/components/artwork/CachedArtwork";
 import { AddToPlaylistSheet } from "@/components/playlists/AddToPlaylistSheet";
 import { Chip } from "@/components/ui/Chip";
 import { Screen } from "@/components/ui/Screen";
+import { SymbolIcon } from "@/components/ui/SymbolIcon";
 import { Text } from "@/components/ui/Text";
 import { providerLabels } from "@/constants/providers";
 import { useMiniPlayerLayout } from "@/hooks/useMiniPlayerLayout";
 import { useSourceSearch } from "@/hooks/useSources";
 import { useTheme } from "@/hooks/useTheme";
+import { downloadService } from "@/modules/downloads/downloadService";
+import { findDownloadForTrack, useDownloadStore } from "@/modules/downloads/downloadStore";
 import { playerService } from "@/modules/player/playerService";
 import { sourceRegistry } from "@/modules/sources/SourceRegistry";
+import { navigationService } from "@/services/navigationService";
 import { toastService } from "@/services/toastService";
 import type { ProviderFilter } from "@/types/source";
 import type { Track } from "@/types/track";
@@ -36,9 +40,10 @@ type SearchResultRowProps = {
   track: Track;
   onPress: () => void;
   onLongPress: () => void;
+  onOptionsPress: () => void;
 };
 
-const SearchResultRow = memo(({ track, onPress, onLongPress }: SearchResultRowProps) => {
+const SearchResultRow = memo(({ track, onPress, onLongPress, onOptionsPress }: SearchResultRowProps) => {
   const theme = useTheme();
 
   return (
@@ -83,6 +88,17 @@ const SearchResultRow = memo(({ track, onPress, onLongPress }: SearchResultRowPr
       </View>
       <View style={styles.resultSide}>
         <Text muted>{formatDuration(track.duration)}</Text>
+        <Pressable
+          accessibilityLabel={`Options for ${track.title}`}
+          hitSlop={8}
+          onPress={(event) => {
+            event.stopPropagation();
+            onOptionsPress();
+          }}
+          style={[styles.resultMoreButton, { backgroundColor: `${theme.surfaceAlt}CC`, borderColor: `${theme.border}66` }]}
+        >
+          <SymbolIcon name="menu" size={15} color={theme.textMuted} />
+        </Pressable>
       </View>
     </Pressable>
   );
@@ -96,6 +112,12 @@ export default function SearchScreen() {
   const [provider, setProvider] = useState<ProviderFilter>("all");
   const [selectedTrack, setSelectedTrack] = useState<Track | null>(null);
   const [playlistTrack, setPlaylistTrack] = useState<Track | null>(null);
+  const selectedDownload = useDownloadStore((state) =>
+    selectedTrack ? findDownloadForTrack(selectedTrack, state.downloads) : undefined,
+  );
+  const selectedDownloadTask = useDownloadStore((state) =>
+    selectedTrack ? state.tasks[selectedTrack.id] : undefined,
+  );
   const theme = useTheme();
   const insets = useSafeAreaInsets();
   const { contentBottomSpacing } = useMiniPlayerLayout();
@@ -216,7 +238,7 @@ export default function SearchScreen() {
               {results.length ? (
                 <View style={styles.helperRow}>
                   <Text muted style={styles.helperText}>
-                    Press and hold any result to view full details.
+                    Hold a result or tap its options button to view full details.
                   </Text>
                 </View>
               ) : null}
@@ -254,6 +276,7 @@ export default function SearchScreen() {
               })
             }
             onLongPress={() => setSelectedTrack(track)}
+            onOptionsPress={() => setSelectedTrack(track)}
           />
         )}
       />
@@ -350,16 +373,45 @@ export default function SearchScreen() {
             ) : null}
             <View style={[styles.detailBlock, { backgroundColor: theme.surface, borderColor: `${theme.border}88` }]}>
               <Text muted variant="caption">
-                Playlists
+                Actions
               </Text>
               <View style={styles.playlistActions}>
+                <Pressable
+                  onPress={() => {
+                    if (!selectedTrack) {
+                      return;
+                    }
+                    if (selectedDownload || selectedDownloadTask?.status === "queued" || selectedDownloadTask?.status === "downloading" || selectedDownloadTask?.status === "resolving") {
+                      setSelectedTrack(null);
+                      navigationService.push("/downloads", "Opening downloads…");
+                      return;
+                    }
+                    void downloadService.downloadTrack(selectedTrack).then(
+                      () => toastService.show(`Downloaded ${selectedTrack.title}.`),
+                      () => toastService.show("Download failed. Check your connection and try again."),
+                    );
+                  }}
+                  style={[styles.playlistActionButton, { borderColor: theme.accent, backgroundColor: `${theme.accent}14` }]}
+                >
+                  <Text style={{ color: theme.accent }}>
+                    {selectedDownload
+                      ? "Manage download"
+                      : selectedDownloadTask?.status === "queued"
+                        ? `Queued #${selectedDownloadTask.queuePosition ?? 1}`
+                        : selectedDownloadTask?.status === "downloading" || selectedDownloadTask?.status === "resolving"
+                        ? "Downloading…"
+                        : selectedDownloadTask?.status === "failed"
+                          ? "Retry download"
+                          : "Download"}
+                  </Text>
+                </Pressable>
                 <Pressable
                   onPress={() => setPlaylistTrack(selectedTrack)}
                   style={[styles.playlistActionButton, { borderColor: theme.accent, backgroundColor: `${theme.accent}14` }]}
                 >
                   <Text style={{ color: theme.accent }}>Add to playlist</Text>
                 </Pressable>
-                <Text muted>Pick a playlist or create a new one.</Text>
+                <Text muted>Keep it offline or add it to a playlist.</Text>
               </View>
             </View>
           </ScrollView>
@@ -492,6 +544,15 @@ const styles = StyleSheet.create({
   resultSide: {
     alignItems: "flex-end",
     minWidth: 44,
+    gap: 10,
+  },
+  resultMoreButton: {
+    width: 30,
+    height: 30,
+    borderRadius: 999,
+    borderWidth: 1,
+    alignItems: "center",
+    justifyContent: "center",
   },
   emptyState: {
     borderRadius: 28,

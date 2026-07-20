@@ -13,8 +13,11 @@ import { Text } from "@/components/ui/Text";
 import { providerLabels } from "@/constants/providers";
 import { usePlayer } from "@/hooks/usePlayer";
 import { useTheme } from "@/hooks/useTheme";
+import { downloadService } from "@/modules/downloads/downloadService";
+import { findDownloadForTrack, useDownloadStore } from "@/modules/downloads/downloadStore";
 import { playerService } from "@/modules/player/playerService";
 import { navigationService } from "@/services/navigationService";
+import { toastService } from "@/services/toastService";
 import { formatDuration } from "@/utils/formatDuration";
 import type { Track } from "@/types/track";
 
@@ -25,7 +28,7 @@ const menuItems = [
   { icon: "add", title: "Add to Playlist", hint: "Available now" },
   { icon: "sparkles", title: "Smart Replace", hint: "Coming soon" },
   { icon: "refresh", title: "Refresh Metadata", hint: "Coming soon" },
-  { icon: "checkCircle", title: "Available Offline", hint: "Coming soon" },
+  { icon: "download", title: "Download", hint: "Listen without a connection" },
   { icon: "share", title: "Share", hint: "Coming soon" },
   { icon: "link", title: "Open Original Link", hint: "Coming soon" },
   { icon: "person", title: "Go to Artist", hint: "Coming soon" },
@@ -49,12 +52,22 @@ export default function NowPlayingScreen() {
   const [menuOpen, setMenuOpen] = useState(false);
   const [liked, setLiked] = useState(false);
   const [playlistTrack, setPlaylistTrack] = useState<Track | null>(null);
+  const downloadedTrack = useDownloadStore((state) =>
+    player.currentTrack ? findDownloadForTrack(player.currentTrack, state.downloads) : undefined,
+  );
+  const downloadTask = useDownloadStore((state) =>
+    player.currentTrack ? state.tasks[player.currentTrack.id] : undefined,
+  );
   const duration = player.duration || player.currentTrack?.duration || 0;
   const elapsed = seekDraft ?? player.progress;
   const progress = duration ? elapsed / duration : 0;
   const contextLabel = useMemo(() => {
     if (!player.currentTrack) {
       return "Nothing playing";
+    }
+
+    if (player.currentTrack.playbackProvider && player.currentTrack.fallbackFromProvider) {
+      return `Playing via ${providerLabels[player.currentTrack.playbackProvider]}`;
     }
 
     if (player.currentTrack.album) {
@@ -84,6 +97,24 @@ export default function NowPlayingScreen() {
 
     setPlaylistTrack(player.currentTrack);
     setMenuOpen(false);
+  };
+
+  const handleDownloadAction = () => {
+    const track = player.currentTrack;
+    if (!track) {
+      return;
+    }
+
+    setMenuOpen(false);
+    if (downloadedTrack || downloadTask?.status === "queued" || downloadTask?.status === "downloading" || downloadTask?.status === "resolving") {
+      navigationService.push("/downloads", "Opening downloads…");
+      return;
+    }
+
+    void downloadService.downloadTrack(track).then(
+      () => toastService.show(`Downloaded ${track.title}.`),
+      () => toastService.show("Download failed. Check your connection and try again."),
+    );
   };
 
   return (
@@ -183,6 +214,17 @@ export default function NowPlayingScreen() {
                     ? `${player.currentTrack.artist}${detailSuffix(player.currentTrack.album)}`
                     : "Choose something from home or search."}
                 </Text>
+                {player.currentTrack?.playbackProvider && player.currentTrack.fallbackFromProvider ? (
+                  <Text muted numberOfLines={1} style={styles.subtitle}>
+                    {`Requested from ${providerLabels[player.currentTrack.fallbackFromProvider]} · matched by ${
+                      player.currentTrack.playbackMatchKind === "cached_fallback"
+                        ? "cache"
+                        : player.currentTrack.playbackMatchKind === "isrc"
+                          ? "ISRC"
+                          : "metadata"
+                    }`}
+                  </Text>
+                ) : null}
               </View>
               <Pressable
                 hitSlop={8}
@@ -387,6 +429,11 @@ export default function NowPlayingScreen() {
                           return;
                         }
 
+                        if (item.title === "Download") {
+                          handleDownloadAction();
+                          return;
+                        }
+
                         setMenuOpen(false);
                       }}
                       style={styles.menuRow}
@@ -395,13 +442,31 @@ export default function NowPlayingScreen() {
                         <SymbolIcon
                           name={item.icon}
                           size={18}
-                          color={item.icon === "checkCircle" ? theme.accent : theme.text}
+                          color={item.icon === "download" ? theme.accent : theme.text}
                         />
                       </View>
                       <View style={styles.menuRowMeta}>
-                        <Text>{item.title}</Text>
+                        <Text>
+                          {item.title === "Download"
+                            ? downloadedTrack
+                              ? "Downloaded"
+                              : downloadTask?.status === "queued"
+                                ? "Queued"
+                                : downloadTask?.status === "downloading" || downloadTask?.status === "resolving"
+                                ? "Downloading"
+                                : downloadTask?.status === "failed"
+                                  ? "Retry Download"
+                                  : item.title
+                            : item.title}
+                        </Text>
                         <Text muted style={styles.menuHint}>
-                          {item.hint}
+                          {item.title === "Download" && downloadedTrack
+                            ? "Available offline · manage downloads"
+                            : item.title === "Download" && downloadTask?.status === "queued"
+                              ? `Waiting · position ${downloadTask.queuePosition ?? 1}`
+                            : item.title === "Download" && downloadTask?.status === "downloading"
+                              ? `${Math.round(downloadTask.progress * 100)}% complete`
+                              : item.hint}
                         </Text>
                       </View>
                       <SymbolIcon name="forward" size={16} color={theme.textMuted} />

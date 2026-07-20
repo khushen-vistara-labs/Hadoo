@@ -1,5 +1,7 @@
 import { CachedMusicSource } from "@/modules/sources/CachedMusicSource";
 import { ExperimentalJioSaavnSource } from "@/modules/sources/ExperimentalJioSaavnSource";
+import { ExperimentalSpotifySource } from "@/modules/sources/ExperimentalSpotifySource";
+import { useFallbackMatchStore } from "@/modules/sources/fallbackMatchStore";
 import { ExperimentalYouTubeSource } from "@/modules/sources/ExperimentalYouTubeSource";
 import { ExperimentalYouTubeMusicSource } from "@/modules/sources/ExperimentalYouTubeMusicSource";
 import { LocalFilesMusicSource } from "@/modules/sources/LocalFilesMusicSource";
@@ -7,10 +9,12 @@ import type { MusicSource } from "@/modules/sources/MusicSource";
 import { MockMusicSource } from "@/modules/sources/MockMusicSource";
 import { PlaceholderCatalogSource } from "@/modules/sources/PlaceholderCatalogSource";
 import {
+  buildCanonicalTrackKey,
   buildTrackSearchQuery,
   extractScopedLocalId,
-  findBestTrackCandidate,
   isProbablyUrl,
+  isStreamExpired,
+  rankTrackCandidates,
   selectPreferredStream,
 } from "@/modules/sources/sourceUtils";
 import { logger } from "@/services/logger";
@@ -18,7 +22,7 @@ import type { AudioQualityPreference, MusicProvider, ProviderStatus } from "@/ty
 import type { ImportResult } from "@/modules/sources/sourceModels";
 import type { HomeSection } from "@/types/home";
 import type { StreamResult, Track } from "@/types/track";
-import { SourceUnavailableError, StreamResolveError } from "@/utils/errors";
+import { StreamResolveError } from "@/utils/errors";
 
 type ProviderHealth = {
   provider: MusicProvider;
@@ -35,9 +39,9 @@ export class SourceRegistry {
     [
       new MockMusicSource(),
       new LocalFilesMusicSource(),
+      new ExperimentalSpotifySource(),
       new ExperimentalYouTubeSource(),
       new ExperimentalYouTubeMusicSource(),
-      new PlaceholderCatalogSource({ id: "spotify_experimental", name: "Spotify Experimental" }),
       new PlaceholderCatalogSource({ id: "soundcloud_experimental", name: "SoundCloud Experimental" }),
       new PlaceholderCatalogSource({ id: "deezer_experimental", name: "Deezer Experimental" }),
       new PlaceholderCatalogSource({ id: "tidal_experimental", name: "Tidal Experimental" }),
@@ -146,12 +150,20 @@ export class SourceRegistry {
       return { url: track.fileUrl, quality: track.quality ?? "high" };
     }
 
-    if (track.streamUrl?.startsWith("http")) {
-      return { url: track.streamUrl, quality: track.quality ?? "unknown" };
+    if (track.streamUrl?.startsWith("http") && !isStreamExpired({ expiresAt: track.streamExpiresAt })) {
+      return {
+        url: track.streamUrl,
+        quality: track.quality ?? "unknown",
+        headers: track.streamHeaders,
+        format: track.streamFormat,
+        mimeType: track.streamMimeType,
+        expiresAt: track.streamExpiresAt,
+      };
     }
 
     const source = this.sources.get(track.provider);
     const fallbackProviders = this.getPlaybackFallbackProviders(track.provider);
+    const canonicalKey = buildCanonicalTrackKey(track);
     let lastError: unknown;
 
     if (source?.getStreams) {
@@ -168,7 +180,7 @@ export class SourceRegistry {
 
     for (const provider of fallbackProviders) {
       try {
-        const resolved = await this.resolveFallbackStream(track, provider, preference);
+        const resolved = await this.resolveFallbackStream(track, provider, preference, canonicalKey);
         if (resolved) {
           logger.info("Resolved playback through fallback provider", {
             requestedProvider: track.provider,
@@ -253,17 +265,41 @@ export class SourceRegistry {
     }
 
     const streams = await source.getStreams(localId);
-    return selectPreferredStream(streams, preference);
+    const selected = selectPreferredStream(streams, preference);
+    if (!selected) {
+      return undefined;
+    }
+
+    return {
+      ...selected,
+      resolvedTrack: track,
+    };
   }
 
   private async resolveFallbackStream(
     track: Track,
     provider: MusicProvider,
     preference: AudioQualityPreference,
+    canonicalKey: string,
   ): Promise<StreamResult | undefined> {
     const source = this.sources.get(provider);
     if (!source?.search || !source.getStreams) {
       return undefined;
+    }
+
+    const cached = this.resolveCachedFallbackTrack(track, provider, canonicalKey);
+    if (cached) {
+      try {
+        const stream = await this.resolveTrackStream(cached, preference, source);
+        if (stream) {
+          return {
+            ...stream,
+            resolvedTrack: cached,
+          };
+        }
+      } catch (error) {
+        logger.warn("Cached fallback stream is no longer playable", provider, cached.localId, error);
+      }
     }
 
     const query = buildTrackSearchQuery(track);
@@ -272,12 +308,84 @@ export class SourceRegistry {
     }
 
     const candidates = await source.search(query);
-    const match = findBestTrackCandidate(track, candidates);
-    if (!match) {
+    const matches = rankTrackCandidates(track, candidates).slice(0, 4);
+    if (!matches.length) {
+      return undefined;
+    }
+    let lastError: unknown;
+
+    for (const match of matches) {
+      const matchKind = track.isrc && match.isrc && track.isrc === match.isrc ? "isrc" : "metadata_search";
+      const matchedTrack: Track = {
+        ...match,
+        playbackProvider: provider,
+        fallbackFromProvider: track.provider,
+        playbackMatchKind: matchKind,
+      };
+
+      try {
+        const stream = await this.resolveTrackStream(matchedTrack, preference, source);
+        if (!stream) {
+          continue;
+        }
+
+        this.cacheFallbackMatch(canonicalKey, matchedTrack, matchKind);
+        return {
+          ...stream,
+          resolvedTrack: matchedTrack,
+        };
+      } catch (error) {
+        lastError = error;
+        logger.warn("Fallback candidate was not playable", provider, matchedTrack.localId, error);
+      }
+    }
+
+    if (lastError instanceof Error) {
+      throw lastError;
+    }
+    return undefined;
+  }
+
+  private resolveCachedFallbackTrack(track: Track, provider: MusicProvider, canonicalKey: string): Track | undefined {
+    const cached = useFallbackMatchStore.getState().getMatch(canonicalKey);
+    if (!cached || cached.targetProvider !== provider || !cached.localId) {
       return undefined;
     }
 
-    return this.resolveTrackStream(match, preference, source);
+    return {
+      ...track,
+      id: `${provider}::${cached.localId}`,
+      provider,
+      localId: cached.localId,
+      providerTrackId: cached.localId,
+      sourceUrl: cached.sourceUrl ?? track.sourceUrl,
+      title: cached.title || track.title,
+      artist: cached.artist || track.artist,
+      artwork: cached.artwork ?? track.artwork,
+      duration: cached.duration ?? track.duration,
+      playbackProvider: provider,
+      fallbackFromProvider: track.provider,
+      playbackMatchKind: "cached_fallback",
+    };
+  }
+
+  private cacheFallbackMatch(canonicalKey: string, track: Track, matchKind: "isrc" | "metadata_search") {
+    const localId = extractScopedLocalId(track);
+    if (!localId) {
+      return;
+    }
+
+    useFallbackMatchStore.getState().saveMatch(canonicalKey, {
+      targetProvider: track.provider,
+      localId,
+      sourceUrl: track.sourceUrl,
+      title: track.title,
+      artist: track.artist,
+      artwork: track.artwork,
+      duration: track.duration,
+      matchedAt: Date.now(),
+      matchKind,
+    });
   }
 }
 

@@ -1,11 +1,9 @@
 import { ActivityIndicator, StyleSheet, View } from "react-native";
-import { StatusBar } from "expo-status-bar";
 
 import { BrandLogo } from "@/components/ui/BrandLogo";
 
 export const AppBootstrapScreen = () => (
   <View style={styles.container}>
-    <StatusBar backgroundColor="#FFFFFF" style="dark" />
     <View style={styles.logoFrame}>
       <BrandLogo accessibilityLabel="Hadoo" size={280} variant="wordmark" />
       <ActivityIndicator color="#2AAEC7" size="small" style={styles.wordmarkSpinner} />
@@ -15,10 +13,11 @@ export const AppBootstrapScreen = () => (
 
 const styles = StyleSheet.create({
   container: {
-    flex: 1,
+    ...StyleSheet.absoluteFillObject,
     alignItems: "center",
     justifyContent: "center",
     backgroundColor: "#FFFFFF",
+    zIndex: 100,
   },
   logoFrame: {
     width: 280,

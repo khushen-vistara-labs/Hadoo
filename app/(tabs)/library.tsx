@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { Pressable, ScrollView, StyleSheet, TextInput, View } from "react-native";
+import { Pressable, StyleSheet, TextInput, View } from "react-native";
 
 import { CachedArtwork } from "@/components/artwork/CachedArtwork";
 import { Button } from "@/components/ui/Button";
@@ -7,6 +7,7 @@ import { Screen } from "@/components/ui/Screen";
 import { SymbolIcon } from "@/components/ui/SymbolIcon";
 import { Text } from "@/components/ui/Text";
 import { useTheme } from "@/hooks/useTheme";
+import { useDownloadStore } from "@/modules/downloads/downloadStore";
 import { useLibraryStore } from "@/modules/library/libraryStore";
 import { usePlaylistStore } from "@/modules/playlists/playlistStore";
 import { navigationService } from "@/services/navigationService";
@@ -38,6 +39,7 @@ export default function LibraryScreen() {
   const likedSongs = useLibraryStore((state) => state.likedSongs);
   const recentlyPlayed = useLibraryStore((state) => state.recentlyPlayed);
   const playlists = usePlaylistStore((state) => state.playlists);
+  const downloadCount = useDownloadStore((state) => Object.keys(state.downloads).length);
   const createPlaylist = usePlaylistStore((state) => state.createPlaylist);
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
@@ -171,10 +173,13 @@ export default function LibraryScreen() {
         <UtilityCard
           icon="download"
           title="Downloads"
+          detail={formatCount(downloadCount, "offline track")}
+          onPress={() => navigationService.push("/downloads", "Opening downloads…")}
         />
         <UtilityCard
           icon="folder"
           title="Local Files"
+          detail="Coming soon"
         />
       </View>
     </Screen>
@@ -211,21 +216,36 @@ const LibraryStatCard = ({
 };
 
 const UtilityCard = ({
+  detail,
   icon,
+  onPress,
   title,
 }: {
+  detail?: string;
   icon: "download" | "folder";
+  onPress?: () => void;
   title: string;
 }) => {
   const theme = useTheme();
 
   return (
-    <View style={[styles.utilityCard, { backgroundColor: `${theme.card}D0`, borderColor: `${theme.border}88` }]}>
+    <Pressable
+      disabled={!onPress}
+      onPress={onPress}
+      style={({ pressed }) => [
+        styles.utilityCard,
+        {
+          backgroundColor: pressed ? `${theme.surfaceAlt}E8` : `${theme.card}D0`,
+          borderColor: pressed ? `${theme.accent}66` : `${theme.border}88`,
+        },
+      ]}
+    >
       <View style={[styles.utilityIcon, { backgroundColor: `${theme.accentAlt}16` }]}>
         <SymbolIcon name={icon} size={18} color={theme.accentAlt} />
       </View>
       <Text variant="headline">{title}</Text>
-    </View>
+      {detail ? <Text muted>{detail}</Text> : null}
+    </Pressable>
   );
 };
 

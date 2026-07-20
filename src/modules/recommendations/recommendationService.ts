@@ -137,10 +137,6 @@ const buildPrimarySection = ({
     id: "taste-primary-recommendations",
     provider: topTracks[0]?.provider ?? fallbackProvider,
     title: "Recommended For You",
-    subtitle:
-      scoredTracks[0]?.score > 0
-        ? "Built from your taste profile and tuned by what you actually play."
-        : "We are starting with the strongest shelves available while your recommendations learn.",
     cardType: "track_list",
     items: topTracks.map((track) => ({
       id: `recommended-${track.provider}-${track.id}`,

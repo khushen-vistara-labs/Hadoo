@@ -1,18 +1,26 @@
 import { QueryClientProvider } from "@tanstack/react-query";
 import { Ionicons } from "@expo/vector-icons";
 import { useFonts } from "expo-font";
+import * as SplashScreen from "expo-splash-screen";
 import { Stack, router, usePathname } from "expo-router";
 import { StatusBar } from "expo-status-bar";
 import { useEffect } from "react";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
 
 import { MiniPlayer } from "@/components/player/MiniPlayer";
+import { DownloadStatusPill } from "@/components/downloads/DownloadStatusPill";
 import { AppBootstrapScreen } from "@/components/ui/AppBootstrapScreen";
 import { AppLoadingOverlay } from "@/components/ui/AppLoadingOverlay";
 import { queryClient } from "@/data/queryClient";
+import { downloadService } from "@/modules/downloads/downloadService";
+import { useDownloadStore } from "@/modules/downloads/downloadStore";
 import { playerService } from "@/modules/player/playerService";
 import { useTasteProfileStore } from "@/modules/recommendations/tasteProfileStore";
 import { navigationService } from "@/services/navigationService";
+
+void SplashScreen.preventAutoHideAsync().catch(() => {
+  // Ignore duplicate calls during fast refresh.
+});
 
 export default function RootLayout() {
   const [fontsLoaded, fontError] = useFonts({
@@ -20,12 +28,20 @@ export default function RootLayout() {
     CuteDisplay: require("../assets/fonts/Skia.ttf"),
   });
   const pathname = usePathname();
+  const downloadsHydrated = useDownloadStore((state) => state.hasHydrated);
   const hasHydrated = useTasteProfileStore((state) => state.hasHydrated);
   const onboardingCompleted = useTasteProfileStore((state) => state.tasteProfile.onboardingCompleted);
+  const isBootstrapping = !hasHydrated || (!fontsLoaded && !fontError);
 
   useEffect(() => {
     void playerService.setup();
   }, []);
+
+  useEffect(() => {
+    if (downloadsHydrated) {
+      void downloadService.reconcileDownloads();
+    }
+  }, [downloadsHydrated]);
 
   useEffect(() => {
     if (fontError && __DEV__) {
@@ -51,14 +67,23 @@ export default function RootLayout() {
     return () => clearTimeout(timeout);
   }, [pathname]);
 
-  if (!hasHydrated || (!fontsLoaded && !fontError)) {
-    return <AppBootstrapScreen />;
-  }
+  useEffect(() => {
+    if (isBootstrapping) {
+      return;
+    }
+
+    void SplashScreen.hideAsync().catch(() => {
+      // Ignore hide failures and continue boot.
+    });
+  }, [isBootstrapping]);
 
   return (
     <GestureHandlerRootView style={{ flex: 1 }}>
       <QueryClientProvider client={queryClient}>
-        <StatusBar style="light" />
+        <StatusBar
+          backgroundColor={isBootstrapping ? "#FFFFFF" : "transparent"}
+          style={isBootstrapping ? "dark" : "light"}
+        />
         <Stack screenOptions={{ headerShown: false }}>
           <Stack.Screen name="(tabs)" />
           <Stack.Screen name="onboarding" options={{ presentation: "card" }} />
@@ -68,9 +93,12 @@ export default function RootLayout() {
           <Stack.Screen name="sleep-timer" options={{ presentation: "modal" }} />
           <Stack.Screen name="player-settings" options={{ presentation: "card" }} />
           <Stack.Screen name="source-settings" options={{ presentation: "card" }} />
+          <Stack.Screen name="downloads" options={{ presentation: "card" }} />
         </Stack>
-        {pathname !== "/now-playing" ? <MiniPlayer /> : null}
+        {!isBootstrapping && pathname !== "/now-playing" ? <MiniPlayer /> : null}
+        {!isBootstrapping ? <DownloadStatusPill /> : null}
         <AppLoadingOverlay />
+        {isBootstrapping ? <AppBootstrapScreen /> : null}
       </QueryClientProvider>
     </GestureHandlerRootView>
   );

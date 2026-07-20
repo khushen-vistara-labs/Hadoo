@@ -21,6 +21,11 @@ type LibraryStore = {
   clearRecentlyPlayed: () => void;
 };
 
+const withoutTransientStreamHeaders = (track: Track): Track => ({
+  ...track,
+  streamHeaders: undefined,
+});
+
 export const useLibraryStore = create<LibraryStore>()(
   persist(
     (set, get) => ({
@@ -32,14 +37,25 @@ export const useLibraryStore = create<LibraryStore>()(
         set({
           likedSongs: exists
             ? get().likedSongs.filter((item) => item.id !== track.id)
-            : [track, ...get().likedSongs],
+            : [withoutTransientStreamHeaders(track), ...get().likedSongs],
         });
       },
       addRecent: (track) => {
-        const next = [track, ...get().recentlyPlayed.filter((item) => item.id !== track.id)].slice(0, 12);
+        const next = [
+          withoutTransientStreamHeaders(track),
+          ...get().recentlyPlayed.filter((item) => item.id !== track.id),
+        ].slice(0, 12);
         set({ recentlyPlayed: next });
       },
-      updateResumeSession: (resumeSession) => set({ resumeSession }),
+      updateResumeSession: (resumeSession) =>
+        set({
+          resumeSession: resumeSession
+            ? {
+                ...resumeSession,
+                track: withoutTransientStreamHeaders(resumeSession.track),
+              }
+            : undefined,
+        }),
       clearRecentlyPlayed: () => set({ recentlyPlayed: [] }),
     }),
     {

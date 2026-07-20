@@ -24,7 +24,7 @@ const providerStates: Record<MusicProvider, boolean> = {
   local: false,
   youtube_experimental: true,
   youtube_music_experimental: true,
-  spotify_experimental: false,
+  spotify_experimental: true,
   amazon_music_experimental: false,
   tidal_experimental: false,
   deezer_experimental: false,
