@@ -44,7 +44,7 @@ export const SelectableArtistChips = ({
 
       {selected.length ? (
         <View style={styles.group}>
-          <Text muted>Your picks</Text>
+          <Text muted>Selected</Text>
           <View style={styles.wrap}>
             {selected.map((artist) => (
               <Chip key={artist} label={artist} active onPress={() => onToggleArtist(artist)} />
@@ -56,10 +56,14 @@ export const SelectableArtistChips = ({
       <View style={styles.group}>
         <Text muted>
           {loading
-            ? "Finding artists from your active provider..."
+            ? "Searching..."
             : providerUnavailable
-              ? "Search is unavailable right now. Typed chips still work."
-              : "Tap suggestions from search, or add your own artists."}
+              ? "Search is unavailable. You can still add a name."
+              : suggestions.length
+                ? "Suggestions"
+                : query.trim().length >= 2
+                  ? "No artists found. You can add the name above."
+                  : "Search to see suggestions."}
         </Text>
         <View style={styles.wrap}>
           {suggestions.map((artist) => (

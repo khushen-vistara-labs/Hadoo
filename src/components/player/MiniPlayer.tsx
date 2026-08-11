@@ -1,4 +1,5 @@
 import { LinearGradient } from "expo-linear-gradient";
+import { router } from "expo-router";
 import { ActivityIndicator, Pressable, StyleSheet, View } from "react-native";
 
 import { CachedArtwork } from "@/components/artwork/CachedArtwork";
@@ -7,7 +8,6 @@ import { Text } from "@/components/ui/Text";
 import { useMiniPlayerLayout } from "@/hooks/useMiniPlayerLayout";
 import { usePlayer } from "@/hooks/usePlayer";
 import { useTheme } from "@/hooks/useTheme";
-import { navigationService } from "@/services/navigationService";
 import { playerService } from "@/modules/player/playerService";
 import { formatDuration } from "@/utils/formatDuration";
 
@@ -23,7 +23,7 @@ export const MiniPlayer = () => {
   const progressRatio = duration > 0 ? Math.min(Math.max(progress / duration, 0), 1) : 0;
 
   return (
-    <Pressable onPress={() => navigationService.push("/now-playing", "Opening player…")} style={[styles.wrapper, { bottom: miniPlayerBottomOffset }]}>
+    <Pressable onPress={() => router.push("/now-playing")} style={[styles.wrapper, { bottom: miniPlayerBottomOffset }]}>
       <View style={[styles.shell, { backgroundColor: theme.surface, borderColor: theme.border }]}>
         <LinearGradient colors={["rgba(255,255,255,0.06)", "rgba(255,255,255,0.02)"]} style={styles.card}>
           {currentTrack.artwork ? (
@@ -59,7 +59,7 @@ export const MiniPlayer = () => {
                 disabled={isLoading}
                 onPress={(event) => {
                   event.stopPropagation();
-                  void (isPlaying ? playerService.pause() : playerService.resume());
+                  void playerService.togglePlayback();
                 }}
                 style={[styles.actionButton, { backgroundColor: theme.surfaceAlt }]}
               >

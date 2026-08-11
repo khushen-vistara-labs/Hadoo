@@ -7,7 +7,6 @@ import { Text } from "@/components/ui/Text";
 import { useTheme } from "@/hooks/useTheme";
 
 type Props = PropsWithChildren<{
-  eyebrow: string;
   title: string;
   body: string;
   ctaLabel: string;
@@ -18,7 +17,6 @@ type Props = PropsWithChildren<{
 }>;
 
 export const OnboardingStepContainer = ({
-  eyebrow,
   title,
   body,
   ctaLabel,
@@ -33,10 +31,7 @@ export const OnboardingStepContainer = ({
   return (
     <Card style={[styles.card, { backgroundColor: theme.card }]}>
       <View style={styles.copy}>
-        <Text variant="caption" style={{ color: theme.accent }}>
-          {eyebrow}
-        </Text>
-        <Text variant="headline">{title}</Text>
+        <Text variant="title">{title}</Text>
         <Text muted>{body}</Text>
       </View>
       <View style={styles.body}>{children}</View>

@@ -2,7 +2,12 @@ import type { MusicSource } from "@/modules/sources/MusicSource";
 import { pipedYouTubeClient } from "@/modules/sources/PipedYouTubeClient";
 import type { ImportResult } from "@/modules/sources/sourceModels";
 import { buildScopedTrackId } from "@/modules/sources/sourceUtils";
-import { fetchYouTubeMusicCollection, fetchYouTubeMusicHomeSections } from "@/modules/sources/youtube/musicHome";
+import {
+  fetchYouTubeMusicCollection,
+  fetchYouTubeMusicHomeSections,
+  searchYouTubeMusic,
+  searchYouTubeMusicArtists,
+} from "@/modules/sources/youtube/musicHome";
 import { youtubeResolver } from "@/modules/sources/youtube/resolver";
 import {
   extractYouTubeBrowseId,
@@ -43,29 +48,11 @@ export class ExperimentalYouTubeMusicSource implements MusicSource {
       return imported.tracks;
     }
 
-    const results = await pipedYouTubeClient.search(trimmed);
+    return searchYouTubeMusic(trimmed);
+  }
 
-    return results
-      .map((item) => {
-        const localId = extractYouTubeVideoId(`https://www.youtube.com${item.url}`);
-        if (!localId) {
-          return undefined;
-        }
-
-        return {
-          id: buildScopedTrackId(this.id, localId),
-          provider: this.id,
-          localId,
-          title: item.title,
-          artist: item.uploaderName ?? "Unknown artist",
-          artists: item.uploaderName ? [item.uploaderName] : undefined,
-          artwork: item.thumbnail,
-          duration: item.duration,
-          sourceUrl: `https://www.youtube.com/watch?v=${localId}`,
-          providerTrackId: localId,
-        } satisfies Track;
-      })
-      .filter(Boolean) as Track[];
+  searchArtists(query: string) {
+    return searchYouTubeMusicArtists(query);
   }
 
   async resolveTrackFromUrl(url: string): Promise<Track> {

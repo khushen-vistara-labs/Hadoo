@@ -110,6 +110,44 @@ export class SourceRegistry {
     return tracks;
   }
 
+  async searchArtists(query: string, provider: MusicProvider | "all" = "all") {
+    const trimmed = query.trim();
+    if (!trimmed) {
+      return [];
+    }
+
+    const enabledSources = [...this.sources.values()].filter((source) => this.enabled.has(source.id));
+    const requestedSources =
+      provider === "all" ? enabledSources : enabledSources.filter((source) => source.id === provider);
+    const requestedArtistSources = requestedSources.filter((source) => source.searchArtists);
+    const candidates = requestedArtistSources.length
+      ? requestedArtistSources
+      : enabledSources.filter((source) => source.searchArtists);
+
+    const settled = await Promise.allSettled(candidates.map((source) => source.searchArtists!(trimmed)));
+    const artists: string[] = [];
+
+    settled.forEach((result, index) => {
+      if (result.status === "fulfilled") {
+        artists.push(...result.value);
+        return;
+      }
+
+      logger.warn("Provider artist search failed", candidates[index]?.id, result.reason);
+    });
+
+    const seen = new Set<string>();
+    return artists.filter((artist) => {
+      const normalized = artist.trim().toLowerCase();
+      if (!normalized || seen.has(normalized)) {
+        return false;
+      }
+
+      seen.add(normalized);
+      return true;
+    });
+  }
+
   async resolveUrlIntent(url: string, provider: MusicProvider | "all" = "all"): Promise<Track[]> {
     const candidates =
       provider === "all"

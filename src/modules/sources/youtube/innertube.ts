@@ -122,15 +122,28 @@ export const fetchInnertubePlayerResponses = async (
 
   for (const client of CLIENT_PROFILES) {
     try {
-      const payload = await postPlayerRequest(watchPage.apiKey, watchPage, videoId, signatureTimestamp, client);
+      const payload = await postPlayerRequest(
+        watchPage.apiKey,
+        watchPage,
+        videoId,
+        signatureTimestamp,
+        client,
+      );
       responses.push({ client, payload });
+
+      const hasPlayableFormats =
+        (payload.streamingData?.adaptiveFormats?.length ?? 0) > 0 ||
+        (payload.streamingData?.formats?.length ?? 0) > 0;
+      if (payload.playabilityStatus?.status === "OK" && hasPlayableFormats) {
+        return responses;
+      }
     } catch (error) {
       lastError = error instanceof Error ? error : new Error(String(error));
     }
   }
 
-  if (!responses.length && lastError) {
-    throw lastError;
+  if (!responses.length) {
+    throw lastError ?? new Error("Innertube player request failed.");
   }
 
   return responses;

@@ -2,6 +2,7 @@ import type { MusicSource } from "@/modules/sources/MusicSource";
 import { pipedYouTubeClient } from "@/modules/sources/PipedYouTubeClient";
 import type { ImportResult } from "@/modules/sources/sourceModels";
 import { buildScopedTrackId } from "@/modules/sources/sourceUtils";
+import { searchYouTubeMusicArtists } from "@/modules/sources/youtube/musicHome";
 import { youtubeResolver } from "@/modules/sources/youtube/resolver";
 import { extractYouTubePlaylistId, extractYouTubeVideoId, isYouTubeUrl } from "@/modules/sources/youtubeUrl";
 import type { StreamSource, Track } from "@/types/track";
@@ -59,6 +60,10 @@ export class ExperimentalYouTubeSource implements MusicSource {
         } satisfies Track;
       })
       .filter(Boolean) as Track[];
+  }
+
+  searchArtists(query: string) {
+    return searchYouTubeMusicArtists(query);
   }
 
   async resolveTrackFromUrl(url: string): Promise<Track> {

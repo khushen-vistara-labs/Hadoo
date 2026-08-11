@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { LinearGradient } from "expo-linear-gradient";
-import { router, useLocalSearchParams } from "expo-router";
+import { useLocalSearchParams } from "expo-router";
 import { useEffect, useMemo, useState } from "react";
 import { ScrollView, StyleSheet, View } from "react-native";
 
@@ -51,9 +51,8 @@ const LANGUAGE_OPTIONS = [
   "Japanese",
   "Korean",
   "Mandarin",
-  "Instrumental",
 ];
-const GENRE_OPTIONS = ["Pop", "Hip-Hop", "Indie", "Electronic", "Bollywood", "Devotional", "Romance", "Lo-fi", "Classical", "Rock"];
+const GENRE_OPTIONS = ["Pop", "Hip-Hop", "Indie", "Electronic", "Bollywood", "Devotional", "Romance", "Lo-fi", "Classical", "Rock", "Instrumental"];
 const MOOD_OPTIONS = ["Focus", "Late Night", "Workout", "Chill", "Road Trip", "Soulful"];
 const ERA_OPTIONS = ["90s", "2000s", "2010s", "Fresh Releases", "Golden Classics"];
 
@@ -97,10 +96,8 @@ export default function OnboardingScreen() {
     queryKey: ["artist-onboarding-search", activeArtistProvider, debouncedArtistQuery],
     enabled: debouncedArtistQuery.length >= 2,
     staleTime: 5 * 60 * 1000,
-    queryFn: async () => {
-      const tracks = await sourceRegistry.search(debouncedArtistQuery, activeArtistProvider);
-      return [...new Set(tracks.flatMap((track) => track.artists?.length ? track.artists : [track.artist]).filter(Boolean))].slice(0, 10);
-    },
+    queryFn: async () =>
+      (await sourceRegistry.searchArtists(debouncedArtistQuery, activeArtistProvider)).slice(0, 10),
   });
 
   const artistSuggestions = useMemo(() => {
@@ -112,14 +109,11 @@ export default function OnboardingScreen() {
 
   const steps = [
     {
-      title: "Pick the languages you reach for",
-      subtitle: "This helps shape your first shelves before playback history exists.",
       content: (
         <OnboardingStepContainer
-          eyebrow="Taste Profile"
-          title="Languages first"
-          body="Choose the languages you want your home feed to lean on."
-          ctaLabel="Next"
+          title="What languages do you listen to?"
+          body="Pick at least one."
+          ctaLabel="Continue"
           onNext={() => setStepIndex(1)}
           disableNext={!languages.length}
         >
@@ -132,14 +126,11 @@ export default function OnboardingScreen() {
       ),
     },
     {
-      title: "Shape the sound",
-      subtitle: "Genres and categories give the recommendation layer something concrete to rank against.",
       content: (
         <OnboardingStepContainer
-          eyebrow="Taste Profile"
-          title="What should dominate?"
-          body="Pick a few genres or categories. This becomes the first signal for discovery."
-          ctaLabel="Next"
+          title="What kind of music do you like?"
+          body="Choose a few genres."
+          ctaLabel="Continue"
           onBack={() => setStepIndex(0)}
           onNext={() => setStepIndex(2)}
           disableNext={!genres.length}
@@ -153,14 +144,11 @@ export default function OnboardingScreen() {
       ),
     },
     {
-      title: "Name the artists that matter",
-      subtitle: "Artist picks are optional, but they give the home feed a much stronger opening signal.",
       content: (
         <OnboardingStepContainer
-          eyebrow="Artist Seeds"
-          title="Who should anchor the feed?"
-          body="Search your active provider when possible, or type artist names directly."
-          ctaLabel="Next"
+          title="Who are your favorite artists?"
+          body="Search and select any you love. This step is optional."
+          ctaLabel="Continue"
           onBack={() => setStepIndex(1)}
           onNext={() => setStepIndex(3)}
           onSkip={() => setStepIndex(3)}
@@ -186,14 +174,11 @@ export default function OnboardingScreen() {
       ),
     },
     {
-      title: "Set the vibe",
-      subtitle: "Mood and era are optional soft signals. They help ranking without hard-filtering the homepage.",
       content: (
         <OnboardingStepContainer
-          eyebrow="Optional Layers"
-          title="Mood and era"
-          body="These tags help the app nudge provider shelves toward the feeling you want."
-          ctaLabel="Next"
+          title="What fits your mood?"
+          body="Choose any moods or eras you enjoy. This step is optional."
+          ctaLabel="Continue"
           onBack={() => setStepIndex(2)}
           onNext={() => setStepIndex(4)}
           onSkip={() => setStepIndex(4)}
@@ -218,14 +203,11 @@ export default function OnboardingScreen() {
       ),
     },
     {
-      title: "Build your home feed",
-      subtitle: "These picks shape your first recommendations, then give way to real listening over time.",
       content: (
         <OnboardingStepContainer
-          eyebrow="Ready"
-          title="Building your home feed"
-          body="This profile stays on-device and seeds recommendations until your listening history becomes strong enough to take over."
-          ctaLabel={isEditMode ? "Save taste profile" : "Enter Discover"}
+          title="Looks good?"
+          body="You can change these choices anytime in Settings."
+          ctaLabel={isEditMode ? "Save" : "Start listening"}
           onBack={() => setStepIndex(3)}
           onNext={() => {
             completeOnboarding({
@@ -242,7 +224,7 @@ export default function OnboardingScreen() {
             colors={[theme.surfaceAlt, theme.surface, theme.background]}
             style={[styles.summaryHero, { borderColor: theme.border }]}
           >
-            <Text variant="headline">Personalization summary</Text>
+            <Text variant="headline">Your picks</Text>
             <View style={styles.summaryBlock}>
               <Text muted>Languages</Text>
               <Text>{languages.join(" • ")}</Text>
@@ -259,7 +241,7 @@ export default function OnboardingScreen() {
             ) : null}
             {moods.length || eras.length ? (
               <View style={styles.summaryBlock}>
-                <Text muted>Vibe</Text>
+                <Text muted>Moods and eras</Text>
                 <Text>{[...moods, ...eras].join(" • ")}</Text>
               </View>
             ) : null}
@@ -275,28 +257,16 @@ export default function OnboardingScreen() {
         contentContainerStyle={[styles.content, { paddingBottom: styles.content.paddingBottom + contentBottomSpacing }]}
         showsVerticalScrollIndicator={false}
       >
-        <View style={styles.header}>
-          <View style={styles.headerCopy}>
-            <Text variant="title">{isEditMode ? "Edit Taste Profile" : "Make Discover yours"}</Text>
-            <Text muted>
-              {isEditMode
-                ? "Update the signals that shape your recommendations."
-                : "A short setup to make Discover feel personal from the start."}
-            </Text>
+        {isEditMode ? (
+          <View style={styles.header}>
+            <Text variant="title">Edit taste</Text>
+            <Button label="Close" tone="secondary" onPress={() => navigationService.replace("/settings", "Opening settings…")} />
           </View>
-          {isEditMode ? <Button label="Close" tone="secondary" onPress={() => navigationService.replace("/settings", "Opening settings…")} /> : null}
-        </View>
+        ) : null}
 
-        <ProgressHeader
-          currentStep={stepIndex + 1}
-          totalSteps={stepCount}
-          title={steps[stepIndex].title}
-          subtitle={steps[stepIndex].subtitle}
-        />
+        <ProgressHeader currentStep={stepIndex + 1} totalSteps={stepCount} />
 
         {steps[stepIndex].content}
-
-        {!isEditMode && stepIndex === 0 ? <Text muted style={styles.secondaryLink}>You can change all of this later.</Text> : null}
       </ScrollView>
     </Screen>
   );
@@ -309,10 +279,9 @@ const styles = StyleSheet.create({
     gap: 22,
   },
   header: {
-    gap: 16,
-  },
-  headerCopy: {
-    gap: 8,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
   },
   optionalGroup: {
     gap: 10,
@@ -325,8 +294,5 @@ const styles = StyleSheet.create({
   },
   summaryBlock: {
     gap: 4,
-  },
-  secondaryLink: {
-    alignSelf: "center",
   },
 });

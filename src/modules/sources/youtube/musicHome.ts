@@ -8,7 +8,9 @@ import { SourceUnavailableError } from "@/utils/errors";
 
 const YT_MUSIC_URL = "https://music.youtube.com";
 const YT_MUSIC_BROWSE_URL = `${YT_MUSIC_URL}/youtubei/v1/browse`;
+const YT_MUSIC_SEARCH_URL = `${YT_MUSIC_URL}/youtubei/v1/search`;
 const DEFAULT_CLIENT_VERSION = "1.20260707.01.00";
+const ARTIST_SEARCH_PARAMS = "EgWKAQIgAWoKEAkQChAFEAMQBA==";
 
 type Thumbnail = {
   url?: string;
@@ -176,10 +178,12 @@ const mapResponsiveListItem = (renderer: Record<string, unknown>): MediaItem | u
     ((renderer.flexColumns as Record<string, unknown>[] | undefined)?.[0] as
       | { musicResponsiveListItemFlexColumnRenderer?: { text?: { runs?: Run[] } } }
       | undefined)?.musicResponsiveListItemFlexColumnRenderer?.text?.runs?.[0]?.navigationEndpoint;
+  const navigationEndpoint =
+    firstRunEndpoint ?? (renderer.navigationEndpoint as Record<string, unknown> | undefined);
 
-  const videoId = extractVideoId(firstRunEndpoint);
-  const browseId = extractBrowseId(firstRunEndpoint);
-  const playlistId = extractWatchPlaylistId(firstRunEndpoint);
+  const videoId = extractVideoId(navigationEndpoint);
+  const browseId = extractBrowseId(navigationEndpoint);
+  const playlistId = extractWatchPlaylistId(navigationEndpoint);
   const title = runs[0];
 
   if (!title) {
@@ -312,13 +316,13 @@ const findSectionListContents = (payload: Record<string, unknown>) => {
     ?.contents ?? []) as unknown[];
 };
 
-const collectTrackMediaItems = (value: unknown): MediaItem[] => {
+const collectMediaItems = (value: unknown): MediaItem[] => {
   if (!value || typeof value !== "object") {
     return [];
   }
 
   if (Array.isArray(value)) {
-    return value.flatMap(collectTrackMediaItems);
+    return value.flatMap(collectMediaItems);
   }
 
   const record = value as {
@@ -326,14 +330,16 @@ const collectTrackMediaItems = (value: unknown): MediaItem[] => {
     musicTwoRowItemRenderer?: Record<string, unknown>;
   };
   const mapped = mapShelfContentItem(record);
-  const nested = Object.values(record).flatMap(collectTrackMediaItems);
+  const nested = Object.values(record).flatMap(collectMediaItems);
 
-  if (!mapped?.track) {
+  if (!mapped) {
     return nested;
   }
 
   return [mapped, ...nested];
 };
+
+const collectTrackMediaItems = (value: unknown) => collectMediaItems(value).filter((item) => item.track);
 
 const extractCollectionTitle = (payload: Record<string, unknown>) =>
   extractTextRuns(
@@ -348,8 +354,8 @@ const extractCollectionTitle = (payload: Record<string, unknown>) =>
       ?.title,
   );
 
-const fetchBrowsePayload = async (browseId: string) => {
-  const response = await fetch(`${YT_MUSIC_BROWSE_URL}?prettyPrint=false`, {
+const fetchYouTubeMusicPayload = async (url: string, body: Record<string, unknown>, operation: string) => {
+  const response = await fetch(`${url}?prettyPrint=false`, {
     method: "POST",
     headers: {
       "content-type": "application/json",
@@ -365,15 +371,53 @@ const fetchBrowsePayload = async (browseId: string) => {
         },
         user: {},
       },
-      browseId,
+      ...body,
     }),
   });
 
   if (!response.ok) {
-    throw new Error(`YouTube Music browse failed with ${response.status}`);
+    throw new Error(`YouTube Music ${operation} failed with ${response.status}`);
   }
 
   return (await response.json()) as Record<string, unknown>;
+};
+
+const fetchBrowsePayload = (browseId: string) =>
+  fetchYouTubeMusicPayload(YT_MUSIC_BROWSE_URL, { browseId }, "browse");
+
+export const searchYouTubeMusic = async (query: string): Promise<Track[]> => {
+  const trimmed = query.trim();
+  if (!trimmed) {
+    return [];
+  }
+
+  const payload = await fetchYouTubeMusicPayload(YT_MUSIC_SEARCH_URL, { query: trimmed }, "search");
+  const tracks = collectTrackMediaItems(payload)
+    .map((item) => item.track)
+    .filter(Boolean) as Track[];
+
+  return tracks.filter((track, index) => tracks.findIndex((candidate) => candidate.id === track.id) === index);
+};
+
+export const searchYouTubeMusicArtists = async (query: string): Promise<string[]> => {
+  const trimmed = query.trim();
+  if (!trimmed) {
+    return [];
+  }
+
+  const payload = await fetchYouTubeMusicPayload(
+    YT_MUSIC_SEARCH_URL,
+    { query: trimmed, params: ARTIST_SEARCH_PARAMS },
+    "artist search",
+  );
+  const artists = collectMediaItems(payload)
+    .filter((item) => item.kind === "artist")
+    .map((item) => item.title.trim())
+    .filter(Boolean);
+
+  return artists.filter(
+    (artist, index) => artists.findIndex((candidate) => candidate.toLowerCase() === artist.toLowerCase()) === index,
+  );
 };
 
 export const fetchYouTubeMusicCollection = async (browseId: string): Promise<ImportResult> => {
