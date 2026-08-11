@@ -82,16 +82,6 @@ const normalizeStream = (
   client: InnertubeClientProfile,
   decipher?: (value: string) => string,
 ): ResolvedStream | undefined => {
-  logger.info(
-    "YouTube resolver: fmt",
-    format.itag ?? "unknown",
-    typeof format.mimeType === "string" ? format.mimeType : "unknown",
-    "hasUrl",
-    Boolean(format.url),
-    "hasCipher",
-    Boolean(format.signatureCipher) || Boolean(format.cipher),
-  );
-
   const url = resolveCipheredUrl(
     typeof format.url === "string" ? format.url : undefined,
     typeof format.signatureCipher === "string" ? format.signatureCipher : undefined,

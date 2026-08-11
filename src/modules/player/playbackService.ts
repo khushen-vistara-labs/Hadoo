@@ -7,7 +7,10 @@ export const playbackService = async () => {
   TrackPlayer.addEventListener(Event.PlaybackActiveTrackChanged, async (event) => {
     logger.info("Player event: active track changed", event.index, event.lastIndex);
     const queue = usePlayerStore.getState().queue;
-    const nextTrack = event.index != null ? queue[event.index] ?? null : null;
+    const activeTrackId = String(event.track?.id ?? "");
+    const nextTrack = event.track
+      ? queue.find((track) => track.id === activeTrackId) ?? null
+      : null;
     usePlayerStore.getState().setCurrentTrack(nextTrack);
   });
 

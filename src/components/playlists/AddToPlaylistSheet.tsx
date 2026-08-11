@@ -226,6 +226,7 @@ const styles = StyleSheet.create({
   overlay: {
     ...StyleSheet.absoluteFillObject,
     justifyContent: "flex-end",
+    zIndex: 30,
   },
   backdrop: {
     ...StyleSheet.absoluteFillObject,

@@ -9,4 +9,5 @@ export interface MusicSource extends SourceCapabilities {
   name: string;
   status: ProviderStatus;
   search(query: string): Promise<Track[]>;
+  searchArtists?(query: string): Promise<string[]>;
 }

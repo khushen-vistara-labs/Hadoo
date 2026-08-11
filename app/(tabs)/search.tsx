@@ -159,6 +159,17 @@ export default function SearchScreen() {
     return `${results.length} result${results.length === 1 ? "" : "s"}. Press and hold for details.`;
   }, [canSearch, hasTypedQuery, isError, isLoading, results.length]);
 
+  const playSearchResult = (track: Track) => {
+    const providerResults = results.filter((candidate) => candidate.provider === track.provider);
+    const selectedIndex = providerResults.findIndex((candidate) => candidate.id === track.id);
+    const queueStart = Math.max(selectedIndex - 2, 0);
+    const queue = selectedIndex >= 0 ? providerResults.slice(queueStart, queueStart + 8) : [track];
+
+    void playerService.playTrack(track, queue).catch(() => {
+      toastService.show("Could not play this track.");
+    });
+  };
+
   return (
     <Screen scroll={false} contentContainerStyle={styles.screenContent}>
       <View pointerEvents="none" style={styles.backgroundOrbs}>
@@ -270,11 +281,7 @@ export default function SearchScreen() {
         renderItem={({ item: track }) => (
           <SearchResultRow
             track={track}
-            onPress={() =>
-              playerService.playTrack(track).catch(() => {
-                toastService.show("Could not play this track.");
-              })
-            }
+            onPress={() => playSearchResult(track)}
             onLongPress={() => setSelectedTrack(track)}
             onOptionsPress={() => setSelectedTrack(track)}
           />

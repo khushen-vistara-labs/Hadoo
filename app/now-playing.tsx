@@ -90,6 +90,21 @@ export default function NowPlayingScreen() {
   const verticalGap = Math.max(width * 0.016, 6);
   const lowerSectionTop = Math.max(width * 0.01, 2);
 
+  const dismissNowPlaying = () => {
+    if (router.canGoBack()) {
+      router.back();
+      return;
+    }
+
+    router.replace("/");
+  };
+
+  const runPlayerAction = (action: () => Promise<void>) => {
+    void action().catch(() => {
+      toastService.show("The player could not complete that action.");
+    });
+  };
+
   const openPlaylistSheet = () => {
     if (!player.currentTrack) {
       return;
@@ -138,7 +153,7 @@ export default function NowPlayingScreen() {
             <View style={styles.headerSide}>
               <Pressable
                 hitSlop={10}
-                onPress={() => router.back()}
+                onPress={dismissNowPlaying}
                 style={styles.headerButton}
               >
                 <SymbolIcon name="down" size={20} color={theme.text} />
@@ -285,18 +300,18 @@ export default function NowPlayingScreen() {
                 <SymbolIcon name="shuffle" size={20} color={player.shuffle ? theme.accent : theme.textMuted} />
               </Pressable>
               <Pressable
-                disabled={!canControlPlayback || player.isLoading || isSeeking}
+                disabled={!canControlPlayback || isSeeking}
                 hitSlop={10}
-                onPress={() => playerService.skipPrevious()}
+                onPress={() => runPlayerAction(() => playerService.skipPrevious())}
                 style={styles.transportButton}
               >
                 <SymbolIcon name="back" size={26} color={canControlPlayback ? theme.text : theme.textMuted} />
               </Pressable>
               <View style={styles.transportCenterSpacer} />
               <Pressable
-                disabled={!canControlPlayback || player.isLoading || isSeeking}
+                disabled={!canControlPlayback || isSeeking}
                 hitSlop={10}
-                onPress={() => playerService.skipNext()}
+                onPress={() => runPlayerAction(() => playerService.skipNext())}
                 style={styles.transportButton}
               >
                 <SymbolIcon name="next" size={26} color={canControlPlayback ? theme.text : theme.textMuted} />
@@ -326,7 +341,7 @@ export default function NowPlayingScreen() {
               <Pressable
                 disabled={!canControlPlayback || isSeeking}
                 style={styles.primaryActionPress}
-                onPress={() => (player.isPlaying ? playerService.pause() : playerService.resume())}
+                onPress={() => runPlayerAction(() => playerService.togglePlayback())}
               >
                 {player.isLoading || isSeeking ? (
                   <ActivityIndicator size="small" color={theme.background} />
@@ -493,15 +508,20 @@ const styles = StyleSheet.create({
   content: {
     flex: 1,
     justifyContent: "flex-start",
+    position: "relative",
   },
   topSection: {
     flex: 1,
     gap: 8,
     justifyContent: "space-between",
+    position: "relative",
+    zIndex: 1,
   },
   bottomSection: {
     justifyContent: "flex-start",
     flexShrink: 0,
+    position: "relative",
+    zIndex: 2,
   },
   backgroundOrbs: {
     ...StyleSheet.absoluteFillObject,
@@ -640,6 +660,8 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
     minHeight: 100,
+    position: "relative",
+    zIndex: 2,
   },
   transportDeck: {
     width: "100%",
@@ -674,6 +696,7 @@ const styles = StyleSheet.create({
     position: "absolute",
     alignItems: "center",
     justifyContent: "center",
+    zIndex: 2,
     shadowColor: "#000000",
     shadowOpacity: 0.2,
     shadowRadius: 22,
@@ -706,6 +729,7 @@ const styles = StyleSheet.create({
   overlay: {
     ...StyleSheet.absoluteFillObject,
     justifyContent: "flex-end",
+    zIndex: 20,
   },
   backdrop: {
     ...StyleSheet.absoluteFillObject,
