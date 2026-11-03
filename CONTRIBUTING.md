@@ -1,90 +1,34 @@
 # Contributing
 
-This repository enforces commit, pull request, and ownership rules through local hooks and GitHub Actions.
+Hadoo is a local patch/build project for a user-supplied YouTube Music APK.
+Use Python 3.10+ and a Java 21+ JDK. No Node.js, Expo, Gradle project, or Python
+packages are needed for Hadoo's own tooling.
 
-## Commit Messages
+Run these checks before opening a pull request:
 
-Commit messages must follow Conventional Commits:
-
-```text
-type(scope): short summary
+```sh
+./hadoo check
+./hadoo setup
+./hadoo patches
 ```
 
-Valid examples:
+GitHub Actions runs the offline tests, exports the branding and checks the
+profile against the actual checksum-pinned Morphe bundle. It never builds or
+publishes a proprietary APK and never needs a signing key.
 
-```text
-feat(player): add source filter chips
-fix(search): remove unused Pressable import
-chore(ci): add PR checks and CODEOWNERS
-```
+Use Conventional Commits for commits and PR titles, for example
+`feat(build): support a reviewed upstream release`. Local commit checks live in
+`.husky/commit-msg`; enable them with `git config core.hooksPath .husky`.
+Complete every section of the PR template. Code owners are in `.github/CODEOWNERS`.
 
-Allowed types:
+Keep changes to `config/upstream-lock.json` explicit and reviewed. Obtain hashes
+from the official GitHub release asset metadata, check upstream compatibility,
+and exercise setup plus a complete local APK build when a suitable input exists.
+Do not automatically follow latest releases or bypass APK version checks.
 
-- `feat`
-- `fix`
-- `docs`
-- `style`
-- `refactor`
-- `perf`
-- `test`
-- `build`
-- `ci`
-- `chore`
-- `revert`
+Keep originals in `assets/images/` unchanged when changing the resource exporter.
+Review `.hadoo-local/branding/preview.png` after generating new density resources.
 
-Local enforcement is provided by [`.husky/commit-msg`](/Users/icemonkey/code/Hadoo/.husky/commit-msg), which runs [`scripts/validate-commit-msg.js`](/Users/icemonkey/code/Hadoo/scripts/validate-commit-msg.js).
-
-To enable the local Git hook path in a fresh clone:
-
-```bash
-git config core.hooksPath .husky
-```
-
-## Pull Request Requirements
-
-PR titles must also follow Conventional Commits:
-
-```text
-type(scope): short summary
-```
-
-The PR body must use the required sections from [`.github/pull_request_template.md`](/Users/icemonkey/code/Hadoo/.github/pull_request_template.md):
-
-- `## Summary`
-- `## Changes`
-- `## Testing`
-- `## Screenshots`
-- `## Checklist`
-
-The checklist expects contributors to confirm:
-
-- commit messages follow Conventional Commits
-- the PR title follows Conventional Commits
-- no unrelated changes are included
-
-## Required Checks
-
-PR validation runs in GitHub Actions:
-
-- [`.github/workflows/pr-format.yml`](/Users/icemonkey/code/Hadoo/.github/workflows/pr-format.yml) validates the PR title and required body sections
-- [`.github/workflows/pr-checks.yml`](/Users/icemonkey/code/Hadoo/.github/workflows/pr-checks.yml) runs `npm ci`, `npm run typecheck`, `npm run lint`, `npm test`, and `npx expo export --platform android`
-- [`.github/workflows/reviewdog.yml`](/Users/icemonkey/code/Hadoo/.github/workflows/reviewdog.yml) publishes ESLint findings on pull requests
-
-Before opening a PR, run:
-
-```bash
-npm run typecheck
-npm run lint
-npm test
-```
-
-If the change affects runtime behavior, also verify the app manually and include that in the PR body.
-
-## Code Owners
-
-Code owner review is defined in [`.github/CODEOWNERS`](/Users/icemonkey/code/Hadoo/.github/CODEOWNERS).
-
-Current owners:
-
-- `@khushen-vistara`
-- `@harshithRai`
+Never commit APKs, downloaded tools, signing keys, credentials, exported account
+data, local backups or music. These belong under the ignored `.hadoo-local/`
+directory. See `NOTICE`, `LICENSE`, and `third_party/` for attribution.

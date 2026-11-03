@@ -1,0 +1,21 @@
+{
+  "name": "Hadoo",
+  "logo": "assets/images/hadoo-logo.png",
+  "mark": "assets/images/hadoo-mark.png",
+  "patches": [
+    "Custom branding",
+    "Change header",
+    "GmsCore support",
+    "Spoof video streams",
+    "Remove background playback restrictions",
+    "Enable exclusive audio playback",
+    "Downloads",
+    "Hide ads",
+    "Android Auto",
+    "Media notification controls",
+    "Miniplayer previous and next buttons",
+    "Remember repeat state",
+    "Remember shuffle state",
+    "Third-party lyrics"
+  ]
+}

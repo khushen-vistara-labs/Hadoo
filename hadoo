@@ -1,0 +1,6 @@
+#!/usr/bin/env python3
+"""Hadoo's local build entry point; requires Python 3.10+."""
+import runpy
+from pathlib import Path
+
+runpy.run_path(str(Path(__file__).resolve().parent / "tools" / "hadoo.py"), run_name="__main__")

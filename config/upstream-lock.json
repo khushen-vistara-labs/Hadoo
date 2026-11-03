@@ -1,0 +1,264 @@
+{
+  "schema_version": 1,
+  "desktop": {
+    "version": "1.20.0",
+    "filename": "morphe-desktop-1.20.0-all.jar",
+    "url": "https://github.com/MorpheApp/morphe-desktop/releases/download/v1.20.0/morphe-desktop-1.20.0-all.jar",
+    "sha256": "679f579b3ad743ac0ca697ef71e57430d00be59411b04494afd1845c43fb79f0"
+  },
+  "patches": {
+    "version": "2.0.0",
+    "filename": "patches-2.0.0.mpp",
+    "url": "https://github.com/MorpheApp/morphe-patches/releases/download/v2.0.0/patches-2.0.0.mpp",
+    "sha256": "f0f5cfd857950ed61a26a7b2eeeecf37d4d66bece2e8f94802280e189b69ed00"
+  },
+  "source": {
+    "package": "com.google.android.apps.youtube.music",
+    "recommended_version": "9.30.53",
+    "supported_versions": [
+      "9.30.53",
+      "9.20.53",
+      "9.15.51"
+    ],
+    "certificate_sha256": [
+      "6a2f65ec694a6a632acdcb5080912a565f903d4b8d83f0eb8e44fbdf2660d8e1",
+      "a2a1ad7ba7f41dfca4514e2afeb90691719af6d0fdbed4b09bbf0ed897701ceb"
+    ]
+  },
+  "output": {
+    "package": "app.morphe.android.apps.youtube.music"
+  },
+  "available_patches": [
+    {
+      "name": "Android Auto",
+      "options": []
+    },
+    {
+      "name": "App refresh rate",
+      "options": []
+    },
+    {
+      "name": "Change header",
+      "options": [
+        "custom"
+      ]
+    },
+    {
+      "name": "Change miniplayer color",
+      "options": []
+    },
+    {
+      "name": "Change start page",
+      "options": []
+    },
+    {
+      "name": "Check watch history domain name resolution",
+      "options": []
+    },
+    {
+      "name": "Crossfade",
+      "options": []
+    },
+    {
+      "name": "Custom branding",
+      "options": [
+        "customName",
+        "customIcon",
+        "appIcon"
+      ]
+    },
+    {
+      "name": "Custom font",
+      "options": []
+    },
+    {
+      "name": "Disable DRC audio",
+      "options": []
+    },
+    {
+      "name": "Disable QUIC protocol",
+      "options": []
+    },
+    {
+      "name": "Disable dislike redirection",
+      "options": []
+    },
+    {
+      "name": "Downloads",
+      "options": []
+    },
+    {
+      "name": "Enable audio/video switch",
+      "options": []
+    },
+    {
+      "name": "Enable debugging",
+      "options": []
+    },
+    {
+      "name": "Enable exclusive audio playback",
+      "options": []
+    },
+    {
+      "name": "Enable forced miniplayer",
+      "options": []
+    },
+    {
+      "name": "Enable swipe to dismiss miniplayer",
+      "options": []
+    },
+    {
+      "name": "Force original audio",
+      "options": []
+    },
+    {
+      "name": "Force portrait orientation",
+      "options": []
+    },
+    {
+      "name": "GmsCore support",
+      "options": []
+    },
+    {
+      "name": "Hide ads",
+      "options": []
+    },
+    {
+      "name": "Hide buttons",
+      "options": []
+    },
+    {
+      "name": "Hide flyout menu components",
+      "options": []
+    },
+    {
+      "name": "Hide layout components",
+      "options": []
+    },
+    {
+      "name": "Hide music action buttons",
+      "options": []
+    },
+    {
+      "name": "Jam queue sharing",
+      "options": []
+    },
+    {
+      "name": "Media notification controls",
+      "options": []
+    },
+    {
+      "name": "Miniplayer previous and next buttons",
+      "options": []
+    },
+    {
+      "name": "Navigation bar",
+      "options": []
+    },
+    {
+      "name": "Network proxy",
+      "options": []
+    },
+    {
+      "name": "Play albums songs",
+      "options": []
+    },
+    {
+      "name": "Playback speed",
+      "options": []
+    },
+    {
+      "name": "Playlist track tap action",
+      "options": []
+    },
+    {
+      "name": "PoToken provider",
+      "options": []
+    },
+    {
+      "name": "Remember repeat state",
+      "options": []
+    },
+    {
+      "name": "Remember shuffle state",
+      "options": []
+    },
+    {
+      "name": "Remove background playback restrictions",
+      "options": []
+    },
+    {
+      "name": "Remove viewer discretion dialog",
+      "options": []
+    },
+    {
+      "name": "Return YouTube Dislike",
+      "options": []
+    },
+    {
+      "name": "Sanitize sharing links",
+      "options": []
+    },
+    {
+      "name": "Scrobbling",
+      "options": []
+    },
+    {
+      "name": "Settings menu filter",
+      "options": []
+    },
+    {
+      "name": "Skip silence",
+      "options": []
+    },
+    {
+      "name": "SponsorBlock",
+      "options": []
+    },
+    {
+      "name": "Spoof app version",
+      "options": []
+    },
+    {
+      "name": "Spoof video streams",
+      "options": []
+    },
+    {
+      "name": "Theme",
+      "options": [
+        "darkThemeColor"
+      ]
+    },
+    {
+      "name": "Third-party lyrics",
+      "options": []
+    },
+    {
+      "name": "Change installer source",
+      "options": [
+        "packageInstallerName"
+      ]
+    },
+    {
+      "name": "Clone app",
+      "options": [
+        "packageName",
+        "updatePermissions",
+        "updateProviders"
+      ]
+    },
+    {
+      "name": "Disable Play Store updates",
+      "options": []
+    },
+    {
+      "name": "Override certificate pinning",
+      "options": []
+    },
+    {
+      "name": "Spoof signature",
+      "options": []
+    }
+  ]
+}
+
