@@ -1,0 +1,24 @@
+Hadoo
+Copyright (C) 2026 Hadoo contributors.
+
+Hadoo is an independent collection of branding assets, build tooling and
+configuration for local modification of a user-supplied YouTube Music APK.
+Hadoo's original source code is licensed under GPL-3.0-only; see LICENSE.
+
+Hadoo uses unmodified, separately downloaded Morphe Desktop and Morphe Patches.
+Their copyright, license terms and notices remain applicable. Verbatim upstream
+notices are preserved in third_party/morphe-desktop.NOTICE and
+third_party/morphe-patches.NOTICE. Their upstream sources are:
+https://github.com/MorpheApp/morphe-desktop
+https://github.com/MorpheApp/morphe-patches
+
+Morphe is based on prior ReVanced work. Original upstream author notices are
+retained by the downloaded tools and patch bundle. Hadoo is a separate project
+and does not claim authorship of those projects.
+
+The YouTube Music application, its proprietary source and service content are
+not included in or relicensed by this repository. The output of a local build
+is a modified proprietary application, not a wholly open-source application.
+
+Hadoo is not affiliated with or endorsed by Google, YouTube or Morphe.
+Third-party names and trademarks belong to their respective owners.

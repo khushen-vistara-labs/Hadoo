@@ -1,79 +1,169 @@
+<p align="center"><img src="assets/images/hadoo-logo.png" width="180" alt="Hadoo"></p>
+
 # Hadoo
 
-Personal music app for searching, organizing, and playing tracks across modular source providers, built with Expo development builds, React Native, TypeScript, Expo Router, Zustand, TanStack Query, and AsyncStorage persistence.
+Your personal YouTube Music build, with Hadoo's name and artwork.
 
-## Run
+Hadoo applies a reviewed Morphe patch profile and Hadoo branding to an original
+YouTube Music APK that you supply locally. Playback, queues, account integration
+and downloads run in the patched YouTube Music app. This replaces the earlier
+Expo/React Native implementation.
 
-Install dependencies:
+The repository contains open-source tooling, configuration and branding. Google's
+app and source code are not included or relicensed. Generated APKs, original APKs,
+signing keys and music remain on your own computer and phone.
 
-```bash
-npm install
+![Hadoo icon and header preview](docs/images/branding-preview.png)
+
+## Quick start
+
+Requirements: Python 3.10+, a **Java 21+ JDK**, Android SDK **Build-Tools**
+(`aapt2` and `apksigner`), and an original, complete **YouTube Music 9.30.53 APK**.
+Android Studio can install the SDK tools. No npm packages or Python packages are
+needed. ADB Platform-Tools are optional for USB installation.
+
+```sh
+./hadoo doctor
+./hadoo setup
+./hadoo import-key /path/to/Morphe.keystore
+./hadoo build /path/to/youtube-music-9.30.53.apk
+./hadoo install
 ```
 
-Start Metro for a development build:
+**Already using patched YouTube Music?** Export its signing key from Morphe
+Manager → Settings → Signing key → Export, then import that file as shown above.
+Using the same key lets Hadoo install as an update and retain the app's data.
+If Manager shows a different arrangement, look for the Signing key item in its
+Backup settings. Do not uninstall your working app to change its branding.
 
-```bash
-npm run start
-```
+The build checks the source package, supported version and official signing
+certificates, verifies both downloaded tools by SHA-256, applies 17 selected
+patches plus their dependencies, signs the output, and verifies the resulting
+APK. Installation is a separate, explicit command and uses `adb install -r`.
 
-Run Android:
+Every build is saved under `.hadoo-local/builds/<timestamp>/Hadoo.apk` with a
+`build.json` provenance report and upstream license notices. A failed build does
+not replace the last verified output. You can also copy `Hadoo.apk` to your phone
+and install it there.
 
-```bash
-npm run android
-```
+## After installation
 
-Run iOS on macOS with Xcode:
+The launcher uses **Hadoo** and the original Hadoo symbol. YouTube Music's
+interface and playback behavior remain underneath.
 
-```bash
-npm run ios
-```
+### Music-focused setup
 
-### Running On A Real Android Device
+On the phone, enable **Settings → Data saving → Don't play music videos**. The
+included exclusive-audio patch makes this option available. This is a native
+YouTube Music setting, so it is not applied by importing Morphe settings. Enable
+**Don't play podcast videos** on the same screen to prefer audio for any podcast
+episodes that remain in saved collections.
 
-This app does not run in Expo Go. It uses Expo development builds and native modules.
+In **Morphe → General**, set **Start page → Default** to open Home for personalized
+recommendations. Under **Navigation bar**, keep **Home** and **Library** visible
+and hide **Samples** and **Upgrade**. This leaves Home, Search and Library. In
+**Morphe → Player**, enable **Hide Audio / Video toggle**. Choose **Songs** in
+Library and in search results when browsing recordings.
 
-For the shortest path on an Android phone with USB debugging enabled:
+The corresponding Morphe choices are recorded in `config/phone-settings.json`.
+Audio-only playback and hidden video controls do not filter YouTube Music's
+entire catalog: video-origin tracks and podcasts may still appear in search or
+saved collections. Strictly excluding those results requires another catalog
+filter; the stock patches do not provide that guarantee.
 
-```bash
-npm install
-npm run android
-```
+The **Play albums songs** patch is intentionally excluded. In the pinned release
+it overrides the native Don't play music videos setting when enabled, so combining
+them would undermine this profile's audio-only preference.
 
-If your phone is already connected by USB and developer options are enabled, that command will build the native app, install it on the device, and connect it to Metro.
+### Branding and downloads
 
-Detailed device setup and troubleshooting lives in [docs/running-on-android-device.md](/Users/icemonkey/code/Hadoo/docs/running-on-android-device.md).
+To select the included Hadoo header, open the app's profile menu → Settings →
+Morphe → General → Header logo → Custom. Search settings for “Header logo” if the
+menu differs. Under Downloads, choose the in-app download mode if it is not
+already selected. Existing user preferences survive an update, so installing an
+APK alone does not reset these choices.
 
-### Building A Standalone Android App
+When updating an already configured Morphe build, also select **Custom** under
+**App name** (this build defines that name as Hadoo) and **Custom** under **App icon**
+in its Morphe General settings. You can disable the inherited startup animation
+on the same screen.
+The new build includes those choices; a previous explicit selection can override
+the new build's defaults until you change it once.
 
-If you want the phone app to run without your Mac, build and install the release APK instead of the Expo dev client:
+The selected Hide ads patch provides switches for hiding video ads, the Get
+Premium label and Premium promotions. The Navigation bar patch hides the Upgrade
+tab by default. These switches can be checked in the app's Morphe → Ads settings
+and Morphe → General → Navigation bar settings. Existing explicit choices are
+preserved on update. Hiding offers or enabling local playback features does not
+activate a paid Google account membership.
 
-```bash
-npm run android:release
-npm run android:install-release
-```
+`config/phone-settings.json` records the optional runtime choices for a custom
+header, in-app downloads, the “Hadoo settings” menu name, ad and Premium-promotion
+hiding, the Library start page, and hidden video/navigation controls. It is separate
+from build options; it is not applied silently. You may merge those keys into an
+export of your in-app Morphe settings before reimporting. Keep an original export
+if you do this; a partial settings import can reset other preferences.
 
-That produces a bundled Android app that does not connect to Metro at runtime.
+Validate playback, repeated next/previous taps, background playback and downloads
+on your device. Test downloads after closing the app and enabling airplane mode.
+A successful APK build establishes package integrity, not music-service uptime or
+device playback reliability.
 
-Release signing and APK / AAB details live in [docs/standalone-android-build.md](/Users/icemonkey/code/Hadoo/docs/standalone-android-build.md).
+## Commands
 
-## Contributing
+| Command | Purpose |
+| --- | --- |
+| `./hadoo doctor` | Find prerequisites and show remaining setup |
+| `./hadoo setup` | Download and verify pinned tools; check patches; export branding |
+| `./hadoo prepare` | Export branding and options offline using Java |
+| `./hadoo patches` | Validate selected patches against the actual pinned bundle |
+| `./hadoo import-key PATH` | Copy your existing signing key into private local storage |
+| `./hadoo build APK` | Validate, patch, sign and verify an APK |
+| `./hadoo build APK --keystore PATH` | Use an existing keystore without copying it |
+| `./hadoo build APK --new-key` | Create a new local signing identity on the first build |
+| `./hadoo install --serial DEVICE` | Install the last verified build on one USB device |
+| `./hadoo check` | Run offline automated tests |
 
-Contributor requirements for commit messages, PR titles, PR template sections, required checks, and code owners are documented in [CONTRIBUTING.md](/Users/icemonkey/code/Hadoo/CONTRIBUTING.md).
+`--new-key` cannot update an app signed by your phone's existing Manager key.
+Only use it when you deliberately want a new signing identity. The generated key
+is retained for future builds. The tool never uninstalls an app or overwrites a
+different imported key.
 
-## Notes
+## Configuration
 
-- This project targets Expo development builds, not Expo Go.
-- Android release builds bundle the JavaScript so the installed release APK can run without Metro.
-- `react-native-track-player` is wired through `index.js` and `src/modules/player/playbackService.ts`.
-- Experimental providers are isolated under `src/modules/sources/` and can return clean failures without crashing the UI.
-- State persistence uses AsyncStorage through Zustand middleware.
+- `config/hadoo.json`: the Hadoo name, original artwork paths and selected patches.
+- `config/upstream-lock.json`: reviewed release URLs, SHA-256 checksums, source
+  signing certificates, supported versions and available patch option keys.
+- `tools/Branding.java`: deterministic Android resource export. The original PNGs
+  stay unchanged; generated resources are sized for each Android display density.
+  Lettering uses a clean coverage mask, and reductions average every source pixel
+  with its opacity to retain thin strokes without dark or colored fringes.
+- `tools/hadoo.py`: dependency-free build, validation, signing and installation CLI.
+- `.github/workflows/checks.yml`: source tests, branding export and upstream patch
+  compatibility checks. It never builds or uploads Google's app.
 
-## Structure
+Pinned tools: **Morphe Desktop 1.20.0** and **Morphe Patches 2.0.0**. Supported
+stable source versions: 9.30.53 (recommended), 9.20.53 and 9.15.51. Upstream updates
+require an explicit lock-file change; builds do not silently follow latest.
 
-- `app/`: expo-router screens and navigation
-- `src/components/`: reusable UI and player components
-- `src/modules/player/`: playback setup, background service, player store, player service
-- `src/modules/sources/`: provider adapters and source registry
-- `src/modules/library/`, `playlists/`, `settings/`: persisted feature stores
-- `src/data/`: mock tracks, playlists, query client
-- `src/types/`: shared domain types
+The patched package ID remains `app.morphe.android.apps.youtube.music`, matching
+the standard Morphe GmsCore setup. Its display name is Hadoo. The earlier Hadoo
+package, `com.icemonkey.hadoo`, can coexist with it. microG remains installed.
+
+See [device setup](docs/device-setup.md), [maintenance](docs/maintenance.md), and
+[contributing](CONTRIBUTING.md).
+
+## License and attribution
+
+Hadoo's original code is GPL-3.0-only; see [LICENSE](LICENSE). Morphe and ReVanced
+authorship is acknowledged in [NOTICE](NOTICE), and verbatim upstream notices are
+preserved in [third_party](third_party). The downloaded tools and their bundled
+code retain their own licenses.
+
+This license does not grant rights to Google's proprietary app, trademarks or
+music. Local patching and service use remain subject to applicable rights and
+terms. Hadoo is independent of Google, YouTube and Morphe.
+
+Upstream: [Morphe Desktop](https://github.com/MorpheApp/morphe-desktop),
+[Morphe Patches](https://github.com/MorpheApp/morphe-patches),
+[Morphe Manager documentation](https://github.com/MorpheApp/morphe-manager/tree/main/docs).

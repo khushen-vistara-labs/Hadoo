@@ -1,6 +1,6 @@
 ## Summary
 
-# Describe the purpose of this PR.
+Describe the resulting Hadoo behavior.
 
 ## Changes
 
@@ -8,16 +8,18 @@
 
 ## Testing
 
-- [ ] `npm run lint`
-- [ ] `npm run typecheck`
-- [ ] tested manually
+- [ ] `./hadoo check`
+- [ ] `./hadoo setup`
+- [ ] `./hadoo patches`
+- [ ] Device testing described, or explicitly marked as pending
 
 ## Screenshots
 
-# Add screenshots if the UI changed, N/A if none.
+Branding preview, or N/A.
 
 ## Checklist
 
-- [ ] Commit messages follow Conventional Commits
-- [ ] PR title follows Conventional Commits
-- [ ] No unrelated changes are included
+- [ ] Commit messages and PR title follow Conventional Commits
+- [ ] No unrelated changes
+- [ ] No APKs, signing keys, credentials, local backups or downloaded music
+- [ ] Upstream license and attribution notices preserved
