@@ -55,9 +55,11 @@ interface and playback behavior remain underneath.
 
 On the phone, enable **Settings → Data saving → Don't play music videos**. The
 included exclusive-audio patch makes this option available. This is a native
-YouTube Music setting, so it is not applied by importing Morphe settings.
+YouTube Music setting, so it is not applied by importing Morphe settings. Enable
+**Don't play podcast videos** on the same screen to prefer audio for any podcast
+episodes that remain in saved collections.
 
-In **Morphe → General**, set **Change start page → Library** and, under
+In **Morphe → General**, set **Start page → Library** and, under
 **Navigation bar**, hide **Home**, **Samples** and **Upgrade**. This leaves Search
 and Library and avoids starting in the mixed recommendation feed. In **Morphe →
 Player**, enable **Hide Audio / Video toggle**. Choose **Songs** in Library and in
