@@ -1,5 +1,9 @@
 {
   "morphe_header_logo": "CUSTOM",
   "morphe_download_mode": "IN_APP",
-  "morphe_settings_name": "Hadoo settings"
+  "morphe_settings_name": "Hadoo settings",
+  "morphe_music_hide_get_premium_label": true,
+  "morphe_music_hide_music_premium_promotions": true,
+  "morphe_music_hide_video_ads": true,
+  "morphe_music_hide_navigation_bar_upgrade_button": true
 }

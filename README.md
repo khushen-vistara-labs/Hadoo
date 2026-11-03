@@ -37,7 +37,7 @@ If Manager shows a different arrangement, look for the Signing key item in its
 Backup settings. Do not uninstall your working app to change its branding.
 
 The build checks the source package, supported version and official signing
-certificates, verifies both downloaded tools by SHA-256, applies 14 selected
+certificates, verifies both downloaded tools by SHA-256, applies 15 selected
 patches plus their dependencies, signs the output, and verifies the resulting
 APK. Installation is a separate, explicit command and uses `adb install -r`.
 
@@ -64,8 +64,16 @@ on the same screen.
 The new build includes those choices; a previous explicit selection can override
 the new build's defaults until you change it once.
 
-`config/phone-settings.json` records the three optional runtime choices for a
-custom header, in-app downloads and the “Hadoo settings” menu name. It is separate
+The selected Hide ads patch provides switches for hiding video ads, the Get
+Premium label and Premium promotions. The Navigation bar patch hides the Upgrade
+tab by default. These switches can be checked in the app's Morphe → Ads settings
+and Morphe → General → Navigation bar settings. Existing explicit choices are
+preserved on update. Hiding offers or enabling local playback features does not
+activate a paid Google account membership.
+
+`config/phone-settings.json` records the optional runtime choices for a custom
+header, in-app downloads, the “Hadoo settings” menu name, ad and Premium-promotion
+hiding, and removal of the Upgrade tab. It is separate
 from build options; it is not applied silently. You may merge those keys into an
 export of your in-app Morphe settings before reimporting. Keep an original export
 if you do this; a partial settings import can reset other preferences.
