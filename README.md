@@ -59,11 +59,11 @@ YouTube Music setting, so it is not applied by importing Morphe settings. Enable
 **Don't play podcast videos** on the same screen to prefer audio for any podcast
 episodes that remain in saved collections.
 
-In **Morphe → General**, set **Start page → Library** and, under
-**Navigation bar**, hide **Home**, **Samples** and **Upgrade**. This leaves Search
-and Library and avoids starting in the mixed recommendation feed. In **Morphe →
-Player**, enable **Hide Audio / Video toggle**. Choose **Songs** in Library and in
-search results when browsing recordings.
+In **Morphe → General**, set **Start page → Default** to open Home for personalized
+recommendations. Under **Navigation bar**, keep **Home** and **Library** visible
+and hide **Samples** and **Upgrade**. This leaves Home, Search and Library. In
+**Morphe → Player**, enable **Hide Audio / Video toggle**. Choose **Songs** in
+Library and in search results when browsing recordings.
 
 The corresponding Morphe choices are recorded in `config/phone-settings.json`.
 Audio-only playback and hidden video controls do not filter YouTube Music's
