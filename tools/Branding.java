@@ -23,6 +23,7 @@ class Branding {
 
     // Remove the near-white scan background at export time, preserving colored logo ink.
     private static BufferedImage ink(BufferedImage source, boolean darkHeader) {
+        if (darkHeader) return wordmarkInk(source);
         BufferedImage output = new BufferedImage(source.getWidth(), source.getHeight(), BufferedImage.TYPE_INT_ARGB);
         for (int y = 0; y < source.getHeight(); y++) {
             for (int x = 0; x < source.getWidth(); x++) {
@@ -34,9 +35,24 @@ class Branding {
                 if (saturation < 22 && minimum > 220) {
                     alpha = alpha * Math.max(0, 248 - minimum) / 28;
                 }
-                // Preserve the existing wordmark's shape; light ink makes it visible on a dark app bar.
-                if (darkHeader && Math.max(r, Math.max(g, b)) < 100) r = g = b = 245;
                 output.setRGB(x, y, (Math.min(255, alpha) << 24) | (r << 16) | (g << 8) | b);
+            }
+        }
+        return output;
+    }
+
+    // Recover coverage from the original dark ink on white paper. Recolor every
+    // covered pixel, including antialiased edges, so no navy/white fringe survives.
+    // The symbol in this mask is discarded when the wordmark is cropped below.
+    static BufferedImage wordmarkInk(BufferedImage source) {
+        BufferedImage output = canvas(source.getWidth(), source.getHeight());
+        for (int y = 0; y < source.getHeight(); y++) {
+            for (int x = 0; x < source.getWidth(); x++) {
+                int pixel = source.getRGB(x, y);
+                int minimum = Math.min((pixel >>> 16) & 255, Math.min((pixel >>> 8) & 255, pixel & 255));
+                double coverage = Math.clamp((248.0 - minimum) / 200.0, 0.0, 1.0);
+                int alpha = (int) Math.round((pixel >>> 24) * coverage);
+                output.setRGB(x, y, (alpha << 24) | 0xf5f5f5);
             }
         }
         return output;
@@ -65,14 +81,60 @@ class Branding {
         g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BICUBIC);
         g.setRenderingHint(RenderingHints.KEY_RENDERING, RenderingHints.VALUE_RENDER_QUALITY);
         g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+        g.setRenderingHint(RenderingHints.KEY_ALPHA_INTERPOLATION, RenderingHints.VALUE_ALPHA_INTERPOLATION_QUALITY);
         return g;
+    }
+
+    // A single bicubic draw samples only a few source pixels even during a large
+    // reduction. Integrate the complete footprint in premultiplied-alpha space
+    // instead, retaining thin strokes without aliasing or transparent-edge halos.
+    static BufferedImage resizeForExport(BufferedImage source, int width, int height) {
+        if (width <= 0 || height <= 0) throw new IllegalArgumentException("Image dimensions must be positive.");
+        if (width == source.getWidth() && height == source.getHeight()) return source;
+        BufferedImage output = canvas(width, height);
+        if (width > source.getWidth() || height > source.getHeight()) {
+            Graphics2D g = graphics(output);
+            g.drawImage(source, 0, 0, width, height, null);
+            g.dispose();
+            return output;
+        }
+        double stepX = source.getWidth() / (double) width;
+        double stepY = source.getHeight() / (double) height;
+        double area = stepX * stepY;
+        for (int y = 0; y < height; y++) {
+            double top = y * stepY, bottom = (y + 1) * stepY;
+            for (int x = 0; x < width; x++) {
+                double left = x * stepX, right = (x + 1) * stepX;
+                double alpha = 0, red = 0, green = 0, blue = 0;
+                for (int sy = (int) Math.floor(top); sy < Math.min(source.getHeight(), (int) Math.ceil(bottom)); sy++) {
+                    double weightY = Math.min(bottom, sy + 1) - Math.max(top, sy);
+                    for (int sx = (int) Math.floor(left); sx < Math.min(source.getWidth(), (int) Math.ceil(right)); sx++) {
+                        double weight = weightY * (Math.min(right, sx + 1) - Math.max(left, sx));
+                        int pixel = source.getRGB(sx, sy);
+                        double coveredArea = (pixel >>> 24) * weight;
+                        alpha += coveredArea;
+                        red += ((pixel >>> 16) & 255) * coveredArea;
+                        green += ((pixel >>> 8) & 255) * coveredArea;
+                        blue += (pixel & 255) * coveredArea;
+                    }
+                }
+                int a = Math.clamp((int) Math.round(alpha / area), 0, 255);
+                if (a > 0) {
+                    int r = Math.clamp((int) Math.round(red / alpha), 0, 255);
+                    int g = Math.clamp((int) Math.round(green / alpha), 0, 255);
+                    int b = Math.clamp((int) Math.round(blue / alpha), 0, 255);
+                    output.setRGB(x, y, (a << 24) | (r << 16) | (g << 8) | b);
+                }
+            }
+        }
+        return output;
     }
 
     private static void fit(Graphics2D g, BufferedImage source, double x, double y, double width, double height) {
         double scale = Math.min(width / source.getWidth(), height / source.getHeight());
         int w = Math.max(1, (int) Math.round(source.getWidth() * scale));
         int h = Math.max(1, (int) Math.round(source.getHeight() * scale));
-        g.drawImage(source, (int) Math.round(x + (width - w) / 2), (int) Math.round(y + (height - h) / 2), w, h, null);
+        g.drawImage(resizeForExport(source, w, h), (int) Math.round(x + (width - w) / 2), (int) Math.round(y + (height - h) / 2), null);
     }
 
     private static void save(BufferedImage image, Path path) throws IOException {

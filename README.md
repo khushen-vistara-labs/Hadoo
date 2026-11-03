@@ -102,6 +102,8 @@ different imported key.
   signing certificates, supported versions and available patch option keys.
 - `tools/Branding.java`: deterministic Android resource export. The original PNGs
   stay unchanged; generated resources are sized for each Android display density.
+  Lettering uses a clean coverage mask, and reductions average every source pixel
+  with its opacity to retain thin strokes without dark or colored fringes.
 - `tools/hadoo.py`: dependency-free build, validation, signing and installation CLI.
 - `.github/workflows/checks.yml`: source tests, branding export and upstream patch
   compatibility checks. It never builds or uploads Google's app.

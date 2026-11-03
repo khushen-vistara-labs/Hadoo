@@ -187,6 +187,15 @@ class BuilderTests(unittest.TestCase):
             for name, expected in original_hashes.items():
                 self.assertEqual(h.sha256(h.ROOT / "assets/images" / name), expected)
 
+    def test_branding_preserves_thin_strokes_and_removes_color_fringes(self):
+        java = h.find_java()
+        with tempfile.TemporaryDirectory() as directory:
+            subprocess.run([str(java.parent / "javac"), "-d", directory,
+                            str(h.ROOT / "tools/Branding.java"), str(h.ROOT / "tests/BrandingQualityTest.java")],
+                           check=True, capture_output=True, text=True, timeout=45)
+            subprocess.run([str(java), "-Djava.awt.headless=true", "-cp", directory, "BrandingQualityTest"],
+                           check=True, capture_output=True, text=True, timeout=30)
+
     def test_local_artifacts_are_git_ignored(self):
         names = [".hadoo-local/input/original.apk", ".hadoo-local/signing/morphe.keystore", ".hadoo-local/legacy-2026-11-03/app.json", "accidental.apk", "accidental.jks", "accidental.pem"]
         result = subprocess.run(["git", "check-ignore", "--stdin"], input="\n".join(names) + "\n", cwd=h.ROOT, capture_output=True, text=True)
