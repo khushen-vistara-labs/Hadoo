@@ -5,5 +5,9 @@
   "morphe_music_hide_get_premium_label": true,
   "morphe_music_hide_music_premium_promotions": true,
   "morphe_music_hide_video_ads": true,
-  "morphe_music_hide_navigation_bar_upgrade_button": true
+  "morphe_music_hide_navigation_bar_upgrade_button": true,
+  "morphe_change_start_page": "LIBRARY",
+  "morphe_music_hide_navigation_bar_home_button": true,
+  "morphe_music_hide_navigation_bar_samples_button": true,
+  "morphe_music_hide_audio_video_toggle": true
 }

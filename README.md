@@ -37,7 +37,7 @@ If Manager shows a different arrangement, look for the Signing key item in its
 Backup settings. Do not uninstall your working app to change its branding.
 
 The build checks the source package, supported version and official signing
-certificates, verifies both downloaded tools by SHA-256, applies 15 selected
+certificates, verifies both downloaded tools by SHA-256, applies 17 selected
 patches plus their dependencies, signs the output, and verifies the resulting
 APK. Installation is a separate, explicit command and uses `adb install -r`.
 
@@ -50,6 +50,30 @@ and install it there.
 
 The launcher uses **Hadoo** and the original Hadoo symbol. YouTube Music's
 interface and playback behavior remain underneath.
+
+### Music-focused setup
+
+On the phone, enable **Settings → Data saving → Don't play music videos**. The
+included exclusive-audio patch makes this option available. This is a native
+YouTube Music setting, so it is not applied by importing Morphe settings.
+
+In **Morphe → General**, set **Change start page → Library** and, under
+**Navigation bar**, hide **Home**, **Samples** and **Upgrade**. This leaves Search
+and Library and avoids starting in the mixed recommendation feed. In **Morphe →
+Player**, enable **Hide Audio / Video toggle**. Choose **Songs** in Library and in
+search results when browsing recordings.
+
+The corresponding Morphe choices are recorded in `config/phone-settings.json`.
+Audio-only playback and hidden video controls do not filter YouTube Music's
+entire catalog: video-origin tracks and podcasts may still appear in search or
+saved collections. Strictly excluding those results requires another catalog
+filter; the stock patches do not provide that guarantee.
+
+The **Play albums songs** patch is intentionally excluded. In the pinned release
+it overrides the native Don't play music videos setting when enabled, so combining
+them would undermine this profile's audio-only preference.
+
+### Branding and downloads
 
 To select the included Hadoo header, open the app's profile menu → Settings →
 Morphe → General → Header logo → Custom. Search settings for “Header logo” if the
@@ -73,7 +97,7 @@ activate a paid Google account membership.
 
 `config/phone-settings.json` records the optional runtime choices for a custom
 header, in-app downloads, the “Hadoo settings” menu name, ad and Premium-promotion
-hiding, and removal of the Upgrade tab. It is separate
+hiding, the Library start page, and hidden video/navigation controls. It is separate
 from build options; it is not applied silently. You may merge those keys into an
 export of your in-app Morphe settings before reimporting. Keep an original export
 if you do this; a partial settings import can reset other preferences.
