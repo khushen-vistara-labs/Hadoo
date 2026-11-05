@@ -6,6 +6,7 @@ configuration for local modification of a user-supplied YouTube Music APK.
 Hadoo's original source code is licensed under GPL-3.0-only; see LICENSE.
 
 Hadoo uses unmodified, separately downloaded Morphe Desktop and Morphe Patches.
+It also compiles its own Hadoo defaults add-on from the source in tools/.
 Their copyright, license terms and notices remain applicable. Verbatim upstream
 notices are preserved in third_party/morphe-desktop.NOTICE and
 third_party/morphe-patches.NOTICE. Their upstream sources are:

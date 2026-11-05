@@ -116,12 +116,52 @@ class BuilderTests(unittest.TestCase):
             self.assertFalse((Path(directory) / "signing/morphe.keystore").exists())
 
     def test_partial_or_failed_patches_cannot_be_promoted_to_latest_build(self):
-        valid = {"success": True, "failedPatches": [], "appliedPatches": self.profile["patches"]}
+        valid = {"success": True, "failedPatches": [], "appliedPatches": self.profile["patches"] + [h.DEFAULTS_PATCH]}
         h.validate_patch_report(valid, self.profile)
         for bad in ({**valid, "success": False}, {**valid, "failedPatches": ["Downloads"]},
-                    {**valid, "appliedPatches": ["Custom branding"]}, {}):
+                    {**valid, "appliedPatches": ["Custom branding"]},
+                    {**valid, "appliedPatches": self.profile["patches"]}, {}):
             with self.subTest(report=bad), self.assertRaises(h.HadooError):
                 h.validate_patch_report(bad, self.profile)
+
+    def test_embedded_defaults_are_typed_and_native_preferences_are_explicit(self):
+        defaults = h.read_defaults()
+        self.assertTrue(defaults["native"]["pref_key_dont_play_video"])
+        self.assertFalse(defaults["morphe"]["morphe_music_hide_navigation_bar_home_button"])
+        with mock.patch.object(h, "read_json", side_effect=[{"morphe_bad": 1}, defaults["native"]]):
+            with self.assertRaisesRegex(h.HadooError, "Unsupported Morphe"):
+                h.read_defaults()
+        with mock.patch.object(h, "read_json", side_effect=[defaults["morphe"], {"pref_key_dont_play_video": "true"}]):
+            with self.assertRaisesRegex(h.HadooError, "Native defaults"):
+                h.read_defaults()
+
+    def test_defaults_properties_preserve_text_and_booleans_for_java(self):
+        properties = h.defaults_properties({"morphe": {"morphe_label": " Hadoo\\音\n", "morphe_boolean": False}, "native": {"pref_key_dont_play_video": True}})
+        self.assertIn("morphe.string.morphe_label=\\ Hadoo\\\\\\u97f3\\n\n", properties)
+        self.assertIn("morphe.boolean.morphe_boolean=false\n", properties)
+        self.assertIn("native.boolean.pref_key_dont_play_video=true\n", properties)
+
+    def test_addon_options_record_the_compiled_bundle_hash(self):
+        with tempfile.TemporaryDirectory() as directory:
+            addon = Path(directory) / h.DEFAULTS_BUNDLE
+            addon.write_bytes(b"local defaults bundle")
+            document = h.options_document(self.profile, self.lock, Path(directory), addon)
+            self.assertEqual(document[1]["meta"]["sha256"], h.sha256(addon))
+            self.assertEqual(document[1]["patches"], {h.DEFAULTS_PATCH: {"enabled": True, "options": {}}})
+
+    def test_defaults_patch_preserves_other_settings_and_saved_native_values(self):
+        desktop = h.tool_paths(self.lock)[0]
+        if not desktop.is_file():
+            self.skipTest("Run ./hadoo setup once to cache the pinned add-on compiler API.")
+        h.validate_tool_cache(self.lock)
+        java = h.find_java()
+        with tempfile.TemporaryDirectory() as directory:
+            command = [str(java.with_name("javac")), "--release", "17", "-cp", str(desktop), "-d", directory,
+                       str(h.ROOT / "tools/HadooDefaultsPatch.java"), str(h.ROOT / "tests/DefaultsPatchTest.java")]
+            h.run(command, java=java, capture=True)
+            result = h.run([str(java), "-cp", os.pathsep.join((str(desktop), directory)),
+                            "app.hadoo.patches.DefaultsPatchTest"], java=java, capture=True)
+            self.assertIn("Defaults regression checks passed", result)
 
     def test_key_import_does_not_overwrite_another_key(self):
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(h, "LOCAL", Path(directory) / "local"):

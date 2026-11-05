@@ -21,6 +21,8 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 LOCAL = ROOT / ".hadoo-local"
+DEFAULTS_PATCH = "Hadoo defaults"
+DEFAULTS_BUNDLE = "hadoo-defaults.mpp"
 
 
 class HadooError(Exception):
@@ -222,11 +224,81 @@ def check_inventory(text: str, profile: dict) -> None:
             raise HadooError(f"The actual {patch} options do not match this builder.")
 
 
-def options_document(profile: dict, lock: dict, branding: Path) -> list[dict]:
+def read_defaults() -> dict:
+    morphe = read_json(ROOT / "config/phone-settings.json")
+    native = read_json(ROOT / "config/native-settings.json")
+    if not isinstance(morphe, dict) or not morphe:
+        raise HadooError("Morphe defaults must be a nonempty settings object.")
+    for key, value in morphe.items():
+        if not re.fullmatch(r"morphe_[a-z0-9_]+", key) or type(value) not in (bool, str) or value == "":
+            raise HadooError(f"Unsupported Morphe default: {key}")
+    if not isinstance(native, dict) or set(native) != {"pref_key_dont_play_video", "pref_key_dont_play_nma_video"} or any(type(v) is not bool for v in native.values()):
+        raise HadooError("Native defaults must explicitly select both supported audio-only preferences.")
+    return {"morphe": morphe, "native": native}
+
+
+def property_value(value: str) -> str:
+    result = []
+    for char in value:
+        if char in "\\\n\r\t":
+            result.append({"\\": "\\\\", "\n": "\\n", "\r": "\\r", "\t": "\\t"}[char])
+        elif char == " ":
+            result.append("\\ ")
+        elif 0x20 <= ord(char) < 0x7f:
+            result.append(char)
+        else:
+            encoded = char.encode("utf-16-be")
+            result.extend(f"\\u{int.from_bytes(encoded[i:i+2], 'big'):04x}" for i in range(0, len(encoded), 2))
+    return "".join(result)
+
+
+def defaults_properties(defaults: dict) -> str:
+    lines = []
+    for group in ("morphe", "native"):
+        for key, value in sorted(defaults[group].items()):
+            kind = "boolean" if type(value) is bool else "string"
+            text = str(value).lower() if type(value) is bool else value
+            lines.append(f"{group}.{kind}.{key}={property_value(text)}")
+    return "\n".join(lines) + "\n"
+
+
+def prepare_defaults(java: Path, lock: dict) -> Path:
+    desktop, _ = validate_tool_cache(lock)
+    defaults = read_defaults()
+    destination = LOCAL / "defaults"
+    classes = destination / "classes"
+    if classes.exists():
+        shutil.rmtree(classes)
+    classes.mkdir(parents=True)
+    javac = java.with_name("javac" + java.suffix)
+    if not javac.is_file():
+        raise HadooError("A Java 21+ JDK with javac is required to build the Hadoo defaults add-on.")
+    # Morphe's add-on contract limits bundled class files to Java 17.
+    run([str(javac), "--release", "17", "-cp", str(desktop), "-d", str(classes),
+         str(ROOT / "tools/HadooDefaultsPatch.java")], java=java)
+    (classes / "hadoo-defaults.properties").write_text(defaults_properties(defaults), encoding="ascii")
+    bundle = destination / DEFAULTS_BUNDLE
+    with zipfile.ZipFile(bundle, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for file in sorted(classes.rglob("*")):
+            if file.is_file():
+                entry = zipfile.ZipInfo(file.relative_to(classes).as_posix(), (1980, 1, 1, 0, 0, 0))
+                entry.compress_type = zipfile.ZIP_DEFLATED
+                archive.writestr(entry, file.read_bytes())
+    inventory = run([str(java), "-jar", str(desktop), "list-patches", "--patches", str(bundle)], java=java, capture=True)
+    if f"Name: {DEFAULTS_PATCH}\n" not in inventory:
+        raise HadooError("The compiled Hadoo defaults add-on was not recognized by Morphe.")
+    return bundle
+
+
+def options_document(profile: dict, lock: dict, branding: Path, addon: Path | None = None) -> list[dict]:
     entries = {p["name"]: {"enabled": p["name"] in profile["patches"], "options": {key: None for key in p["options"]}} for p in lock["available_patches"]}
     entries["Custom branding"]["options"] = {"customName": profile["name"], "customIcon": str(branding / "icons"), "appIcon": "custom"}
     entries["Change header"]["options"] = {"custom": str(branding / "header")}
-    return [{"meta": {"source": lock["patches"]["filename"], "sha256": lock["patches"]["sha256"]}, "patches": entries}]
+    document = [{"meta": {"source": lock["patches"]["filename"], "sha256": lock["patches"]["sha256"]}, "patches": entries}]
+    if addon is not None:
+        document.append({"meta": {"source": DEFAULTS_BUNDLE, "sha256": sha256(addon)},
+                         "patches": {DEFAULTS_PATCH: {"enabled": True, "options": {}}}})
+    return document
 
 
 def prepare(java: Path, profile: dict, lock: dict) -> Path:
@@ -234,7 +306,8 @@ def prepare(java: Path, profile: dict, lock: dict) -> Path:
     run([str(java), "-Djava.awt.headless=true", str(ROOT / "tools/Branding.java"),
          str(ROOT / profile["mark"]), str(ROOT / profile["logo"]), str(destination)], java=java)
     options = LOCAL / "options.json"
-    write_json(options, options_document(profile, lock, destination))
+    addon = prepare_defaults(java, lock)
+    write_json(options, options_document(profile, lock, destination, addon))
     return options
 
 
@@ -245,7 +318,7 @@ def setup(profile: dict, lock: dict) -> None:
     check_inventory(patch_inventory(java, lock), profile)
     prepare(java, profile, lock)
     print("Verified Morphe Desktop " + lock["desktop"]["version"] + " and patches " + lock["patches"]["version"] + ".")
-    print("Hadoo branding and patch options are ready.")
+    print("Hadoo branding, embedded defaults and patch options are ready.")
 
 
 def parse_badging(text: str) -> dict:
@@ -293,6 +366,7 @@ def inspect_apk(path: Path, java: Path, sdk: dict) -> tuple[dict, set[str]]:
 def patch_arguments(java: Path, lock: dict, options: Path, source: Path, output: Path, report: Path, key: Path) -> list[str]:
     desktop, patches = tool_paths(lock)
     command = [str(java), "-Xmx3g", "-jar", str(desktop), "patch", "--patches", str(patches),
+               "--patches", str(LOCAL / "defaults" / DEFAULTS_BUNDLE),
                "--options-file", str(options), "--bytecode-mode", "FULL", "--keystore", str(key),
                "--signer", "Hadoo", "--out", str(output), "--result-file", str(report),
                "--temporary-files-path", str(output.parent / "scratch")]
@@ -308,7 +382,7 @@ def patch_arguments(java: Path, lock: dict, options: Path, source: Path, output:
 def validate_patch_report(report: dict, profile: dict) -> None:
     if report.get("success") is not True or report.get("failedPatches"):
         raise HadooError("Morphe reported a failed patch; no installation was attempted.")
-    if missing := set(profile["patches"]) - set(report.get("appliedPatches", [])):
+    if missing := (set(profile["patches"]) | {DEFAULTS_PATCH}) - set(report.get("appliedPatches", [])):
         raise HadooError("The build skipped required patches: " + ", ".join(sorted(missing)))
 
 
@@ -360,6 +434,10 @@ def build(args, profile: dict, lock: dict) -> None:
             if key.is_file():
                 key.chmod(0o600)
         validate_patch_report(read_json(report), profile)
+        addon = LOCAL / "defaults" / DEFAULTS_BUNDLE
+        defaults_check = run([str(java), "-Xmx2g", "-cp", os.pathsep.join((str(tool_paths(lock)[0]), str(addon))),
+                              "app.hadoo.patches.HadooDefaultsPatch", "verify", str(output)], java=java, capture=True)
+        print(defaults_check.strip())
         built, built_certs = inspect_apk(output, java, sdk)
         if built["package"] != lock["output"]["package"] or not built_certs:
             raise HadooError("Output package or signature verification failed; no installation was attempted.")
@@ -370,8 +448,12 @@ def build(args, profile: dict, lock: dict) -> None:
         manifest = {"name": profile["name"], "built_at": stamp, "input": {**info, "sha256": sha256(source), "certificate_sha256": sorted(certs)},
                     "output": {**built, "filename": "Hadoo.apk", "sha256": sha256(output), "certificate_sha256": sorted(built_certs)},
                     "upstream": {k: {"version": lock[k]["version"], "sha256": lock[k]["sha256"]} for k in ("desktop", "patches")},
-                    "patches": profile["patches"], "device_tested": False}
+                    "patches": profile["patches"] + [DEFAULTS_PATCH],
+                    "defaults": {**read_defaults(), "bundle_sha256": sha256(addon),
+                                 "source_sha256": sha256(ROOT / "tools/HadooDefaultsPatch.java"), "apk_verified": True},
+                    "device_tested": False}
         write_json(output_dir / "build.json", manifest)
+        shutil.copy2(addon, output_dir / DEFAULTS_BUNDLE)
         for filename in ("LICENSE", "NOTICE"):
             shutil.copy2(ROOT / filename, output_dir / filename)
         shutil.copytree(ROOT / "third_party", output_dir / "third_party")
@@ -463,9 +545,11 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "prepare":
             print("Prepared patch options: " + str(prepare(find_java(), profile, lock)))
         elif args.command == "patches":
-            inventory = patch_inventory(find_java(), lock)
+            java = find_java()
+            inventory = patch_inventory(java, lock)
             check_inventory(inventory, profile)
-            print(f"Verified {len(profile['patches'])} selected patches and branding option keys against the official bundle.")
+            prepare_defaults(java, lock)
+            print(f"Verified {len(profile['patches'])} upstream patches, branding options and the local Hadoo defaults add-on.")
         elif args.command == "build":
             build(args, profile, lock)
         elif args.command == "import-key":

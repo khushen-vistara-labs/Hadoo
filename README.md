@@ -38,7 +38,8 @@ Backup settings. Do not uninstall your working app to change its branding.
 
 The build checks the source package, supported version and official signing
 certificates, verifies both downloaded tools by SHA-256, applies 17 selected
-patches plus their dependencies, signs the output, and verifies the resulting
+upstream patches plus Hadoo's local defaults add-on and their dependencies,
+signs the output, and verifies the resulting
 APK. Installation is a separate, explicit command and uses `adb install -r`.
 
 Every build is saved under `.hadoo-local/builds/<timestamp>/Hadoo.apk` with a
@@ -51,21 +52,33 @@ and install it there.
 The launcher uses **Hadoo** and the original Hadoo symbol. YouTube Music's
 interface and playback behavior remain underneath.
 
-### Music-focused setup
+### Defaults included in the APK
 
-On the phone, enable **Settings → Data saving → Don't play music videos**. The
-included exclusive-audio patch makes this option available. This is a native
-YouTube Music setting, so it is not applied by importing Morphe settings. Enable
-**Don't play podcast videos** on the same screen to prefer audio for any podcast
-episodes that remain in saved collections.
+Fresh installs start with Home for personalized recommendations and **Home,
+Search and Library** in the bottom bar. Samples and Upgrade are hidden. The
+native **Don't play music videos** and **Don't play podcast videos** preferences
+default to enabled, and the player's Audio / Video switch defaults to hidden.
+The custom Hadoo header, in-app downloads, ad-hiding preferences and the
+**Hadoo settings** menu name are also included. Startup animation is disabled.
 
-In **Morphe → General**, set **Start page → Default** to open Home for personalized
-recommendations. Under **Navigation bar**, keep **Home** and **Library** visible
-and hide **Samples** and **Upgrade**. This leaves Home, Search and Library. In
-**Morphe → Player**, enable **Hide Audio / Video toggle**. Choose **Songs** in
-Library and in search results when browsing recordings.
+`config/phone-settings.json` defines Morphe defaults and
+`config/native-settings.json` defines the two native audio preferences. The
+builder compiles these into a local **Hadoo defaults** add-on. It changes setting
+defaults and native preference fallback values; it does not repeatedly write
+preferences. The signed APK is checked for every configured default before it
+can become the latest build.
 
-The corresponding Morphe choices are recorded in `config/phone-settings.json`.
+You can still change these settings. Normal updates preserve explicit saved
+choices; an older installation with a different saved choice needs changing
+once. No settings import is needed on a fresh phone. Google sign-in and the
+MicroG RE companion remain separate per-device setup.
+
+To change audio preference manually, use **Settings → Data saving → Don't play
+music videos**. To show the player's switch, use **Settings → Hadoo settings →
+Player → Hide Audio / Video toggle** and turn it off. Older builds label that
+settings menu **Morphe**. Choose **Songs** in Library or search when browsing
+recordings.
+
 Audio-only playback and hidden video controls do not filter YouTube Music's
 entire catalog: video-origin tracks and podcasts may still appear in search or
 saved collections. Strictly excluding those results requires another catalog
@@ -77,32 +90,23 @@ them would undermine this profile's audio-only preference.
 
 ### Branding and downloads
 
-To select the included Hadoo header, open the app's profile menu → Settings →
-Morphe → General → Header logo → Custom. Search settings for “Header logo” if the
-menu differs. Under Downloads, choose the in-app download mode if it is not
-already selected. Existing user preferences survive an update, so installing an
-APK alone does not reset these choices.
+Fresh installs select the Hadoo header and in-app download mode automatically.
+If an older saved preference overrides the header, open the app's profile menu →
+Settings → Hadoo settings → General → Header logo → Custom. Search settings for
+“Header logo” if the menu differs. Existing preferences survive an update.
 
 When updating an already configured Morphe build, also select **Custom** under
 **App name** (this build defines that name as Hadoo) and **Custom** under **App icon**
-in its Morphe General settings. You can disable the inherited startup animation
-on the same screen.
+in its General settings. You can change the startup animation on the same screen.
 The new build includes those choices; a previous explicit selection can override
 the new build's defaults until you change it once.
 
 The selected Hide ads patch provides switches for hiding video ads, the Get
 Premium label and Premium promotions. The Navigation bar patch hides the Upgrade
 tab by default. These switches can be checked in the app's Morphe → Ads settings
-and Morphe → General → Navigation bar settings. Existing explicit choices are
+and General → Navigation bar settings. Existing explicit choices are
 preserved on update. Hiding offers or enabling local playback features does not
 activate a paid Google account membership.
-
-`config/phone-settings.json` records the optional runtime choices for a custom
-header, in-app downloads, the “Hadoo settings” menu name, ad and Premium-promotion
-hiding, the Library start page, and hidden video/navigation controls. It is separate
-from build options; it is not applied silently. You may merge those keys into an
-export of your in-app Morphe settings before reimporting. Keep an original export
-if you do this; a partial settings import can reset other preferences.
 
 Validate playback, repeated next/previous taps, background playback and downloads
 on your device. Test downloads after closing the app and enabling airplane mode.
@@ -114,8 +118,8 @@ device playback reliability.
 | Command | Purpose |
 | --- | --- |
 | `./hadoo doctor` | Find prerequisites and show remaining setup |
-| `./hadoo setup` | Download and verify pinned tools; check patches; export branding |
-| `./hadoo prepare` | Export branding and options offline using Java |
+| `./hadoo setup` | Verify pinned tools, export branding and compile the defaults add-on |
+| `./hadoo prepare` | Export branding, compile defaults and write options offline |
 | `./hadoo patches` | Validate selected patches against the actual pinned bundle |
 | `./hadoo import-key PATH` | Copy your existing signing key into private local storage |
 | `./hadoo build APK` | Validate, patch, sign and verify an APK |

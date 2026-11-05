@@ -28,10 +28,10 @@ jobs:
           java-version: '21'
       - name: Check Python syntax
         run: python3 -m compileall -q tools tests hadoo
-      - name: Run offline tests
-        run: ./hadoo check
       - name: Download checksum-pinned upstream tools and export branding
         run: ./hadoo setup
+      - name: Run tests including the local defaults add-on
+        run: ./hadoo check
       - name: Verify the profile against the actual upstream bundle
         run: ./hadoo patches
       # Builds, APK inputs, signing keys and device/account data stay local.

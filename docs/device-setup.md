@@ -41,14 +41,23 @@ uses `adb install -r`. Add `--serial DEVICE` if more than one phone is connected
 Android refuses a mismatched signature; Hadoo never resolves this by uninstalling
 an app or clearing its data. Import the matching Manager keystore and rebuild.
 
-Keep microG installed. The Hadoo build uses the normal Morphe package identity
-and does not need a separate Google account or separate microG installation.
+Install **MicroG RE** from [Morphe's official releases](https://github.com/MorpheApp/MicroG-RE/releases)
+and keep it installed. The Hadoo build uses the normal Morphe package identity
+and the companion package `app.revanced.android.gms`. Morphe Manager is not
+required to run a prebuilt Hadoo APK. Sign in separately on each phone to access
+your Google library; an existing MicroG RE installation can be shared with other
+compatible patched apps on the same phone.
 
 The previous React Native Hadoo app can remain installed until you decide what
 to do with its local playlists and downloads. Its package is separate.
 
-After installation select the Custom header in the app's Morphe settings. Then
-test songs, next/previous, lock-screen controls, background playback and real
+Fresh installations include the Hadoo header, Home/Search/Library navigation,
+hidden Samples/Upgrade tabs and audio-only preferences. These defaults are built
+into the APK; no per-phone settings import is needed. Existing saved settings
+survive updates and can be changed in Settings → Hadoo settings (Morphe on older
+builds) or Settings → Data saving for native audio preferences.
+
+Test songs, next/previous, lock-screen controls, background playback and real
 offline downloads. Retain an older working APK in local storage for troubleshooting.
 
 Reference: [Morphe signing and backup guide](https://github.com/MorpheApp/morphe-manager/blob/main/docs/backup-and-keystore.md).
