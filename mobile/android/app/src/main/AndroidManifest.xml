@@ -1,0 +1,362 @@
+<manifest
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:installLocation="auto">
+    <!-- Some USB DACs/headsets expose an audio-capture interface. Android
+         checks the *granted* RECORD_AUDIO runtime permission before deciding
+         whether to display an additional USB-capture warning. Lokal does not
+         record audio; the user can grant this optional permission in USB DAC
+         settings. USB-device access is authorized separately by UsbManager. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-feature android:name="android.hardware.microphone" android:required="false" />
+    <!-- No microphone foreground service is used. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" tools:node="remove" />
+    <!-- Internet permission for Last.fm scrobbling and online features -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_LOCAL_NETWORK" />
+    <!-- USB Host (optional): for UAC 2.0 DAC/AMP detection on Android -->
+    <uses-feature android:name="android.hardware.usb.host" android:required="false" />
+    <!-- Storage permissions for music library access -->
+    <!-- Legacy storage permission (Android 9 and below) -->
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28" />
+    <!-- Android 13+ media permission -->
+    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
+    <!-- All Files Access lives in the `full` flavor manifest only: Google Play
+         rejects it for media apps, so the `play` flavor ships without it and
+         uses MediaStore + SAF + DSD reconciliation instead. -->
+    <!-- Camera permission for Flick Replay custom poster backgrounds -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <!-- Normal permission: player sliders control Android media volume. -->
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <!-- Background playback permissions -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- System-level floating mini-player overlay -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <!-- Bluetooth: connected-device / codec awareness (runtime-granted on Android 12+) -->
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <application
+        android:label="Hadoo"
+        android:name="${applicationName}"
+        android:icon="@mipmap/ic_lokal_lime"
+        android:roundIcon="@mipmap/ic_lokal_lime"
+        android:requestLegacyExternalStorage="true"
+        android:enableOnBackInvokedCallback="true"
+        android:usesCleartextTraffic="true">
+        <!-- Android Auto discovers the existing music MediaBrowserService. -->
+        <meta-data
+            android:name="com.google.android.gms.car.application"
+            android:resource="@xml/automotive_app_desc" />
+        <meta-data
+            android:name="com.google.android.gms.cast.framework.OPTIONS_PROVIDER_CLASS_NAME"
+            android:value="com.mossapps.flick.CastOptionsProvider" />
+        <service android:name=".FileCopyService" android:exported="false"
+            android:stopWithTask="true" android:foregroundServiceType="dataSync" />
+        <service android:name=".SoulseekForegroundService" android:exported="false"
+            android:stopWithTask="false" android:foregroundServiceType="dataSync" />
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:taskAffinity=""
+            android:theme="@style/LaunchTheme"
+            android:resizeableActivity="true"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
+            android:hardwareAccelerated="true"
+            android:windowSoftInputMode="adjustResize">
+            <!-- Specifies an Android theme to apply to this Activity as soon as
+                 the Android process has started. This theme is visible to the user
+                 while the Flutter UI initializes. After that, this theme continues
+                 to determine the Window background behind the Flutter UI. -->
+            <meta-data
+              android:name="io.flutter.embedding.android.NormalTheme"
+              android:resource="@style/NormalTheme"
+              />
+            <!-- The launcher entry lives on the accent aliases below. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:scheme="content" />
+                <data android:mimeType="audio/*" />
+            </intent-filter>
+            <!-- USB device attached: open app when a UAC 2.0 device is connected -->
+            <intent-filter>
+                <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
+            </intent-filter>
+            <meta-data
+                android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"
+                android:resource="@xml/device_filter" />
+        </activity>
+        <!-- Launcher icons whose sticker takes the accent, like desktop's Dock
+             and taskbar icon. Exactly one alias is enabled; LauncherIcon.kt
+             swaps it when the accent changes. Icons are generated by tool/gen_lokal_launcher_icons.py. -->
+        <activity-alias
+            android:name=".LauncherIconLime"
+            android:targetActivity=".MainActivity"
+            android:icon="@mipmap/ic_lokal_lime"
+            android:roundIcon="@mipmap/ic_lokal_lime"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".LauncherIconPurple"
+            android:targetActivity=".MainActivity"
+            android:icon="@mipmap/ic_lokal_purple"
+            android:roundIcon="@mipmap/ic_lokal_purple"
+            android:enabled="false"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".LauncherIconPink"
+            android:targetActivity=".MainActivity"
+            android:icon="@mipmap/ic_lokal_pink"
+            android:roundIcon="@mipmap/ic_lokal_pink"
+            android:enabled="false"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".LauncherIconOrange"
+            android:targetActivity=".MainActivity"
+            android:icon="@mipmap/ic_lokal_orange"
+            android:roundIcon="@mipmap/ic_lokal_orange"
+            android:enabled="false"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".LauncherIconBlue"
+            android:targetActivity=".MainActivity"
+            android:icon="@mipmap/ic_lokal_blue"
+            android:roundIcon="@mipmap/ic_lokal_blue"
+            android:enabled="false"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".LauncherIconRed"
+            android:targetActivity=".MainActivity"
+            android:icon="@mipmap/ic_lokal_red"
+            android:roundIcon="@mipmap/ic_lokal_red"
+            android:enabled="false"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".LauncherIconTeal"
+            android:targetActivity=".MainActivity"
+            android:icon="@mipmap/ic_lokal_teal"
+            android:roundIcon="@mipmap/ic_lokal_teal"
+            android:enabled="false"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".LauncherIconWhite"
+            android:targetActivity=".MainActivity"
+            android:icon="@mipmap/ic_lokal_white"
+            android:roundIcon="@mipmap/ic_lokal_white"
+            android:enabled="false"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".LauncherIconYellow"
+            android:targetActivity=".MainActivity"
+            android:icon="@mipmap/ic_lokal_yellow"
+            android:roundIcon="@mipmap/ic_lokal_yellow"
+            android:enabled="false"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".LauncherIconCyan"
+            android:targetActivity=".MainActivity"
+            android:icon="@mipmap/ic_lokal_cyan"
+            android:roundIcon="@mipmap/ic_lokal_cyan"
+            android:enabled="false"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".LauncherIconMagenta"
+            android:targetActivity=".MainActivity"
+            android:icon="@mipmap/ic_lokal_magenta"
+            android:roundIcon="@mipmap/ic_lokal_magenta"
+            android:enabled="false"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".LauncherIconGray"
+            android:targetActivity=".MainActivity"
+            android:icon="@mipmap/ic_lokal_gray"
+            android:roundIcon="@mipmap/ic_lokal_gray"
+            android:enabled="false"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <!-- Don't delete the meta-data below.
+             This is used by the Flutter tool to generate GeneratedPluginRegistrant.java -->
+        <meta-data
+            android:name="flutterEmbedding"
+            android:value="2" />
+        <!-- Flutter reads this as a BOOLEAN from ApplicationInfo.metaData.
+             android:resource stores the resource ID (an int), not its boolean
+             value; that silently defeats the API 31+ Impeller opt-in and
+             makes ImageFilter.shader fall back to plain frosted glass. -->
+        <meta-data
+            android:name="io.flutter.embedding.android.EnableImpeller"
+            android:value="@bool/enable_impeller" />
+        <!-- Media Notification Service for background playback -->
+        <service
+            android:name=".MusicNotificationService"
+            android:exported="true"
+            android:foregroundServiceType="mediaPlayback">
+            <intent-filter>
+                <action android:name="android.media.browse.MediaBrowserService" />
+            </intent-filter>
+        </service>
+
+        <!-- Publishes DLNA renderers as MediaRouter routes for system UI -->
+        <service
+            android:name=".DlnaRouteProviderService"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.media.MediaRouteProviderService" />
+            </intent-filter>
+        </service>
+
+        <!-- Home-screen widgets -->
+        <receiver
+            android:name=".widgets.WidgetActionReceiver"
+            android:exported="false" />
+
+        <receiver
+            android:name=".widgets.MiniPlayerWidgetProvider"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/mini_player_widget_info" />
+        </receiver>
+
+        <receiver android:name=".widgets.FlowRadioWidgetProvider" android:exported="true">
+            <intent-filter><action android:name="android.appwidget.action.APPWIDGET_UPDATE" /></intent-filter>
+            <meta-data android:name="android.appwidget.provider"
+                android:resource="@xml/flow_radio_widget_info" />
+        </receiver>
+        <receiver android:name=".widgets.CoverFlowRecommendationWidgetProvider" android:exported="true">
+            <intent-filter><action android:name="android.appwidget.action.APPWIDGET_UPDATE" /></intent-filter>
+            <meta-data android:name="android.appwidget.provider"
+                android:resource="@xml/recommended_flow_widget_info" />
+        </receiver>
+        <activity-alias android:name=".LauncherIconChartreuse"
+            android:targetActivity=".MainActivity"
+            android:icon="@mipmap/ic_lokal_chartreuse" android:roundIcon="@mipmap/ic_lokal_chartreuse"
+            android:enabled="false" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias android:name=".LauncherIconMidnight"
+            android:targetActivity=".MainActivity"
+            android:icon="@mipmap/ic_lokal_midnight" android:roundIcon="@mipmap/ic_lokal_midnight"
+            android:enabled="false" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias android:name=".LauncherIconRosegold"
+            android:targetActivity=".MainActivity"
+            android:icon="@mipmap/ic_lokal_rosegold" android:roundIcon="@mipmap/ic_lokal_rosegold"
+            android:enabled="false" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias android:name=".LauncherIconNeon"
+            android:targetActivity=".MainActivity"
+            android:icon="@mipmap/ic_lokal_neon" android:roundIcon="@mipmap/ic_lokal_neon"
+            android:enabled="false" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+    </application>
+    <!-- Required to query activities that can process text, see:
+         https://developer.android.com/training/package-visibility and
+         https://developer.android.com/reference/android/content/Intent#ACTION_PROCESS_TEXT.
+
+         In particular, this is used by the Flutter engine in io.flutter.plugin.text.ProcessTextPlugin. -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.PROCESS_TEXT"/>
+            <data android:mimeType="text/plain"/>
+        </intent>
+        <!-- url_launcher: Android 11+ (API 30+) package-visibility requires
+             declaring the browser VIEW intent or launchUrl throws
+             ACTIVITY_NOT_FOUND. Needed for Tidal/Last.fm OAuth device flow. -->
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <category android:name="android.intent.category.BROWSABLE" />
+            <data android:scheme="https" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="http" />
+        </intent>
+    </queries>
+</manifest>

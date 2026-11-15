@@ -1,0 +1,391 @@
+import 'dart:async';
+
+import 'package:flutter/foundation.dart';
+
+import 'package:flick/core/utils/dev_log.dart';
+
+import '../data/entities/song_entity.dart';
+import '../data/entities/song_audio_cache_entity.dart';
+import '../data/repositories/song_repository.dart';
+import 'audio_analysis_queue.dart';
+import 'album_art_service.dart';
+import 'artwork_gate.dart';
+
+class PreloadProgress {
+  final int completed;
+  final int total;
+  final int skipped;
+  final int failed;
+  final String? currentFile;
+  final bool isComplete;
+
+  const PreloadProgress({
+    this.completed = 0,
+    this.total = 0,
+    this.skipped = 0,
+    this.failed = 0,
+    this.currentFile,
+    this.isComplete = false,
+  });
+
+  double get fraction => total > 0 ? completed / total : 0.0;
+}
+
+/// Orchestrates the audio preload pass: decodes each song once via the Rust
+/// bridge, caches waveform peaks + metrics, and resolves cover art.
+///
+/// [instance] is the app-wide singleton. Exactly one pass runs at any time:
+/// post-scan auto passes merge into a shared drain queue, while a manual
+/// [preloadSongs] pass takes over exclusively (cancelling any auto pass).
+/// Multiple concurrent passes previously stacked decoders, held overlapping
+/// artwork-gate refcounts, and made scans look wedged on slow devices.
+class AudioPreloadService {
+  static final AudioPreloadService instance = AudioPreloadService();
+
+  static const int _concurrency = 2;
+  static const int _currentVersion = AudioAnalysisQueue.cacheVersion;
+
+  /// Formats the native analyzer cannot decode yet (Rust skips them). Misses
+  /// are negative-cached so every pass doesn't re-probe them. Bump
+  /// [_currentVersion] when decode support lands to force a recompute.
+  static const Set<String> _negativeCacheExtensions = {'dsf', 'dff', 'wv'};
+
+  /// Pure extension check (unit-tested): should a failed analysis for [path]
+  /// be persisted as a negative cache row?
+  static bool shouldNegativeCache(String path) {
+    final dot = path.lastIndexOf('.');
+    if (dot < 0 || dot == path.length - 1) return false;
+    return _negativeCacheExtensions.contains(
+      path.substring(dot + 1).toLowerCase(),
+    );
+  }
+
+  final SongRepository? _injectedSongRepository;
+  final AlbumArtService? _injectedAlbumArtService;
+
+  // Lazy so constructing the service (e.g. in tests) does not require the
+  // database or artwork singletons to be initialized.
+  late final SongRepository _songRepository =
+      _injectedSongRepository ?? SongRepository();
+  late final AlbumArtService _albumArtService =
+      _injectedAlbumArtService ?? AlbumArtService.instance;
+
+  /// Live state of the shared auto pass; null while idle. UI can listen to
+  /// surface background progress and offer cancellation.
+  final ValueNotifier<PreloadProgress?> progress = ValueNotifier(null);
+
+  bool _runnerActive = false;
+  bool _cancelRequested = false;
+  bool _manualPassActive = false;
+
+  /// Completed by [cancel] so a pass can abandon an in-flight decode chunk
+  /// immediately instead of waiting for a slow (or wedged) Rust call. Null
+  /// while no pass is running.
+  Completer<void>? _cancelSignal;
+
+  /// Sticky after [cancel]: blocks new auto passes until the user starts a
+  /// scan session or a manual preload. Prevents a post-scan straggler from
+  /// resurrecting the pill right after the user stopped it.
+  bool _autoSuppressed = false;
+
+  bool get isAutoSuppressed => _autoSuppressed;
+
+  final List<SongEntity> _pending = [];
+  final Set<int> _queuedIds = {};
+  int _completed = 0;
+  int _skipped = 0;
+  int _failed = 0;
+  int _total = 0;
+
+  AudioPreloadService({
+    SongRepository? songRepository,
+    AlbumArtService? albumArtService,
+  }) : _injectedSongRepository = songRepository,
+       _injectedAlbumArtService = albumArtService;
+
+  bool get isRunning => _runnerActive || _manualPassActive;
+
+  /// Stops the active pass (auto or manual) at the next chunk boundary and
+  /// drops everything still queued. Also suppresses later auto passes so an
+  /// in-flight scan can't immediately enqueue a new one.
+  ///
+  /// Clears [progress] and fires [_cancelSignal] synchronously: the floating
+  /// pill and the preload card must not outlive the cancel waiting for a slow
+  /// decode chunk to notice `_cancelRequested`.
+  void cancel() {
+    _cancelRequested = true;
+    _autoSuppressed = true;
+    _pending.clear();
+    _queuedIds.clear();
+    progress.value = null;
+    final signal = _cancelSignal;
+    if (signal != null && !signal.isCompleted) signal.complete();
+  }
+
+  /// Lifts the sticky [cancel] suppression. Called when the user starts work
+  /// again (new scan session, manual preload).
+  void clearAutoSuppression() {
+    _autoSuppressed = false;
+  }
+
+  /// Auto-pass entry point (post-scan). Merges [songs] into the single drain
+  /// queue — concurrent folder scans enqueue without supersetting each other.
+  /// Stale-cache files are filtered out here; already-queued ids are skipped.
+  Future<void> enqueueAutoPreload(List<SongEntity> songs) async {
+    if (_autoSuppressed || _manualPassActive || songs.isEmpty) return;
+
+    final cacheMap = await _songRepository.getAudioCacheMap(
+      songs.map((s) => s.id).toList(),
+    );
+
+    // The await above is a gap: a Stop (or a manual pass) can land while we
+    // read the cache. Re-check before repopulating the queue, or the pass
+    // resurrects itself right after being cancelled.
+    if (_autoSuppressed || _manualPassActive) return;
+
+    for (final song in songs) {
+      if (_queuedIds.contains(song.id)) continue;
+      final cache = cacheMap[song.id];
+      if (cache != null && _isCacheFresh(cache, song)) continue;
+      _queuedIds.add(song.id);
+      _pending.add(song);
+    }
+    if (_pending.isEmpty) return;
+
+    _total = _completed + _skipped + _failed + _pending.length;
+    _emitAutoProgress();
+
+    if (!_runnerActive) {
+      _runnerActive = true;
+      _cancelSignal = Completer<void>();
+      unawaited(_drainAutoQueue());
+    }
+  }
+
+  /// Preloads audio data for [songs]. Skips songs whose cache is fresh
+  /// (computedAt >= song.lastModified) unless [forceAll]. Runs exclusively:
+  /// any in-flight auto pass is cancelled first.
+  Stream<PreloadProgress> preloadSongs(
+    List<SongEntity> songs, {
+    bool forceAll = false,
+  }) async* {
+    if (songs.isEmpty) {
+      yield const PreloadProgress(isComplete: true);
+      return;
+    }
+
+    // Take over from any running auto pass before touching shared state.
+    _cancelRequested = true;
+    while (_runnerActive) {
+      await Future<void>.delayed(const Duration(milliseconds: 25));
+    }
+
+    _manualPassActive = true;
+    _cancelRequested = false;
+    _autoSuppressed = false;
+    _cancelSignal = Completer<void>();
+
+    // ponytail: hold the artwork gate for the whole pass so scroll-side
+    // extraction steps aside. Preload owns the shared compute() isolate
+    // until done; tiles refresh via watchSongs() -> invalidateSelf when each
+    // path is persisted, so art appears as preload reaches it. Refcounted,
+    // so a concurrent fling gate won't clobber this on its settle timer.
+    pauseArtworkExtraction(true);
+    try {
+      final songIds = songs.map((s) => s.id).toList();
+      final cacheMap = await _songRepository.getAudioCacheMap(songIds);
+
+      final toProcess = <SongEntity>[];
+      var skipped = 0;
+
+      for (final song in songs) {
+        final cache = cacheMap[song.id];
+        if (!forceAll && cache != null && _isCacheFresh(cache, song)) {
+          skipped++;
+          continue;
+        }
+        toProcess.add(song);
+      }
+
+      var completed = skipped;
+      var failed = 0;
+
+      final initial = PreloadProgress(
+        completed: completed,
+        total: songs.length,
+        skipped: skipped,
+        failed: failed,
+      );
+      progress.value = initial;
+      yield initial;
+
+      // ponytail: chunked concurrency — simple, correct, good enough for v1.
+      // Uneven decode times leave a worker idle at chunk boundaries; upgrade
+      // a shared-queue worker pool if that matters.
+      for (var i = 0; i < toProcess.length; i += _concurrency) {
+        if (_cancelRequested) break;
+
+        final end = (i + _concurrency).clamp(0, toProcess.length);
+        final chunk = toProcess.sublist(i, end);
+
+        final results = await _waitForChunk(chunk);
+        if (_cancelRequested) break;
+
+        completed += results.where((r) => r).length;
+        failed += results.where((r) => !r).length;
+
+        final snapshot = PreloadProgress(
+          completed: completed,
+          total: songs.length,
+          skipped: skipped,
+          failed: failed,
+          currentFile: chunk.last.title,
+        );
+        progress.value = snapshot;
+        yield snapshot;
+      }
+
+      progress.value = null;
+      yield PreloadProgress(
+        completed: songs.length,
+        total: songs.length,
+        skipped: skipped,
+        failed: failed,
+        isComplete: true,
+      );
+    } finally {
+      pauseArtworkExtraction(false);
+      _manualPassActive = false;
+      _cancelRequested = false;
+      _cancelSignal = null;
+    }
+  }
+
+  /// Drains the merged auto queue. Holds the artwork gate while running so
+  /// the release is guaranteed even on cancel — an orphaned pause previously
+  /// froze artwork extraction for the rest of the session.
+  Future<void> _drainAutoQueue() async {
+    pauseArtworkExtraction(true);
+    try {
+      while (_pending.isNotEmpty) {
+        if (_cancelRequested) break;
+
+        final chunkSize = _concurrency.clamp(0, _pending.length);
+        final chunk = _pending.sublist(0, chunkSize);
+        _pending.removeRange(0, chunkSize);
+
+        final results = await _waitForChunk(chunk);
+
+        // Stop landed while this chunk decoded; don't publish its counters.
+        if (_cancelRequested) break;
+
+        _completed += results.where((r) => r).length;
+        _failed += results.where((r) => !r).length;
+        _emitAutoProgress(
+          currentFile: chunk.isNotEmpty ? chunk.last.title : null,
+        );
+      }
+    } finally {
+      pauseArtworkExtraction(false);
+      _runnerActive = false;
+      final cancelled = _cancelRequested;
+      final processed = _completed + _failed;
+      _cancelRequested = false;
+      _cancelSignal = null;
+      _pending.clear();
+      _queuedIds.clear();
+      _completed = 0;
+      _skipped = 0;
+      _failed = 0;
+      _total = 0;
+      progress.value = null;
+      devLog(
+        '[AudioPreload] auto pass ${cancelled ? 'cancelled' : 'finished'}: '
+        '$processed processed',
+      );
+    }
+  }
+
+  /// Runs one decode chunk, returning early once [cancel] fires. A hung Rust
+  /// decode otherwise keeps the pass (and its progress) alive forever; the
+  /// abandoned work may still finish in the background and is ignored.
+  Future<List<bool>> _waitForChunk(List<SongEntity> chunk) {
+    final signal = _cancelSignal;
+    final work = Future.wait(
+      chunk.map(
+        (s) => _processSong(s).then((_) => true).catchError((_) => false),
+      ),
+    );
+    if (signal == null) return work;
+    return Future.any([
+      work,
+      signal.future.then((_) => List<bool>.filled(chunk.length, false)),
+    ]);
+  }
+
+  void _emitAutoProgress({String? currentFile}) {
+    progress.value = PreloadProgress(
+      completed: _completed + _skipped,
+      total: _total,
+      skipped: _skipped,
+      failed: _failed,
+      currentFile: currentFile,
+    );
+  }
+
+  bool _isCacheFresh(SongAudioCacheEntity cache, SongEntity song) {
+    if (cache.version != _currentVersion) return false;
+    final songModified = song.lastModified?.millisecondsSinceEpoch ?? 0;
+    return cache.computedAt >= songModified;
+  }
+
+  Future<void> _processSong(SongEntity song) async {
+    if (_cancelRequested) return;
+
+    final path = song.filePath;
+    if (path.startsWith('content://')) return;
+
+    final pass = _cancelSignal;
+    final result = await AudioAnalysisQueue.instance.analyze(
+      path,
+      isNeeded: () => !_cancelRequested && identical(pass, _cancelSignal),
+    );
+    if (_cancelRequested || !identical(pass, _cancelSignal)) return;
+
+    if (result == null) {
+      // Known-undecodable formats get a negative cache row so later passes
+      // skip them; transient decode failures of supported formats do not.
+      if (shouldNegativeCache(path)) {
+        await _songRepository.upsertAudioCache(
+          SongAudioCacheEntity()
+            ..songId = song.id
+            ..peaks = const []
+            ..version = _currentVersion
+            ..computedAt = DateTime.now().millisecondsSinceEpoch,
+        );
+      }
+      return;
+    }
+
+    final entity = SongAudioCacheEntity()
+      ..songId = song.id
+      ..peaks = result.peaks.toList()
+      ..lufs = result.lufs
+      ..truePeakDb = result.truePeakDb
+      ..dr = result.dr
+      ..lra = result.lra
+      ..clipping = result.clipping
+      ..version = _currentVersion
+      ..computedAt = DateTime.now().millisecondsSinceEpoch;
+
+    await _songRepository.upsertAudioCache(entity);
+
+    // Resolve cover art (reuses AlbumArtService's full caching pipeline).
+    if (song.albumArtPath == null || song.albumArtPath!.isEmpty) {
+      await _albumArtService.resolveArtworkPath(
+        existingPath: song.albumArtPath,
+        audioSourcePath: path,
+      );
+    }
+  }
+}

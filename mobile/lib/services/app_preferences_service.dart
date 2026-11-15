@@ -1,0 +1,1996 @@
+import 'package:shared_preferences/shared_preferences.dart';
+
+class AppPreferences {
+  final bool animationsEnabled;
+  final bool hapticsEnabled;
+  final bool connectionNoticesEnabled;
+  final bool showSmartMixes;
+  final bool showRecentArtists;
+  final bool showRecentTracks;
+  final bool showPlaylistPreviews;
+  final bool showBrowseMore;
+  final bool showQuickAccess;
+  final bool showEngineSelector;
+  final bool showUsbVolumeOnMenu;
+  final bool showUsbVolumeOnSettings;
+  final bool crossfadeEnabled;
+  final bool automixStemClipsEnabled;
+  final double crossfadeDurationSecs;
+  final int crossfadeCurveIndex;
+  final int crossfeedLevel;
+  final bool swipeActionsEnabled;
+  /// Swap song-row swipe actions: right = Play next, left = Add to queue.
+  final bool swipeQueueDirectionsReversed;
+  final String favoriteRemovalMode; // 'swipe' or 'longpress'
+  final bool fastIndexEnabled;
+  final int fastIndexTimeoutSeconds;
+  final int immersiveAutoFullViewSeconds;
+  final String visualizerAnimationStyle;
+  final String visualizerFrequencyMode;
+  final String visualizerMovementMode;
+  final String visualizerColorMode;
+  final double artworkCardArtworkScale;
+  final double artworkCardTextScale;
+  final double artworkCardVerticalOffset;
+  final double artworkCardArtworkOffset;
+  final bool artworkCardShowTitle;
+  final bool artworkCardShowArtist;
+  final bool artworkCardShowAlbum;
+  final bool artworkCardShowFileInfo;
+  final bool artworkCardShowFrame;
+  final double immersiveTextScale;
+  final double immersiveVerticalOffset;
+  final double immersiveFullViewScale;
+  final bool immersiveShowTitle;
+  final bool immersiveShowArtist;
+  final bool immersiveShowFileInfo;
+  final int widgetBgOpacity;
+  final bool widgetShowAlbumArt;
+  final bool widgetShowArtist;
+  final String widgetAccentColor;
+  final String widgetFlagshipTheme;
+  final String widgetFlagshipAccent;
+  final bool widgetFlagshipShowArtist;
+  final int widgetCompactBgOpacity;
+  final bool widgetCompactShowAlbumArt;
+  final bool widgetCompactShowArtist;
+  final String widgetCompactAccent;
+  final double widgetTextScale;
+  final double widgetFlagshipTextScale;
+  final double widgetCompactTextScale;
+  final bool lyricsMatchAudioFilename;
+
+  /// Look lyrics up online when a song carries none (desktop's
+  /// `lyrics_auto_fetch`, on by default).
+  final bool lyricsAutoFetch;
+  final String leftActionButton;
+  final String rightActionButton;
+  final String leftTopActionButton;
+  final String rightTopActionButton;
+  final bool welcomeCardDismissed;
+  final bool glanceCardHidden;
+  final bool glanceCardMinimized;
+  final bool replaceAlbumWithBitPerfectCapsule;
+  final bool albumsStretchArtwork;
+  final bool animatedAlbumArt;
+  final int folderGridPageSize;
+  final String? lastSeenChangelogVersion;
+  final bool bottomBarAutoCollapseEnabled;
+  final int bottomBarAutoCollapseSeconds;
+  final String miniPlayerSwipeAction;
+  final bool separateMiniPlayerFromNavBar;
+  final bool keepPlayingOnQuit;
+  final bool priorityAnchorEnabled;
+  final bool motionArtDuringBitPerfect;
+  final bool pauseOnBluetoothDisconnect;
+  final bool resumeOnBluetoothReconnect;
+  final bool pauseOnUsbDacDisconnect;
+  final bool pauseOnBluetoothConnect;
+  final bool pauseOnUsbDacConnect;
+  final String preferredBluetoothDevice;
+  final int btPreferredCodec;
+  final String btLdacBitrate;
+  final bool btAbsoluteVolumeSync;
+  final bool btEnableCodecControl;
+  final int btSampleRate;
+  final int btLdacBitsPerSample;
+  final bool floatingPlayerEnabled;
+  final bool floatingIslandEnabled;
+  final bool autoFocusSearch;
+  final String searchPlaybackMode; // 'results', 'library', or 'queue'
+  final String refreshRateMode; // 'high', 'standard', 'adaptive'
+  final bool visualizerEnabled;
+  final double orbitRadiusRatio;
+  final double orbitCenterOffsetRatio;
+  final double orbitCenterYRatio;
+  final double orbitItemSpacing;
+  final double orbitSelectedScale;
+  final double orbitDepth;
+  final int orbitVisibleItems;
+  final double orbitCardArtSize;
+  final double orbitCardWidthRatio;
+  final double orbitArtResolutionMultiplier;
+  final bool orbitShowPath;
+  final bool orbitShowGlow;
+  final bool streaksEnabled;
+  final bool showMoreFromArtist;
+  final bool showMoreArtists;
+  final bool detailHeaderArtExpanded;
+  final bool detailHeaderCenteredTitle;
+  final String
+  songTileThumbnailMode; // 'artwork', 'trackNumber', or 'trackNumberOnArt'
+  final bool extendedVolumeEnabled;
+  final String replayGainMode; // 'off', 'track', or 'album'
+  final String lyricsTextAlign; // 'left', 'center', or 'right'
+  final bool karaokeEnabled;
+  final double replayGainPreampDb;
+  final bool replayGainPreventClipping;
+
+  const AppPreferences({
+    this.animationsEnabled = true,
+    this.hapticsEnabled = true,
+    this.connectionNoticesEnabled = true,
+    this.showSmartMixes = true,
+    this.showRecentArtists = true,
+    this.showRecentTracks = true,
+    this.showPlaylistPreviews = true,
+    this.showBrowseMore = true,
+    this.showQuickAccess = true,
+    this.showEngineSelector = true,
+    this.showUsbVolumeOnMenu = true,
+    this.showUsbVolumeOnSettings = false,
+    this.crossfadeEnabled = false,
+    this.automixStemClipsEnabled = false,
+    this.crossfadeDurationSecs = 3.0,
+    this.crossfadeCurveIndex = 0,
+    this.crossfeedLevel = 0,
+    this.swipeActionsEnabled = true,
+    this.swipeQueueDirectionsReversed = false,
+    this.favoriteRemovalMode = 'swipe',
+    this.fastIndexEnabled = true,
+    this.fastIndexTimeoutSeconds = 3,
+    this.immersiveAutoFullViewSeconds = 0,
+    this.visualizerAnimationStyle = 'bars',
+    this.visualizerFrequencyMode = 'full',
+    this.visualizerMovementMode = 'bouncy',
+    this.visualizerColorMode = 'album_art',
+    this.artworkCardArtworkScale = 1.0,
+    this.artworkCardTextScale = 1.0,
+    this.artworkCardVerticalOffset = 0.0,
+    this.artworkCardArtworkOffset = 0.0,
+    this.artworkCardShowTitle = true,
+    this.artworkCardShowArtist = true,
+    this.artworkCardShowAlbum = true,
+    this.artworkCardShowFileInfo = true,
+    this.artworkCardShowFrame = true,
+    this.immersiveTextScale = 1.0,
+    this.immersiveVerticalOffset = 0.0,
+    this.immersiveFullViewScale = 1.0,
+    this.immersiveShowTitle = true,
+    this.immersiveShowArtist = true,
+    this.immersiveShowFileInfo = true,
+    this.widgetBgOpacity = 3,
+    this.widgetShowAlbumArt = true,
+    this.widgetShowArtist = true,
+    this.widgetAccentColor = 'theme',
+    this.widgetFlagshipTheme = 'art_dominant',
+    this.widgetFlagshipAccent = 'theme',
+    this.widgetFlagshipShowArtist = true,
+    this.widgetCompactBgOpacity = 3,
+    this.widgetCompactShowAlbumArt = true,
+    this.widgetCompactShowArtist = true,
+    this.widgetCompactAccent = 'theme',
+    this.widgetTextScale = 1.0,
+    this.widgetFlagshipTextScale = 1.0,
+    this.widgetCompactTextScale = 1.0,
+    this.lyricsMatchAudioFilename = false,
+    this.lyricsAutoFetch = true,
+    this.leftActionButton = 'lyrics',
+    this.rightActionButton = 'favorites',
+    this.leftTopActionButton = 'none',
+    this.rightTopActionButton = 'none',
+    this.welcomeCardDismissed = false,
+    this.glanceCardHidden = false,
+    this.glanceCardMinimized = false,
+    this.replaceAlbumWithBitPerfectCapsule = false,
+    this.albumsStretchArtwork = false,
+    this.animatedAlbumArt = true,
+    this.folderGridPageSize = 8,
+    this.lastSeenChangelogVersion,
+    this.bottomBarAutoCollapseEnabled = false,
+    this.bottomBarAutoCollapseSeconds = 5,
+    this.miniPlayerSwipeAction = 'switchSongs',
+    this.separateMiniPlayerFromNavBar = false,
+    this.keepPlayingOnQuit = false,
+    this.priorityAnchorEnabled = false,
+    this.motionArtDuringBitPerfect = false,
+    this.pauseOnBluetoothDisconnect = true,
+    this.resumeOnBluetoothReconnect = false,
+    this.pauseOnUsbDacDisconnect = true,
+    this.pauseOnBluetoothConnect = false,
+    this.pauseOnUsbDacConnect = false,
+    this.preferredBluetoothDevice = '',
+    this.btPreferredCodec = -1,
+    this.btLdacBitrate = 'adaptive',
+    this.btAbsoluteVolumeSync = false,
+    this.btEnableCodecControl = false,
+    this.btSampleRate = 0,
+    this.btLdacBitsPerSample = 0,
+    this.floatingPlayerEnabled = false,
+    this.floatingIslandEnabled = false,
+    this.autoFocusSearch = false,
+    this.searchPlaybackMode = 'results',
+    this.refreshRateMode = 'adaptive',
+    this.visualizerEnabled = false,
+    this.orbitRadiusRatio = 1.0,
+    this.orbitCenterOffsetRatio = -0.5,
+    this.orbitCenterYRatio = 0.42,
+    this.orbitItemSpacing = 0.28,
+    this.orbitSelectedScale = 1.25,
+    this.orbitDepth = 0.75,
+    this.orbitVisibleItems = 5,
+    this.orbitCardArtSize = 64.0,
+    this.orbitCardWidthRatio = 0.68,
+    this.orbitArtResolutionMultiplier = 2.0,
+    this.orbitShowPath = true,
+    this.orbitShowGlow = true,
+    this.streaksEnabled = true,
+    this.showMoreFromArtist = true,
+    this.showMoreArtists = true,
+    this.detailHeaderArtExpanded = true,
+    this.detailHeaderCenteredTitle = false,
+    this.songTileThumbnailMode = 'artwork',
+    this.extendedVolumeEnabled = false,
+    this.replayGainMode = 'off',
+    this.lyricsTextAlign = 'center',
+    this.karaokeEnabled = true,
+    this.replayGainPreampDb = 0.0,
+    this.replayGainPreventClipping = true,
+  });
+
+  AppPreferences copyWith({
+    bool? animationsEnabled,
+    bool? hapticsEnabled,
+    bool? connectionNoticesEnabled,
+    bool? showSmartMixes,
+    bool? showRecentArtists,
+    bool? showRecentTracks,
+    bool? showPlaylistPreviews,
+    bool? showBrowseMore,
+    bool? showQuickAccess,
+    bool? showEngineSelector,
+    bool? showUsbVolumeOnMenu,
+    bool? showUsbVolumeOnSettings,
+    bool? crossfadeEnabled,
+    bool? automixStemClipsEnabled,
+    double? crossfadeDurationSecs,
+    int? crossfadeCurveIndex,
+    int? crossfeedLevel,
+    bool? swipeActionsEnabled,
+    bool? swipeQueueDirectionsReversed,
+    String? favoriteRemovalMode,
+    bool? fastIndexEnabled,
+    int? fastIndexTimeoutSeconds,
+    int? immersiveAutoFullViewSeconds,
+    String? visualizerAnimationStyle,
+    String? visualizerFrequencyMode,
+    String? visualizerMovementMode,
+    String? visualizerColorMode,
+    double? artworkCardArtworkScale,
+    double? artworkCardTextScale,
+    double? artworkCardVerticalOffset,
+    double? artworkCardArtworkOffset,
+    bool? artworkCardShowTitle,
+    bool? artworkCardShowArtist,
+    bool? artworkCardShowAlbum,
+    bool? artworkCardShowFileInfo,
+    bool? artworkCardShowFrame,
+    double? immersiveTextScale,
+    double? immersiveVerticalOffset,
+    double? immersiveFullViewScale,
+    bool? immersiveShowTitle,
+    bool? immersiveShowArtist,
+    bool? immersiveShowFileInfo,
+    int? widgetBgOpacity,
+    bool? widgetShowAlbumArt,
+    bool? widgetShowArtist,
+    String? widgetAccentColor,
+    String? widgetFlagshipTheme,
+    String? widgetFlagshipAccent,
+    bool? widgetFlagshipShowArtist,
+    int? widgetCompactBgOpacity,
+    bool? widgetCompactShowAlbumArt,
+    bool? widgetCompactShowArtist,
+    String? widgetCompactAccent,
+    double? widgetTextScale,
+    double? widgetFlagshipTextScale,
+    double? widgetCompactTextScale,
+    bool? lyricsMatchAudioFilename,
+    bool? lyricsAutoFetch,
+    String? leftActionButton,
+    String? rightActionButton,
+    String? leftTopActionButton,
+    String? rightTopActionButton,
+    bool? welcomeCardDismissed,
+    bool? glanceCardHidden,
+    bool? glanceCardMinimized,
+    bool? replaceAlbumWithBitPerfectCapsule,
+    bool? albumsStretchArtwork,
+    bool? animatedAlbumArt,
+    int? folderGridPageSize,
+    String? lastSeenChangelogVersion,
+    bool? bottomBarAutoCollapseEnabled,
+    int? bottomBarAutoCollapseSeconds,
+    String? miniPlayerSwipeAction,
+    bool? separateMiniPlayerFromNavBar,
+    bool? keepPlayingOnQuit,
+    bool? priorityAnchorEnabled,
+    bool? motionArtDuringBitPerfect,
+    bool? pauseOnBluetoothDisconnect,
+    bool? resumeOnBluetoothReconnect,
+    bool? pauseOnUsbDacDisconnect,
+    bool? pauseOnBluetoothConnect,
+    bool? pauseOnUsbDacConnect,
+    String? preferredBluetoothDevice,
+    int? btPreferredCodec,
+    String? btLdacBitrate,
+    bool? btAbsoluteVolumeSync,
+    bool? btEnableCodecControl,
+    int? btSampleRate,
+    int? btLdacBitsPerSample,
+    bool? floatingPlayerEnabled,
+    bool? floatingIslandEnabled,
+    bool? autoFocusSearch,
+    String? searchPlaybackMode,
+    String? refreshRateMode,
+    bool? visualizerEnabled,
+    double? orbitRadiusRatio,
+    double? orbitCenterOffsetRatio,
+    double? orbitCenterYRatio,
+    double? orbitItemSpacing,
+    double? orbitSelectedScale,
+    double? orbitDepth,
+    int? orbitVisibleItems,
+    double? orbitCardArtSize,
+    double? orbitCardWidthRatio,
+    double? orbitArtResolutionMultiplier,
+    bool? orbitShowPath,
+    bool? orbitShowGlow,
+    bool? streaksEnabled,
+    bool? showMoreFromArtist,
+    bool? showMoreArtists,
+    bool? detailHeaderArtExpanded,
+    bool? detailHeaderCenteredTitle,
+    String? songTileThumbnailMode,
+    bool? extendedVolumeEnabled,
+    String? replayGainMode,
+    String? lyricsTextAlign,
+    bool? karaokeEnabled,
+    double? replayGainPreampDb,
+    bool? replayGainPreventClipping,
+  }) {
+    return AppPreferences(
+      animationsEnabled: animationsEnabled ?? this.animationsEnabled,
+      hapticsEnabled: hapticsEnabled ?? this.hapticsEnabled,
+      connectionNoticesEnabled:
+          connectionNoticesEnabled ?? this.connectionNoticesEnabled,
+      showSmartMixes: showSmartMixes ?? this.showSmartMixes,
+      showRecentArtists: showRecentArtists ?? this.showRecentArtists,
+      showRecentTracks: showRecentTracks ?? this.showRecentTracks,
+      showPlaylistPreviews: showPlaylistPreviews ?? this.showPlaylistPreviews,
+      showBrowseMore: showBrowseMore ?? this.showBrowseMore,
+      showQuickAccess: showQuickAccess ?? this.showQuickAccess,
+      showEngineSelector: showEngineSelector ?? this.showEngineSelector,
+      showUsbVolumeOnMenu: showUsbVolumeOnMenu ?? this.showUsbVolumeOnMenu,
+      showUsbVolumeOnSettings:
+          showUsbVolumeOnSettings ?? this.showUsbVolumeOnSettings,
+      crossfadeEnabled: crossfadeEnabled ?? this.crossfadeEnabled,
+      automixStemClipsEnabled: automixStemClipsEnabled ?? this.automixStemClipsEnabled,
+      crossfadeDurationSecs:
+          crossfadeDurationSecs ?? this.crossfadeDurationSecs,
+      crossfadeCurveIndex: crossfadeCurveIndex ?? this.crossfadeCurveIndex,
+      crossfeedLevel: crossfeedLevel ?? this.crossfeedLevel,
+      swipeActionsEnabled: swipeActionsEnabled ?? this.swipeActionsEnabled,
+      swipeQueueDirectionsReversed: swipeQueueDirectionsReversed ?? this.swipeQueueDirectionsReversed,
+      favoriteRemovalMode: favoriteRemovalMode ?? this.favoriteRemovalMode,
+      fastIndexEnabled: fastIndexEnabled ?? this.fastIndexEnabled,
+      fastIndexTimeoutSeconds:
+          fastIndexTimeoutSeconds ?? this.fastIndexTimeoutSeconds,
+      immersiveAutoFullViewSeconds:
+          immersiveAutoFullViewSeconds ?? this.immersiveAutoFullViewSeconds,
+      visualizerAnimationStyle:
+          visualizerAnimationStyle ?? this.visualizerAnimationStyle,
+      visualizerFrequencyMode:
+          visualizerFrequencyMode ?? this.visualizerFrequencyMode,
+      visualizerMovementMode:
+          visualizerMovementMode ?? this.visualizerMovementMode,
+      visualizerColorMode: visualizerColorMode ?? this.visualizerColorMode,
+      artworkCardArtworkScale:
+          artworkCardArtworkScale ?? this.artworkCardArtworkScale,
+      artworkCardTextScale: artworkCardTextScale ?? this.artworkCardTextScale,
+      artworkCardVerticalOffset:
+          artworkCardVerticalOffset ?? this.artworkCardVerticalOffset,
+      artworkCardArtworkOffset:
+          artworkCardArtworkOffset ?? this.artworkCardArtworkOffset,
+      artworkCardShowTitle: artworkCardShowTitle ?? this.artworkCardShowTitle,
+      artworkCardShowArtist:
+          artworkCardShowArtist ?? this.artworkCardShowArtist,
+      artworkCardShowAlbum: artworkCardShowAlbum ?? this.artworkCardShowAlbum,
+      artworkCardShowFileInfo:
+          artworkCardShowFileInfo ?? this.artworkCardShowFileInfo,
+      artworkCardShowFrame: artworkCardShowFrame ?? this.artworkCardShowFrame,
+      immersiveTextScale: immersiveTextScale ?? this.immersiveTextScale,
+      immersiveVerticalOffset:
+          immersiveVerticalOffset ?? this.immersiveVerticalOffset,
+      immersiveFullViewScale:
+          immersiveFullViewScale ?? this.immersiveFullViewScale,
+      immersiveShowTitle: immersiveShowTitle ?? this.immersiveShowTitle,
+      immersiveShowArtist: immersiveShowArtist ?? this.immersiveShowArtist,
+      immersiveShowFileInfo:
+          immersiveShowFileInfo ?? this.immersiveShowFileInfo,
+      widgetBgOpacity: widgetBgOpacity ?? this.widgetBgOpacity,
+      widgetShowAlbumArt: widgetShowAlbumArt ?? this.widgetShowAlbumArt,
+      widgetShowArtist: widgetShowArtist ?? this.widgetShowArtist,
+      widgetAccentColor: widgetAccentColor ?? this.widgetAccentColor,
+      widgetFlagshipTheme: widgetFlagshipTheme ?? this.widgetFlagshipTheme,
+      widgetFlagshipAccent: widgetFlagshipAccent ?? this.widgetFlagshipAccent,
+      widgetFlagshipShowArtist:
+          widgetFlagshipShowArtist ?? this.widgetFlagshipShowArtist,
+      widgetCompactBgOpacity:
+          widgetCompactBgOpacity ?? this.widgetCompactBgOpacity,
+      widgetCompactShowAlbumArt:
+          widgetCompactShowAlbumArt ?? this.widgetCompactShowAlbumArt,
+      widgetCompactShowArtist:
+          widgetCompactShowArtist ?? this.widgetCompactShowArtist,
+      widgetCompactAccent: widgetCompactAccent ?? this.widgetCompactAccent,
+      widgetTextScale: widgetTextScale ?? this.widgetTextScale,
+      widgetFlagshipTextScale:
+          widgetFlagshipTextScale ?? this.widgetFlagshipTextScale,
+      widgetCompactTextScale:
+          widgetCompactTextScale ?? this.widgetCompactTextScale,
+      lyricsMatchAudioFilename:
+          lyricsMatchAudioFilename ?? this.lyricsMatchAudioFilename,
+      lyricsAutoFetch: lyricsAutoFetch ?? this.lyricsAutoFetch,
+      leftActionButton: leftActionButton ?? this.leftActionButton,
+      rightActionButton: rightActionButton ?? this.rightActionButton,
+      leftTopActionButton: leftTopActionButton ?? this.leftTopActionButton,
+      rightTopActionButton: rightTopActionButton ?? this.rightTopActionButton,
+      welcomeCardDismissed: welcomeCardDismissed ?? this.welcomeCardDismissed,
+      glanceCardHidden: glanceCardHidden ?? this.glanceCardHidden,
+      glanceCardMinimized: glanceCardMinimized ?? this.glanceCardMinimized,
+      replaceAlbumWithBitPerfectCapsule:
+          replaceAlbumWithBitPerfectCapsule ??
+          this.replaceAlbumWithBitPerfectCapsule,
+      albumsStretchArtwork: albumsStretchArtwork ?? this.albumsStretchArtwork,
+      animatedAlbumArt: animatedAlbumArt ?? this.animatedAlbumArt,
+      folderGridPageSize: folderGridPageSize ?? this.folderGridPageSize,
+      lastSeenChangelogVersion:
+          lastSeenChangelogVersion ?? this.lastSeenChangelogVersion,
+      bottomBarAutoCollapseEnabled:
+          bottomBarAutoCollapseEnabled ?? this.bottomBarAutoCollapseEnabled,
+      bottomBarAutoCollapseSeconds:
+          bottomBarAutoCollapseSeconds ?? this.bottomBarAutoCollapseSeconds,
+      miniPlayerSwipeAction:
+          miniPlayerSwipeAction ?? this.miniPlayerSwipeAction,
+      separateMiniPlayerFromNavBar:
+          separateMiniPlayerFromNavBar ?? this.separateMiniPlayerFromNavBar,
+      keepPlayingOnQuit: keepPlayingOnQuit ?? this.keepPlayingOnQuit,
+      priorityAnchorEnabled:
+          priorityAnchorEnabled ?? this.priorityAnchorEnabled,
+      motionArtDuringBitPerfect:
+          motionArtDuringBitPerfect ?? this.motionArtDuringBitPerfect,
+      pauseOnBluetoothDisconnect:
+          pauseOnBluetoothDisconnect ?? this.pauseOnBluetoothDisconnect,
+      resumeOnBluetoothReconnect:
+          resumeOnBluetoothReconnect ?? this.resumeOnBluetoothReconnect,
+      pauseOnUsbDacDisconnect:
+          pauseOnUsbDacDisconnect ?? this.pauseOnUsbDacDisconnect,
+      pauseOnBluetoothConnect:
+          pauseOnBluetoothConnect ?? this.pauseOnBluetoothConnect,
+      pauseOnUsbDacConnect: pauseOnUsbDacConnect ?? this.pauseOnUsbDacConnect,
+      preferredBluetoothDevice:
+          preferredBluetoothDevice ?? this.preferredBluetoothDevice,
+      btPreferredCodec: btPreferredCodec ?? this.btPreferredCodec,
+      btLdacBitrate: btLdacBitrate ?? this.btLdacBitrate,
+      btAbsoluteVolumeSync: btAbsoluteVolumeSync ?? this.btAbsoluteVolumeSync,
+      btEnableCodecControl: btEnableCodecControl ?? this.btEnableCodecControl,
+      btSampleRate: btSampleRate ?? this.btSampleRate,
+      btLdacBitsPerSample: btLdacBitsPerSample ?? this.btLdacBitsPerSample,
+      floatingPlayerEnabled:
+          floatingPlayerEnabled ?? this.floatingPlayerEnabled,
+      floatingIslandEnabled:
+          floatingIslandEnabled ?? this.floatingIslandEnabled,
+      autoFocusSearch: autoFocusSearch ?? this.autoFocusSearch,
+      searchPlaybackMode: searchPlaybackMode ?? this.searchPlaybackMode,
+      refreshRateMode: refreshRateMode ?? this.refreshRateMode,
+      visualizerEnabled: visualizerEnabled ?? this.visualizerEnabled,
+      orbitRadiusRatio: orbitRadiusRatio ?? this.orbitRadiusRatio,
+      orbitCenterOffsetRatio:
+          orbitCenterOffsetRatio ?? this.orbitCenterOffsetRatio,
+      orbitCenterYRatio: orbitCenterYRatio ?? this.orbitCenterYRatio,
+      orbitItemSpacing: orbitItemSpacing ?? this.orbitItemSpacing,
+      orbitSelectedScale: orbitSelectedScale ?? this.orbitSelectedScale,
+      orbitDepth: orbitDepth ?? this.orbitDepth,
+      orbitVisibleItems: orbitVisibleItems ?? this.orbitVisibleItems,
+      orbitCardArtSize: orbitCardArtSize ?? this.orbitCardArtSize,
+      orbitCardWidthRatio: orbitCardWidthRatio ?? this.orbitCardWidthRatio,
+      orbitArtResolutionMultiplier:
+          orbitArtResolutionMultiplier ?? this.orbitArtResolutionMultiplier,
+      orbitShowPath: orbitShowPath ?? this.orbitShowPath,
+      orbitShowGlow: orbitShowGlow ?? this.orbitShowGlow,
+      streaksEnabled: streaksEnabled ?? this.streaksEnabled,
+      showMoreFromArtist: showMoreFromArtist ?? this.showMoreFromArtist,
+      showMoreArtists: showMoreArtists ?? this.showMoreArtists,
+      detailHeaderArtExpanded:
+          detailHeaderArtExpanded ?? this.detailHeaderArtExpanded,
+      detailHeaderCenteredTitle:
+          detailHeaderCenteredTitle ?? this.detailHeaderCenteredTitle,
+      songTileThumbnailMode:
+          songTileThumbnailMode ?? this.songTileThumbnailMode,
+      extendedVolumeEnabled:
+          extendedVolumeEnabled ?? this.extendedVolumeEnabled,
+      replayGainMode: replayGainMode ?? this.replayGainMode,
+      lyricsTextAlign: lyricsTextAlign ?? this.lyricsTextAlign,
+      karaokeEnabled: karaokeEnabled ?? this.karaokeEnabled,
+      replayGainPreampDb: replayGainPreampDb ?? this.replayGainPreampDb,
+      replayGainPreventClipping:
+          replayGainPreventClipping ?? this.replayGainPreventClipping,
+    );
+  }
+}
+
+class AppPreferencesService {
+  static const _animationsKey = 'app_animations_enabled';
+  static const _hapticsKey = 'app_haptics_enabled';
+  static const _connectionNoticesKey = 'app_connection_notices_enabled';
+  static const _showSmartMixesKey = 'menu_show_smart_mixes';
+  static const _showRecentArtistsKey = 'menu_show_recent_artists';
+  static const _showRecentTracksKey = 'menu_show_recent_tracks';
+  static const _showPlaylistPreviewsKey = 'menu_show_playlist_previews';
+  static const _showBrowseMoreKey = 'menu_show_browse_more';
+  static const _showQuickAccessKey = 'menu_show_quick_access';
+  static const _showEngineSelectorKey = 'menu_show_engine_selector';
+  static const _showUsbVolumeOnMenuKey = 'menu_show_usb_volume';
+  static const _showUsbVolumeOnSettingsKey = 'settings_show_usb_volume';
+  static const _crossfadeEnabledKey = 'audio_crossfade_enabled';
+  static const automixStemClipsKey = 'audio_automix_stem_clips_enabled';
+  static const _crossfadeDurationKey = 'audio_crossfade_duration_secs';
+  static const _crossfadeCurveKey = 'audio_crossfade_curve_index';
+  static const _crossfeedLevelKey = 'audio_crossfeed_level';
+  static const _swipeActionsEnabledKey = 'swipe_actions_enabled';
+  static const _swipeQueueDirectionsReversedKey = 'swipe_queue_directions_reversed';
+  static const _favoriteRemovalModeKey = 'favorite_removal_mode';
+  static const _fastIndexEnabledKey = 'fast_index_enabled';
+  static const _fastIndexTimeoutKey = 'fast_index_timeout_seconds';
+  static const _immersiveAutoFullViewKey = 'immersive_auto_full_view_seconds';
+  static const _visualizerAnimationStyleKey = 'visualizer_animation_style';
+  static const _visualizerFrequencyModeKey = 'visualizer_frequency_mode';
+  static const _visualizerMovementModeKey = 'visualizer_movement_mode';
+  static const _visualizerColorModeKey = 'visualizer_color_mode';
+  static const _artworkCardArtworkScaleKey = 'artwork_card_artwork_scale';
+  static const _artworkCardTextScaleKey = 'artwork_card_text_scale';
+  static const _artworkCardVerticalOffsetKey = 'artwork_card_vertical_offset';
+  static const _artworkCardArtworkOffsetKey = 'artwork_card_artwork_offset';
+  static const _artworkCardShowTitleKey = 'artwork_card_show_title';
+  static const _artworkCardShowArtistKey = 'artwork_card_show_artist';
+  static const _artworkCardShowAlbumKey = 'artwork_card_show_album';
+  static const _artworkCardShowFileInfoKey = 'artwork_card_show_file_info';
+  static const _artworkCardShowFrameKey = 'artwork_card_show_frame';
+  static const _immersiveTextScaleKey = 'immersive_text_scale';
+  static const _immersiveVerticalOffsetKey = 'immersive_vertical_offset';
+  static const _immersiveFullViewScaleKey = 'immersive_full_view_scale';
+  static const _immersiveShowTitleKey = 'immersive_show_title';
+  static const _immersiveShowArtistKey = 'immersive_show_artist';
+  static const _immersiveShowFileInfoKey = 'immersive_show_file_info';
+  static const _widgetBgOpacityKey = 'widget_bg_opacity';
+  static const _widgetShowAlbumArtKey = 'widget_show_album_art';
+  static const _widgetShowArtistKey = 'widget_show_artist';
+  static const _widgetAccentColorKey = 'widget_accent_color';
+  static const _widgetFlagshipThemeKey = 'widget_flagship_theme';
+  static const _widgetFlagshipAccentKey = 'widget_flagship_accent';
+  static const _widgetFlagshipShowArtistKey = 'widget_flagship_show_artist';
+  static const _widgetCompactBgOpacityKey = 'widget_compact_bg_opacity';
+  static const _widgetCompactShowAlbumArtKey = 'widget_compact_show_album_art';
+  static const _widgetCompactShowArtistKey = 'widget_compact_show_artist';
+  static const _widgetCompactAccentKey = 'widget_compact_accent';
+  static const _widgetTextScaleKey = 'widget_text_scale';
+  static const _widgetFlagshipTextScaleKey = 'widget_flagship_text_scale';
+  static const _widgetCompactTextScaleKey = 'widget_compact_text_scale';
+  static const _lyricsMatchAudioFilenameKey = 'lyrics_match_audio_filename';
+  static const _lyricsAutoFetchKey = 'lyrics_auto_fetch';
+  static const _leftActionButtonKey = 'left_action_button';
+  static const _rightActionButtonKey = 'right_action_button';
+  static const _leftTopActionButtonKey = 'left_top_action_button';
+  static const _rightTopActionButtonKey = 'right_top_action_button';
+  static const _welcomeCardDismissedKey = 'welcome_card_dismissed';
+  static const _glanceCardHiddenKey = 'glance_card_hidden';
+  static const _glanceCardMinimizedKey = 'glance_card_minimized';
+  static const _replaceAlbumWithBitPerfectCapsuleKey =
+      'replace_album_with_bit_perfect_capsule';
+  static const _albumsStretchArtworkKey = 'albums_stretch_artwork';
+  static const _animatedAlbumArtKey = 'album_animated_art';
+  static const _folderGridPageSizeKey = 'folder_grid_page_size';
+  static const _lastSeenChangelogVersionKey = 'last_seen_changelog_version';
+
+  /// UI language. A locale tag such as 'zh_CN', or 'system' to follow the device.
+  static const _appLocaleKey = 'app_locale';
+  static const _bottomBarAutoCollapseEnabledKey =
+      'bottom_bar_auto_collapse_enabled';
+  static const _bottomBarAutoCollapseSecondsKey =
+      'bottom_bar_auto_collapse_seconds';
+  static const _miniPlayerSwipeActionKey = 'mini_player_swipe_action';
+  static const _separateMiniPlayerFromNavBarKey =
+      'separate_mini_player_from_nav_bar';
+  static const _keepPlayingOnQuitKey = 'app_keep_playing_on_quit';
+  static const _priorityAnchorEnabledKey = 'app_priority_anchor_enabled';
+  static const _motionArtDuringBitPerfectKey =
+      'app_motion_art_during_bit_perfect';
+  static const _pauseOnBluetoothDisconnectKey =
+      'app_pause_on_bluetooth_disconnect';
+  static const _resumeOnBluetoothReconnectKey =
+      'app_resume_on_bluetooth_reconnect';
+  static const _pauseOnUsbDacDisconnectKey = 'app_pause_on_usb_dac_disconnect';
+  static const _pauseOnBluetoothConnectKey = 'app_pause_on_bluetooth_connect';
+  static const _pauseOnUsbDacConnectKey = 'app_pause_on_usb_dac_connect';
+  static const _preferredBluetoothDeviceKey = 'app_preferred_bluetooth_device';
+  static const _btPreferredCodecKey = 'app_bt_preferred_codec';
+  static const _btLdacBitrateKey = 'app_bt_ldac_bitrate';
+  static const _btAbsoluteVolumeSyncKey = 'app_bt_absolute_volume_sync';
+  static const _btEnableCodecControlKey = 'app_bt_enable_codec_control';
+  static const _btSampleRateKey = 'app_bt_sample_rate';
+  static const _btLdacBitsPerSampleKey = 'app_bt_ldac_bits_per_sample';
+  static const _floatingPlayerEnabledKey = 'app_floating_player_enabled';
+  static const _floatingIslandEnabledKey = 'app_floating_island_enabled';
+  static const _autoFocusSearchKey = 'app_auto_focus_search';
+  static const _searchPlaybackModeKey = 'app_search_playback_mode';
+  static const _refreshRateModeKey = 'app_refresh_rate_mode';
+  static const _visualizerEnabledKey = 'visualizer_enabled';
+  static const _orbitRadiusRatioKey = 'orbit_radius_ratio';
+  static const _orbitCenterOffsetRatioKey = 'orbit_center_offset_ratio';
+  static const _orbitCenterYRatioKey = 'orbit_center_y_ratio';
+  static const _orbitItemSpacingKey = 'orbit_item_spacing';
+  static const _orbitSelectedScaleKey = 'orbit_selected_scale';
+  static const _orbitDepthKey = 'orbit_depth';
+  static const _orbitVisibleItemsKey = 'orbit_visible_items';
+  static const _orbitCardArtSizeKey = 'orbit_card_art_size';
+  static const _orbitCardWidthRatioKey = 'orbit_card_width_ratio';
+  static const _orbitArtResolutionMultiplierKey =
+      'orbit_art_resolution_multiplier';
+  static const _orbitShowPathKey = 'orbit_show_path';
+  static const _orbitShowGlowKey = 'orbit_show_glow';
+  static const _streaksEnabledKey = 'streaks_enabled';
+  static const _showMoreFromArtistKey = 'album_show_more_from_artist';
+  static const _showMoreArtistsKey = 'album_show_more_artists';
+  static const _detailHeaderArtExpandedKey = 'detail_header_art_expanded';
+  static const _detailHeaderCenteredTitleKey = 'detail_header_centered_title';
+  static const _songTileThumbnailModeKey = 'song_tile_thumbnail_mode';
+  static const _extendedVolumeEnabledKey = 'audio_extended_volume_enabled';
+  static const _replayGainModeKey = 'audio_replaygain_mode';
+  static const _lyricsTextAlignKey = 'lyrics_text_align';
+  static const _lyricsKaraokeEnabledKey = 'lyrics_karaoke_enabled';
+  static const _replayGainPreampKey = 'audio_replaygain_preamp_db';
+  static const _replayGainPreventClippingKey =
+      'audio_replaygain_prevent_clipping';
+  static const _shuffleModeKey = 'playback_shuffle_mode';
+  static const _loopModeKey = 'playback_loop_mode';
+  static const _advanceListOrderKey = 'playback_advance_list_order';
+  static const _wrapAroundQueueKey = 'playback_wrap_around_queue';
+  static const _autoplayOnQueueEndKey = 'playback_autoplay_on_queue_end';
+
+  Future<AppPreferences> getPreferences() async {
+    final prefs = await SharedPreferences.getInstance();
+    return AppPreferences(
+      animationsEnabled: prefs.getBool(_animationsKey) ?? true,
+      hapticsEnabled: prefs.getBool(_hapticsKey) ?? true,
+      connectionNoticesEnabled: prefs.getBool(_connectionNoticesKey) ?? true,
+      showSmartMixes: prefs.getBool(_showSmartMixesKey) ?? true,
+      showRecentArtists: prefs.getBool(_showRecentArtistsKey) ?? true,
+      showRecentTracks: prefs.getBool(_showRecentTracksKey) ?? true,
+      showPlaylistPreviews: prefs.getBool(_showPlaylistPreviewsKey) ?? true,
+      showBrowseMore: prefs.getBool(_showBrowseMoreKey) ?? true,
+      showQuickAccess: prefs.getBool(_showQuickAccessKey) ?? true,
+      showEngineSelector: prefs.getBool(_showEngineSelectorKey) ?? true,
+      showUsbVolumeOnMenu: prefs.getBool(_showUsbVolumeOnMenuKey) ?? true,
+      showUsbVolumeOnSettings:
+          prefs.getBool(_showUsbVolumeOnSettingsKey) ?? false,
+      crossfadeEnabled: prefs.getBool(_crossfadeEnabledKey) ?? false,
+      automixStemClipsEnabled: prefs.getBool(automixStemClipsKey) ?? false,
+      crossfadeDurationSecs: prefs.getDouble(_crossfadeDurationKey) ?? 3.0,
+      crossfadeCurveIndex: prefs.getInt(_crossfadeCurveKey) ?? 0,
+      crossfeedLevel: prefs.getInt(_crossfeedLevelKey) ?? 0,
+      swipeActionsEnabled: prefs.getBool(_swipeActionsEnabledKey) ?? true,
+      swipeQueueDirectionsReversed: prefs.getBool(_swipeQueueDirectionsReversedKey) ?? false,
+      favoriteRemovalMode: prefs.getString(_favoriteRemovalModeKey) ?? 'swipe',
+      fastIndexEnabled: prefs.getBool(_fastIndexEnabledKey) ?? true,
+      fastIndexTimeoutSeconds: prefs.getInt(_fastIndexTimeoutKey) ?? 3,
+      immersiveAutoFullViewSeconds:
+          prefs.getInt(_immersiveAutoFullViewKey) ?? 0,
+      visualizerAnimationStyle:
+          prefs.getString(_visualizerAnimationStyleKey) ?? 'bars',
+      visualizerFrequencyMode:
+          prefs.getString(_visualizerFrequencyModeKey) ?? 'full',
+      visualizerMovementMode:
+          prefs.getString(_visualizerMovementModeKey) ?? 'bouncy',
+      visualizerColorMode:
+          prefs.getString(_visualizerColorModeKey) ?? 'album_art',
+      artworkCardArtworkScale:
+          prefs.getDouble(_artworkCardArtworkScaleKey) ?? 1.0,
+      artworkCardTextScale: prefs.getDouble(_artworkCardTextScaleKey) ?? 1.0,
+      artworkCardVerticalOffset:
+          prefs.getDouble(_artworkCardVerticalOffsetKey) ?? 0.0,
+      artworkCardArtworkOffset:
+          prefs.getDouble(_artworkCardArtworkOffsetKey) ?? 0.0,
+      artworkCardShowTitle: prefs.getBool(_artworkCardShowTitleKey) ?? true,
+      artworkCardShowArtist: prefs.getBool(_artworkCardShowArtistKey) ?? true,
+      artworkCardShowAlbum: prefs.getBool(_artworkCardShowAlbumKey) ?? true,
+      artworkCardShowFileInfo:
+          prefs.getBool(_artworkCardShowFileInfoKey) ?? true,
+      artworkCardShowFrame: prefs.getBool(_artworkCardShowFrameKey) ?? true,
+      immersiveTextScale: prefs.getDouble(_immersiveTextScaleKey) ?? 1.0,
+      immersiveVerticalOffset:
+          prefs.getDouble(_immersiveVerticalOffsetKey) ?? 0.0,
+      immersiveFullViewScale:
+          prefs.getDouble(_immersiveFullViewScaleKey) ?? 1.0,
+      immersiveShowTitle: prefs.getBool(_immersiveShowTitleKey) ?? true,
+      immersiveShowArtist: prefs.getBool(_immersiveShowArtistKey) ?? true,
+      immersiveShowFileInfo: prefs.getBool(_immersiveShowFileInfoKey) ?? true,
+      widgetBgOpacity: prefs.getInt(_widgetBgOpacityKey) ?? 3,
+      widgetShowAlbumArt: prefs.getBool(_widgetShowAlbumArtKey) ?? true,
+      widgetShowArtist: prefs.getBool(_widgetShowArtistKey) ?? true,
+      widgetAccentColor: prefs.getString(_widgetAccentColorKey) ?? 'theme',
+      widgetFlagshipTheme:
+          prefs.getString(_widgetFlagshipThemeKey) ?? 'art_dominant',
+      widgetFlagshipAccent:
+          prefs.getString(_widgetFlagshipAccentKey) ?? 'theme',
+      widgetFlagshipShowArtist:
+          prefs.getBool(_widgetFlagshipShowArtistKey) ?? true,
+      widgetCompactBgOpacity: prefs.getInt(_widgetCompactBgOpacityKey) ?? 3,
+      widgetCompactShowAlbumArt:
+          prefs.getBool(_widgetCompactShowAlbumArtKey) ?? true,
+      widgetCompactShowArtist:
+          prefs.getBool(_widgetCompactShowArtistKey) ?? true,
+      widgetCompactAccent: prefs.getString(_widgetCompactAccentKey) ?? 'theme',
+      widgetTextScale: prefs.getDouble(_widgetTextScaleKey) ?? 1.0,
+      widgetFlagshipTextScale:
+          prefs.getDouble(_widgetFlagshipTextScaleKey) ?? 1.0,
+      widgetCompactTextScale:
+          prefs.getDouble(_widgetCompactTextScaleKey) ?? 1.0,
+      lyricsMatchAudioFilename:
+          prefs.getBool(_lyricsMatchAudioFilenameKey) ?? false,
+      lyricsAutoFetch: prefs.getBool(_lyricsAutoFetchKey) ?? true,
+      leftActionButton: prefs.getString(_leftActionButtonKey) ?? 'lyrics',
+      rightActionButton: prefs.getString(_rightActionButtonKey) ?? 'favorites',
+      leftTopActionButton: prefs.getString(_leftTopActionButtonKey) ?? 'none',
+      rightTopActionButton: prefs.getString(_rightTopActionButtonKey) ?? 'none',
+      welcomeCardDismissed: prefs.getBool(_welcomeCardDismissedKey) ?? false,
+      glanceCardHidden: prefs.getBool(_glanceCardHiddenKey) ?? false,
+      glanceCardMinimized: prefs.getBool(_glanceCardMinimizedKey) ?? false,
+      replaceAlbumWithBitPerfectCapsule:
+          prefs.getBool(_replaceAlbumWithBitPerfectCapsuleKey) ?? false,
+      albumsStretchArtwork: prefs.getBool(_albumsStretchArtworkKey) ?? false,
+      animatedAlbumArt: prefs.getBool(_animatedAlbumArtKey) ?? true,
+      folderGridPageSize: prefs.getInt(_folderGridPageSizeKey) ?? 8,
+      lastSeenChangelogVersion: prefs.getString(_lastSeenChangelogVersionKey),
+      bottomBarAutoCollapseEnabled:
+          prefs.getBool(_bottomBarAutoCollapseEnabledKey) ?? false,
+      bottomBarAutoCollapseSeconds:
+          prefs.getInt(_bottomBarAutoCollapseSecondsKey) ?? 5,
+      miniPlayerSwipeAction: 'switchSongs',
+      separateMiniPlayerFromNavBar:
+          prefs.getBool(_separateMiniPlayerFromNavBarKey) ?? false,
+      keepPlayingOnQuit: prefs.getBool(_keepPlayingOnQuitKey) ?? false,
+      priorityAnchorEnabled: prefs.getBool(_priorityAnchorEnabledKey) ?? false,
+      motionArtDuringBitPerfect:
+          prefs.getBool(_motionArtDuringBitPerfectKey) ?? false,
+      pauseOnBluetoothDisconnect:
+          prefs.getBool(_pauseOnBluetoothDisconnectKey) ?? true,
+      resumeOnBluetoothReconnect:
+          prefs.getBool(_resumeOnBluetoothReconnectKey) ?? false,
+      pauseOnUsbDacDisconnect:
+          prefs.getBool(_pauseOnUsbDacDisconnectKey) ?? true,
+      pauseOnBluetoothConnect:
+          prefs.getBool(_pauseOnBluetoothConnectKey) ?? false,
+      pauseOnUsbDacConnect: prefs.getBool(_pauseOnUsbDacConnectKey) ?? false,
+      preferredBluetoothDevice:
+          prefs.getString(_preferredBluetoothDeviceKey) ?? '',
+      btPreferredCodec: prefs.getInt(_btPreferredCodecKey) ?? -1,
+      btLdacBitrate: prefs.getString(_btLdacBitrateKey) ?? 'adaptive',
+      btAbsoluteVolumeSync: prefs.getBool(_btAbsoluteVolumeSyncKey) ?? false,
+      btEnableCodecControl: prefs.getBool(_btEnableCodecControlKey) ?? false,
+      btSampleRate: prefs.getInt(_btSampleRateKey) ?? 0,
+      btLdacBitsPerSample: prefs.getInt(_btLdacBitsPerSampleKey) ?? 0,
+      floatingPlayerEnabled: prefs.getBool(_floatingPlayerEnabledKey) ?? false,
+      floatingIslandEnabled: prefs.getBool(_floatingIslandEnabledKey) ?? false,
+      autoFocusSearch: prefs.getBool(_autoFocusSearchKey) ?? false,
+      searchPlaybackMode: prefs.getString(_searchPlaybackModeKey) ?? 'results',
+      refreshRateMode: await _resolveRefreshRateMode(prefs),
+      visualizerEnabled: prefs.getBool(_visualizerEnabledKey) ?? true,
+      orbitRadiusRatio: prefs.getDouble(_orbitRadiusRatioKey) ?? 1.0,
+      orbitCenterOffsetRatio:
+          prefs.getDouble(_orbitCenterOffsetRatioKey) ?? -0.5,
+      orbitCenterYRatio: prefs.getDouble(_orbitCenterYRatioKey) ?? 0.42,
+      orbitItemSpacing: prefs.getDouble(_orbitItemSpacingKey) ?? 0.28,
+      orbitSelectedScale: prefs.getDouble(_orbitSelectedScaleKey) ?? 1.25,
+      orbitDepth: prefs.getDouble(_orbitDepthKey) ?? 0.75,
+      orbitVisibleItems: prefs.getInt(_orbitVisibleItemsKey) ?? 5,
+      orbitCardArtSize: prefs.getDouble(_orbitCardArtSizeKey) ?? 64.0,
+      orbitCardWidthRatio: prefs.getDouble(_orbitCardWidthRatioKey) ?? 0.68,
+      orbitArtResolutionMultiplier:
+          prefs.getDouble(_orbitArtResolutionMultiplierKey) ?? 2.0,
+      orbitShowPath: prefs.getBool(_orbitShowPathKey) ?? true,
+      orbitShowGlow: prefs.getBool(_orbitShowGlowKey) ?? true,
+      streaksEnabled: prefs.getBool(_streaksEnabledKey) ?? true,
+      showMoreFromArtist: prefs.getBool(_showMoreFromArtistKey) ?? true,
+      showMoreArtists: prefs.getBool(_showMoreArtistsKey) ?? true,
+      detailHeaderArtExpanded:
+          prefs.getBool(_detailHeaderArtExpandedKey) ?? true,
+      detailHeaderCenteredTitle:
+          prefs.getBool(_detailHeaderCenteredTitleKey) ?? false,
+      songTileThumbnailMode:
+          prefs.getString(_songTileThumbnailModeKey) ?? 'artwork',
+      extendedVolumeEnabled: prefs.getBool(_extendedVolumeEnabledKey) ?? false,
+      replayGainMode: prefs.getString(_replayGainModeKey) ?? 'off',
+      lyricsTextAlign: prefs.getString(_lyricsTextAlignKey) ?? 'center',
+      karaokeEnabled: prefs.getBool(_lyricsKaraokeEnabledKey) ?? true,
+      replayGainPreampDb: prefs.getDouble(_replayGainPreampKey) ?? 0.0,
+      replayGainPreventClipping:
+          prefs.getBool(_replayGainPreventClippingKey) ?? true,
+    );
+  }
+
+  Future<bool> getAnimationsEnabled() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_animationsKey) ?? true;
+  }
+
+  Future<void> setAnimationsEnabled(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_animationsKey, value);
+  }
+
+  Future<bool> getHapticsEnabled() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_hapticsKey) ?? true;
+  }
+
+  Future<void> setHapticsEnabled(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_hapticsKey, value);
+  }
+
+  Future<void> setConnectionNoticesEnabled(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_connectionNoticesKey, value);
+  }
+
+  Future<bool> getShowSmartMixes() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_showSmartMixesKey) ?? true;
+  }
+
+  Future<void> setShowSmartMixes(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_showSmartMixesKey, value);
+  }
+
+  Future<bool> getShowRecentArtists() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_showRecentArtistsKey) ?? true;
+  }
+
+  Future<void> setShowRecentArtists(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_showRecentArtistsKey, value);
+  }
+
+  Future<bool> getShowRecentTracks() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_showRecentTracksKey) ?? true;
+  }
+
+  Future<void> setShowRecentTracks(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_showRecentTracksKey, value);
+  }
+
+  Future<bool> getShowPlaylistPreviews() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_showPlaylistPreviewsKey) ?? true;
+  }
+
+  Future<void> setShowPlaylistPreviews(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_showPlaylistPreviewsKey, value);
+  }
+
+  Future<bool> getShowBrowseMore() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_showBrowseMoreKey) ?? true;
+  }
+
+  Future<void> setShowBrowseMore(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_showBrowseMoreKey, value);
+  }
+
+  Future<bool> getShowQuickAccess() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_showQuickAccessKey) ?? true;
+  }
+
+  Future<void> setShowQuickAccess(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_showQuickAccessKey, value);
+  }
+
+  Future<bool> getShowEngineSelector() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_showEngineSelectorKey) ?? true;
+  }
+
+  Future<void> setShowEngineSelector(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_showEngineSelectorKey, value);
+  }
+
+  Future<bool> getShowUsbVolumeOnMenu() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_showUsbVolumeOnMenuKey) ?? true;
+  }
+
+  Future<void> setShowUsbVolumeOnMenu(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_showUsbVolumeOnMenuKey, value);
+  }
+
+  Future<bool> getShowUsbVolumeOnSettings() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_showUsbVolumeOnSettingsKey) ?? false;
+  }
+
+  Future<void> setShowUsbVolumeOnSettings(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_showUsbVolumeOnSettingsKey, value);
+  }
+
+  Future<bool> getCrossfadeEnabled() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_crossfadeEnabledKey) ?? false;
+  }
+
+  Future<void> setCrossfadeEnabled(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_crossfadeEnabledKey, value);
+  }
+
+  Future<void> setAutomixStemClipsEnabled(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(automixStemClipsKey, value);
+  }
+
+  Future<double> getCrossfadeDurationSecs() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getDouble(_crossfadeDurationKey) ?? 3.0;
+  }
+
+  Future<void> setCrossfadeDurationSecs(double value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setDouble(_crossfadeDurationKey, value);
+  }
+
+  Future<int> getCrossfadeCurveIndex() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getInt(_crossfadeCurveKey) ?? 0;
+  }
+
+  Future<void> setCrossfadeCurveIndex(int value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt(_crossfadeCurveKey, value);
+  }
+
+  Future<int> getCrossfeedLevel() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getInt(_crossfeedLevelKey) ?? 0;
+  }
+
+  Future<void> setCrossfeedLevel(int value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt(_crossfeedLevelKey, value.clamp(0, 3));
+  }
+
+  Future<bool> getExtendedVolumeEnabled() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_extendedVolumeEnabledKey) ?? false;
+  }
+
+  Future<void> setExtendedVolumeEnabled(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_extendedVolumeEnabledKey, value);
+  }
+
+  Future<String> getReplayGainMode() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getString(_replayGainModeKey) ?? 'off';
+  }
+
+  Future<void> setReplayGainMode(String value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_replayGainModeKey, value);
+  }
+
+  Future<String> getLyricsTextAlign() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getString(_lyricsTextAlignKey) ?? 'center';
+  }
+
+  Future<void> setLyricsTextAlign(String value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_lyricsTextAlignKey, value);
+  }
+
+  Future<bool> getLyricsKaraokeEnabled() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_lyricsKaraokeEnabledKey) ?? true;
+  }
+
+  Future<void> setLyricsKaraokeEnabled(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_lyricsKaraokeEnabledKey, value);
+  }
+
+  Future<double> getReplayGainPreampDb() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getDouble(_replayGainPreampKey) ?? 0.0;
+  }
+
+  Future<void> setReplayGainPreampDb(double value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setDouble(_replayGainPreampKey, value);
+  }
+
+  Future<bool> getReplayGainPreventClipping() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_replayGainPreventClippingKey) ?? true;
+  }
+
+  Future<void> setReplayGainPreventClipping(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_replayGainPreventClippingKey, value);
+  }
+
+  Future<bool> getSwipeActionsEnabled() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_swipeActionsEnabledKey) ?? true;
+  }
+
+  Future<void> setSwipeActionsEnabled(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_swipeActionsEnabledKey, value);
+  }
+
+  Future<bool> getSwipeQueueDirectionsReversed() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_swipeQueueDirectionsReversedKey) ?? false;
+  }
+
+  Future<void> setSwipeQueueDirectionsReversed(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_swipeQueueDirectionsReversedKey, value);
+  }
+
+  Future<String> getFavoriteRemovalMode() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getString(_favoriteRemovalModeKey) ?? 'swipe';
+  }
+
+  Future<void> setFavoriteRemovalMode(String value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_favoriteRemovalModeKey, value);
+  }
+
+  Future<bool> getFastIndexEnabled() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_fastIndexEnabledKey) ?? true;
+  }
+
+  Future<void> setFastIndexEnabled(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_fastIndexEnabledKey, value);
+  }
+
+  Future<int> getFastIndexTimeoutSeconds() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getInt(_fastIndexTimeoutKey) ?? 3;
+  }
+
+  Future<void> setFastIndexTimeoutSeconds(int value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt(_fastIndexTimeoutKey, value);
+  }
+
+  Future<int> getImmersiveAutoFullViewSeconds() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getInt(_immersiveAutoFullViewKey) ?? 0;
+  }
+
+  Future<void> setImmersiveAutoFullViewSeconds(int value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt(_immersiveAutoFullViewKey, value);
+  }
+
+  Future<String> getVisualizerAnimationStyle() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getString(_visualizerAnimationStyleKey) ?? 'bars';
+  }
+
+  Future<void> setVisualizerAnimationStyle(String value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_visualizerAnimationStyleKey, value);
+  }
+
+  Future<String> getVisualizerFrequencyMode() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getString(_visualizerFrequencyModeKey) ?? 'full';
+  }
+
+  Future<void> setVisualizerFrequencyMode(String value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_visualizerFrequencyModeKey, value);
+  }
+
+  Future<String> getVisualizerMovementMode() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getString(_visualizerMovementModeKey) ?? 'bouncy';
+  }
+
+  Future<void> setVisualizerMovementMode(String value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_visualizerMovementModeKey, value);
+  }
+
+  Future<String> getVisualizerColorMode() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getString(_visualizerColorModeKey) ?? 'album_art';
+  }
+
+  Future<void> setVisualizerColorMode(String value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_visualizerColorModeKey, value);
+  }
+
+  Future<void> setArtworkCardArtworkScale(double value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setDouble(_artworkCardArtworkScaleKey, value);
+  }
+
+  Future<void> setArtworkCardTextScale(double value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setDouble(_artworkCardTextScaleKey, value);
+  }
+
+  Future<void> setArtworkCardVerticalOffset(double value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setDouble(_artworkCardVerticalOffsetKey, value);
+  }
+
+  Future<void> setArtworkCardArtworkOffset(double value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setDouble(_artworkCardArtworkOffsetKey, value);
+  }
+
+  Future<bool> getArtworkCardShowTitle() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_artworkCardShowTitleKey) ?? true;
+  }
+
+  Future<void> setArtworkCardShowTitle(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_artworkCardShowTitleKey, value);
+  }
+
+  Future<bool> getArtworkCardShowArtist() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_artworkCardShowArtistKey) ?? true;
+  }
+
+  Future<void> setArtworkCardShowArtist(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_artworkCardShowArtistKey, value);
+  }
+
+  Future<bool> getArtworkCardShowAlbum() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_artworkCardShowAlbumKey) ?? true;
+  }
+
+  Future<void> setArtworkCardShowAlbum(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_artworkCardShowAlbumKey, value);
+  }
+
+  Future<bool> getArtworkCardShowFileInfo() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_artworkCardShowFileInfoKey) ?? true;
+  }
+
+  Future<void> setArtworkCardShowFileInfo(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_artworkCardShowFileInfoKey, value);
+  }
+
+  Future<bool> getArtworkCardShowFrame() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_artworkCardShowFrameKey) ?? true;
+  }
+
+  Future<void> setArtworkCardShowFrame(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_artworkCardShowFrameKey, value);
+  }
+
+  Future<void> setImmersiveTextScale(double value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setDouble(_immersiveTextScaleKey, value);
+  }
+
+  Future<void> setImmersiveVerticalOffset(double value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setDouble(_immersiveVerticalOffsetKey, value);
+  }
+
+  Future<void> setImmersiveFullViewScale(double value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setDouble(_immersiveFullViewScaleKey, value);
+  }
+
+  Future<bool> getImmersiveShowTitle() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_immersiveShowTitleKey) ?? true;
+  }
+
+  Future<void> setImmersiveShowTitle(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_immersiveShowTitleKey, value);
+  }
+
+  Future<bool> getImmersiveShowArtist() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_immersiveShowArtistKey) ?? true;
+  }
+
+  Future<void> setImmersiveShowArtist(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_immersiveShowArtistKey, value);
+  }
+
+  Future<bool> getImmersiveShowFileInfo() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_immersiveShowFileInfoKey) ?? true;
+  }
+
+  Future<void> setImmersiveShowFileInfo(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_immersiveShowFileInfoKey, value);
+  }
+
+  Future<void> setWidgetBgOpacity(int value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt(_widgetBgOpacityKey, value);
+  }
+
+  Future<void> setWidgetShowAlbumArt(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_widgetShowAlbumArtKey, value);
+  }
+
+  Future<void> setWidgetShowArtist(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_widgetShowArtistKey, value);
+  }
+
+  Future<void> setWidgetAccentColor(String value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_widgetAccentColorKey, value);
+  }
+
+  Future<String> getWidgetFlagshipTheme() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getString(_widgetFlagshipThemeKey) ?? 'art_dominant';
+  }
+
+  Future<void> setWidgetFlagshipTheme(String value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_widgetFlagshipThemeKey, value);
+  }
+
+  Future<String> getWidgetFlagshipAccent() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getString(_widgetFlagshipAccentKey) ?? 'theme';
+  }
+
+  Future<void> setWidgetFlagshipAccent(String value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_widgetFlagshipAccentKey, value);
+  }
+
+  Future<bool> getWidgetFlagshipShowArtist() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_widgetFlagshipShowArtistKey) ?? true;
+  }
+
+  Future<void> setWidgetFlagshipShowArtist(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_widgetFlagshipShowArtistKey, value);
+  }
+
+  Future<int> getWidgetCompactBgOpacity() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getInt(_widgetCompactBgOpacityKey) ?? 3;
+  }
+
+  Future<void> setWidgetCompactBgOpacity(int value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt(_widgetCompactBgOpacityKey, value);
+  }
+
+  Future<bool> getWidgetCompactShowAlbumArt() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_widgetCompactShowAlbumArtKey) ?? true;
+  }
+
+  Future<void> setWidgetCompactShowAlbumArt(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_widgetCompactShowAlbumArtKey, value);
+  }
+
+  Future<bool> getWidgetCompactShowArtist() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_widgetCompactShowArtistKey) ?? true;
+  }
+
+  Future<void> setWidgetCompactShowArtist(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_widgetCompactShowArtistKey, value);
+  }
+
+  Future<String> getWidgetCompactAccent() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getString(_widgetCompactAccentKey) ?? 'theme';
+  }
+
+  Future<void> setWidgetCompactAccent(String value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_widgetCompactAccentKey, value);
+  }
+
+  Future<void> setWidgetTextScale(double value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setDouble(_widgetTextScaleKey, value);
+  }
+
+  Future<void> setWidgetFlagshipTextScale(double value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setDouble(_widgetFlagshipTextScaleKey, value);
+  }
+
+  Future<void> setWidgetCompactTextScale(double value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setDouble(_widgetCompactTextScaleKey, value);
+  }
+
+  Future<bool> getLyricsMatchAudioFilename() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_lyricsMatchAudioFilenameKey) ?? false;
+  }
+
+  Future<void> setLyricsMatchAudioFilename(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_lyricsMatchAudioFilenameKey, value);
+  }
+
+  Future<bool> getLyricsAutoFetch() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_lyricsAutoFetchKey) ?? true;
+  }
+
+  Future<void> setLyricsAutoFetch(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_lyricsAutoFetchKey, value);
+  }
+
+  Future<String> getLeftActionButton() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getString(_leftActionButtonKey) ?? 'lyrics';
+  }
+
+  Future<void> setLeftActionButton(String value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_leftActionButtonKey, value);
+  }
+
+  Future<String> getRightActionButton() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getString(_rightActionButtonKey) ?? 'favorites';
+  }
+
+  Future<void> setRightActionButton(String value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_rightActionButtonKey, value);
+  }
+
+  Future<String> getLeftTopActionButton() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getString(_leftTopActionButtonKey) ?? 'none';
+  }
+
+  Future<void> setLeftTopActionButton(String value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_leftTopActionButtonKey, value);
+  }
+
+  Future<String> getRightTopActionButton() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getString(_rightTopActionButtonKey) ?? 'none';
+  }
+
+  Future<void> setRightTopActionButton(String value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_rightTopActionButtonKey, value);
+  }
+
+  Future<bool> getWelcomeCardDismissed() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_welcomeCardDismissedKey) ?? false;
+  }
+
+  Future<void> setWelcomeCardDismissed(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_welcomeCardDismissedKey, value);
+  }
+
+  Future<bool> getGlanceCardHidden() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_glanceCardHiddenKey) ?? false;
+  }
+
+  Future<void> setGlanceCardHidden(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_glanceCardHiddenKey, value);
+  }
+
+  Future<bool> getGlanceCardMinimized() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_glanceCardMinimizedKey) ?? false;
+  }
+
+  Future<void> setGlanceCardMinimized(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_glanceCardMinimizedKey, value);
+  }
+
+  Future<bool> getReplaceAlbumWithBitPerfectCapsule() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_replaceAlbumWithBitPerfectCapsuleKey) ?? false;
+  }
+
+  Future<void> setReplaceAlbumWithBitPerfectCapsule(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_replaceAlbumWithBitPerfectCapsuleKey, value);
+  }
+
+  Future<bool> getAlbumsStretchArtwork() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_albumsStretchArtworkKey) ?? false;
+  }
+
+  Future<void> setAlbumsStretchArtwork(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_albumsStretchArtworkKey, value);
+  }
+
+  Future<bool> getAnimatedAlbumArt() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_animatedAlbumArtKey) ?? true;
+  }
+
+  Future<void> setAnimatedAlbumArt(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_animatedAlbumArtKey, value);
+  }
+
+  Future<int> getFolderGridPageSize() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getInt(_folderGridPageSizeKey) ?? 8;
+  }
+
+  Future<void> setFolderGridPageSize(int value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt(_folderGridPageSizeKey, value);
+  }
+
+  Future<String?> getLastSeenChangelogVersion() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getString(_lastSeenChangelogVersionKey);
+  }
+
+  Future<void> setLastSeenChangelogVersion(String? value) async {
+    final prefs = await SharedPreferences.getInstance();
+    if (value == null) {
+      await prefs.remove(_lastSeenChangelogVersionKey);
+    } else {
+      await prefs.setString(_lastSeenChangelogVersionKey, value);
+    }
+  }
+
+  Future<bool> getBottomBarAutoCollapseEnabled() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_bottomBarAutoCollapseEnabledKey) ?? false;
+  }
+
+  Future<void> setBottomBarAutoCollapseEnabled(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_bottomBarAutoCollapseEnabledKey, value);
+  }
+
+  Future<int> getBottomBarAutoCollapseSeconds() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getInt(_bottomBarAutoCollapseSecondsKey) ?? 5;
+  }
+
+  Future<void> setBottomBarAutoCollapseSeconds(int value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt(_bottomBarAutoCollapseSecondsKey, value);
+  }
+
+  Future<String> getMiniPlayerSwipeAction() async => 'switchSongs';
+
+  Future<void> setMiniPlayerSwipeAction(String value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_miniPlayerSwipeActionKey, value);
+  }
+
+  Future<bool> getSeparateMiniPlayerFromNavBar() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_separateMiniPlayerFromNavBarKey) ?? false;
+  }
+
+  Future<void> setSeparateMiniPlayerFromNavBar(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_separateMiniPlayerFromNavBarKey, value);
+  }
+
+  Future<int> getShuffleMode() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getInt(_shuffleModeKey) ?? 0;
+  }
+
+  Future<void> setShuffleMode(int value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt(_shuffleModeKey, value);
+  }
+
+  Future<int> getLoopMode() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getInt(_loopModeKey) ?? 2;
+  }
+
+  Future<void> setLoopMode(int value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt(_loopModeKey, value);
+  }
+
+  Future<int> getAdvanceListOrder() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getInt(_advanceListOrderKey) ?? 0;
+  }
+
+  Future<void> setAdvanceListOrder(int value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt(_advanceListOrderKey, value);
+  }
+
+  Future<bool> getWrapAroundQueue() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_wrapAroundQueueKey) ?? true;
+  }
+
+  Future<void> setWrapAroundQueue(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_wrapAroundQueueKey, value);
+  }
+
+  Future<bool> getAutoplayOnQueueEnd() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_autoplayOnQueueEndKey) ?? true;
+  }
+
+  Future<void> setAutoplayOnQueueEnd(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_autoplayOnQueueEndKey, value);
+  }
+
+  Future<bool> getKeepPlayingOnQuit() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_keepPlayingOnQuitKey) ?? false;
+  }
+
+  Future<void> setKeepPlayingOnQuit(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_keepPlayingOnQuitKey, value);
+  }
+
+  Future<bool> getPriorityAnchorEnabled() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_priorityAnchorEnabledKey) ?? false;
+  }
+
+  Future<void> setPriorityAnchorEnabled(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_priorityAnchorEnabledKey, value);
+  }
+
+  Future<bool> getMotionArtDuringBitPerfect() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_motionArtDuringBitPerfectKey) ?? false;
+  }
+
+  Future<void> setMotionArtDuringBitPerfect(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_motionArtDuringBitPerfectKey, value);
+  }
+
+  Future<bool> getPauseOnBluetoothDisconnect() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_pauseOnBluetoothDisconnectKey) ?? true;
+  }
+
+  Future<void> setPauseOnBluetoothDisconnect(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_pauseOnBluetoothDisconnectKey, value);
+  }
+
+  Future<bool> getPauseOnUsbDacDisconnect() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_pauseOnUsbDacDisconnectKey) ?? true;
+  }
+
+  Future<void> setPauseOnUsbDacDisconnect(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_pauseOnUsbDacDisconnectKey, value);
+  }
+
+  Future<bool> getPauseOnBluetoothConnect() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_pauseOnBluetoothConnectKey) ?? false;
+  }
+
+  Future<void> setPauseOnBluetoothConnect(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_pauseOnBluetoothConnectKey, value);
+  }
+
+  Future<bool> getPauseOnUsbDacConnect() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_pauseOnUsbDacConnectKey) ?? false;
+  }
+
+  Future<void> setPauseOnUsbDacConnect(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_pauseOnUsbDacConnectKey, value);
+  }
+
+  Future<bool> getResumeOnBluetoothReconnect() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_resumeOnBluetoothReconnectKey) ?? false;
+  }
+
+  Future<void> setResumeOnBluetoothReconnect(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_resumeOnBluetoothReconnectKey, value);
+  }
+
+  Future<String> getPreferredBluetoothDevice() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getString(_preferredBluetoothDeviceKey) ?? '';
+  }
+
+  Future<void> setPreferredBluetoothDevice(String value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_preferredBluetoothDeviceKey, value);
+  }
+
+  Future<int> getBtPreferredCodec() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getInt(_btPreferredCodecKey) ?? -1;
+  }
+
+  Future<void> setBtPreferredCodec(int value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt(_btPreferredCodecKey, value);
+  }
+
+  Future<String> getBtLdacBitrate() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getString(_btLdacBitrateKey) ?? 'adaptive';
+  }
+
+  Future<void> setBtLdacBitrate(String value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_btLdacBitrateKey, value);
+  }
+
+  Future<bool> getBtAbsoluteVolumeSync() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_btAbsoluteVolumeSyncKey) ?? false;
+  }
+
+  Future<void> setBtAbsoluteVolumeSync(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_btAbsoluteVolumeSyncKey, value);
+  }
+
+  Future<bool> getBtEnableCodecControl() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_btEnableCodecControlKey) ?? false;
+  }
+
+  Future<void> setBtEnableCodecControl(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_btEnableCodecControlKey, value);
+  }
+
+  Future<int> getBtSampleRate() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getInt(_btSampleRateKey) ?? 0;
+  }
+
+  Future<void> setBtSampleRate(int value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt(_btSampleRateKey, value);
+  }
+
+  Future<int> getBtLdacBitsPerSample() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getInt(_btLdacBitsPerSampleKey) ?? 0;
+  }
+
+  Future<void> setBtLdacBitsPerSample(int value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt(_btLdacBitsPerSampleKey, value);
+  }
+
+  Future<bool> getFloatingPlayerEnabled() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_floatingPlayerEnabledKey) ?? false;
+  }
+
+  Future<void> setFloatingPlayerEnabled(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_floatingPlayerEnabledKey, value);
+  }
+
+  Future<bool> getFloatingIslandEnabled() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_floatingIslandEnabledKey) ?? false;
+  }
+
+  Future<void> setFloatingIslandEnabled(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_floatingIslandEnabledKey, value);
+  }
+
+  Future<bool> getAutoFocusSearch() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_autoFocusSearchKey) ?? false;
+  }
+
+  Future<void> setAutoFocusSearch(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_autoFocusSearchKey, value);
+  }
+
+  Future<String> getSearchPlaybackMode() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getString(_searchPlaybackModeKey) ?? 'results';
+  }
+
+  Future<void> setSearchPlaybackMode(String value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_searchPlaybackModeKey, value);
+  }
+
+  /// Whether the preference store was found empty by
+  /// [captureInstallFreshness] during startup. Distinguishes new
+  /// installations from ones that predate the adaptive refresh-rate default.
+  static bool? _freshInstallAtStartup;
+
+  /// Snapshots whether this is a brand-new installation. Call once from
+  /// `main()` before any other service can write to the preference store.
+  static Future<void> captureInstallFreshness() async {
+    final prefs = await SharedPreferences.getInstance();
+    _freshInstallAtStartup = prefs.getKeys().isEmpty;
+  }
+
+  /// Resolves the refresh-rate mode, choosing the right default for new
+  /// versus existing installations and persisting it on first read.
+  ///
+  /// New installations start on `adaptive` so Flick follows the system
+  /// refresh rate (moss-apps/Flick#210); installations that already have a
+  /// preference store keep the previous `high` default. Persisting the
+  /// result keeps the choice stable across later launches and updates.
+  Future<String> _resolveRefreshRateMode(SharedPreferences prefs) async {
+    final stored = prefs.getString(_refreshRateModeKey);
+    if (stored != null) return stored;
+    final isFreshInstall = _freshInstallAtStartup ?? prefs.getKeys().isEmpty;
+    final resolved = isFreshInstall ? 'adaptive' : 'high';
+    await prefs.setString(_refreshRateModeKey, resolved);
+    return resolved;
+  }
+
+  Future<String> getRefreshRateMode() async {
+    final prefs = await SharedPreferences.getInstance();
+    return _resolveRefreshRateMode(prefs);
+  }
+
+  Future<void> setRefreshRateMode(String value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_refreshRateModeKey, value);
+  }
+
+  /// Returns the persisted UI language tag, or 'system' when unset.
+  Future<String> getAppLocale() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getString(_appLocaleKey) ?? 'system';
+  }
+
+  Future<void> setAppLocale(String value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_appLocaleKey, value);
+  }
+
+  Future<bool> getVisualizerEnabled() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_visualizerEnabledKey) ?? true;
+  }
+
+  Future<void> setVisualizerEnabled(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_visualizerEnabledKey, value);
+  }
+
+  Future<void> setOrbitRadiusRatio(double value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setDouble(_orbitRadiusRatioKey, value);
+  }
+
+  Future<void> setOrbitCenterOffsetRatio(double value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setDouble(_orbitCenterOffsetRatioKey, value);
+  }
+
+  Future<void> setOrbitCenterYRatio(double value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setDouble(_orbitCenterYRatioKey, value);
+  }
+
+  Future<void> setOrbitItemSpacing(double value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setDouble(_orbitItemSpacingKey, value);
+  }
+
+  Future<void> setOrbitSelectedScale(double value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setDouble(_orbitSelectedScaleKey, value);
+  }
+
+  Future<void> setOrbitDepth(double value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setDouble(_orbitDepthKey, value);
+  }
+
+  Future<void> setOrbitVisibleItems(int value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt(_orbitVisibleItemsKey, value);
+  }
+
+  Future<void> setOrbitCardArtSize(double value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setDouble(_orbitCardArtSizeKey, value);
+  }
+
+  Future<void> setOrbitCardWidthRatio(double value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setDouble(_orbitCardWidthRatioKey, value);
+  }
+
+  Future<void> setOrbitArtResolutionMultiplier(double value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setDouble(_orbitArtResolutionMultiplierKey, value);
+  }
+
+  Future<void> setOrbitShowPath(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_orbitShowPathKey, value);
+  }
+
+  Future<void> setOrbitShowGlow(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_orbitShowGlowKey, value);
+  }
+
+  Future<bool> getStreaksEnabled() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_streaksEnabledKey) ?? true;
+  }
+
+  Future<void> setStreaksEnabled(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_streaksEnabledKey, value);
+  }
+
+  Future<bool> getShowMoreFromArtist() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_showMoreFromArtistKey) ?? true;
+  }
+
+  Future<void> setShowMoreFromArtist(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_showMoreFromArtistKey, value);
+  }
+
+  Future<bool> getShowMoreArtists() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_showMoreArtistsKey) ?? true;
+  }
+
+  Future<void> setShowMoreArtists(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_showMoreArtistsKey, value);
+  }
+
+  Future<bool> getDetailHeaderArtExpanded() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_detailHeaderArtExpandedKey) ?? true;
+  }
+
+  Future<void> setDetailHeaderArtExpanded(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_detailHeaderArtExpandedKey, value);
+  }
+
+  Future<bool> getDetailHeaderCenteredTitle() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_detailHeaderCenteredTitleKey) ?? false;
+  }
+
+  Future<void> setDetailHeaderCenteredTitle(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_detailHeaderCenteredTitleKey, value);
+  }
+
+  Future<String> getSongTileThumbnailMode() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getString(_songTileThumbnailModeKey) ?? 'artwork';
+  }
+
+  Future<void> setSongTileThumbnailMode(String value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_songTileThumbnailModeKey, value);
+  }
+
+  Future<void> clearOrbitSettings() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove(_orbitRadiusRatioKey);
+    await prefs.remove(_orbitCenterOffsetRatioKey);
+    await prefs.remove(_orbitCenterYRatioKey);
+    await prefs.remove(_orbitItemSpacingKey);
+    await prefs.remove(_orbitSelectedScaleKey);
+    await prefs.remove(_orbitDepthKey);
+    await prefs.remove(_orbitVisibleItemsKey);
+    await prefs.remove(_orbitCardArtSizeKey);
+    await prefs.remove(_orbitCardWidthRatioKey);
+    await prefs.remove(_orbitArtResolutionMultiplierKey);
+    await prefs.remove(_orbitShowPathKey);
+    await prefs.remove(_orbitShowGlowKey);
+  }
+}

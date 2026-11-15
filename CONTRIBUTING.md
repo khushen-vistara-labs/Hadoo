@@ -1,34 +1,18 @@
-# Contributing
+# Contributing to Hadoo
 
-Hadoo is a local patch/build project for a user-supplied YouTube Music APK.
-Use Python 3.10+ and a Java 21+ JDK. No Node.js, Expo, Gradle project, or Python
-packages are needed for Hadoo's own tooling.
+Use `trunk` as the base and start with the [build guide](docs/build.md). Changes to the Flutter and Rust app live in `mobile/`. Read [mobile/AGENTS.md](mobile/AGENTS.md) for native audio and platform integration constraints.
 
-Run these checks before opening a pull request:
+## Validate changes
 
 ```sh
-./hadoo check
 ./hadoo setup
-./hadoo patches
+./hadoo check
 ```
 
-GitHub Actions runs the offline tests, exports the branding and checks the
-profile against the actual checksum-pinned Morphe bundle. It never builds or
-publishes a proprietary APK and never needs a signing key.
+Analysis reports existing warnings and fails on compiler errors. The default test set covers Hadoo, the shared car catalogue, discovery, YouTube resolution, and downloads. Run the relevant tests and build for each platform you change. State which checks were on a physical device.
 
-Use Conventional Commits for commits and PR titles, for example
-`feat(build): support a reviewed upstream release`. Local commit checks live in
-`.husky/commit-msg`; enable them with `git config core.hooksPath .husky`.
-Complete every section of the PR template. Code owners are in `.github/CODEOWNERS`.
+## Open a pull request
 
-Keep changes to `config/upstream-lock.json` explicit and reviewed. Obtain hashes
-from the official GitHub release asset metadata, check upstream compatibility,
-and exercise setup plus a complete local APK build when a suitable input exists.
-Do not automatically follow latest releases or bypass APK version checks.
+Use a Conventional Commits title and the pull request template. Include the problem, behavior change, checks, and remaining platform limitations. Update the [listener guides](docs/README.md) when labels or setup steps change. Preserve license notices, and record any newly imported revision in `config/mobile-upstream-lock.json`.
 
-Keep originals in `assets/images/` unchanged when changing the resource exporter.
-Review `.hadoo-local/branding/preview.png` after generating new density resources.
-
-Never commit APKs, downloaded tools, signing keys, credentials, exported account
-data, local backups or music. These belong under the ignored `.hadoo-local/`
-directory. See `NOTICE`, `LICENSE`, and `third_party/` for attribution.
+Keep signing keys, packages, SDK downloads, personal account data, logs, and music outside Git. Follow the [release checklist](docs/maintenance.md#release-checklist) when preparing artifacts. For bugs, see [what to include in a report](docs/troubleshooting.md#report-a-problem).

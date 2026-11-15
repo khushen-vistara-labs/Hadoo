@@ -1,0 +1,176 @@
+import 'package:flick/core/theme/lokal_performance_scope.dart';
+import 'package:flutter/material.dart';
+
+import 'package:flick/features/player/widgets/motion_art_widget.dart';
+import 'package:flick/widgets/common/cached_image_widget.dart';
+
+/// Apple Music-style hero art: slow Ken Burns pan/zoom with a soft
+/// pulsing glow derived from the art's dominant color.
+///
+/// When [albumName] and [artistName] are supplied (album detail heroes), real
+/// Apple Music Motion Art is played instead, falling back to the Ken Burns
+/// effect whenever no motion art exists for the album.
+class AnimatedAlbumArt extends StatefulWidget {
+  final String? imagePath;
+  final String? audioSourcePath;
+  final Color? dominantColor;
+  final Widget? placeholder;
+  final Widget? errorWidget;
+
+  /// Album metadata enabling the edition-aware Motion Art lookup.
+  final String? albumName;
+  final String? artistName;
+  final String? representativeSongTitle;
+
+  /// Prefer the portrait motion-art variant (full-bleed backgrounds).
+  final bool preferVertical;
+
+  /// When false, keeps the Ken Burns effect even if album metadata is present.
+  final bool motionEnabled;
+  final bool animate;
+
+  const AnimatedAlbumArt({
+    super.key,
+    this.imagePath,
+    this.audioSourcePath,
+    this.dominantColor,
+    this.placeholder,
+    this.errorWidget,
+    this.albumName,
+    this.artistName,
+    this.representativeSongTitle,
+    this.preferVertical = false,
+    this.motionEnabled = true,
+    this.animate = true,
+  });
+
+  @override
+  State<AnimatedAlbumArt> createState() => _AnimatedAlbumArtState();
+}
+
+class _AnimatedAlbumArtState extends State<AnimatedAlbumArt>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _controller;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = AnimationController(
+      vsync: this,
+      duration: const Duration(seconds: 18),
+    );
+  }
+
+  void _configureMotion() {
+    final animate =
+        widget.animate &&
+        !LokalPerformanceScope.of(context) &&
+        !MediaQuery.disableAnimationsOf(context) &&
+        TickerMode.of(context);
+    if (animate && !_controller.isAnimating) {
+      _controller.repeat(reverse: true);
+    } else if (!animate) {
+      _controller.stop();
+    }
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _configureMotion();
+  }
+
+  @override
+  void didUpdateWidget(AnimatedAlbumArt oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    _configureMotion();
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final image = AnimatedSwitcher(
+      duration: const Duration(milliseconds: 520),
+      switchInCurve: Curves.easeOutCubic,
+      switchOutCurve: Curves.easeInCubic,
+      layoutBuilder: (currentChild, previousChildren) {
+        return Stack(
+          fit: StackFit.expand,
+          children: [
+            ...previousChildren,
+            ...?currentChild == null ? null : [currentChild],
+          ],
+        );
+      },
+      child: KeyedSubtree(
+        key: ValueKey('${widget.imagePath}|${widget.audioSourcePath}'),
+        child: CachedImageWidget(
+          imagePath: widget.imagePath,
+          audioSourcePath: widget.audioSourcePath,
+          fit: BoxFit.cover,
+          placeholder: widget.placeholder,
+          errorWidget: widget.errorWidget,
+        ),
+      ),
+    );
+    final kenBurns = ClipRect(
+      child: AnimatedBuilder(
+        animation: _controller,
+        builder: (context, child) {
+          final t = Curves.easeInOut.transform(_controller.value);
+          final glow = widget.dominantColor;
+          return Stack(
+            fit: StackFit.expand,
+            children: [
+              Transform.scale(scale: 1.0 + 0.12 * t, child: child),
+              if (glow != null)
+                IgnorePointer(
+                  child: DecoratedBox(
+                    decoration: BoxDecoration(
+                      gradient: RadialGradient(
+                        radius: 1.2,
+                        colors: [
+                          glow.withValues(alpha: 0.0),
+                          glow.withValues(alpha: 0.12 + 0.18 * t),
+                        ],
+                        stops: const [0.55, 1.0],
+                      ),
+                    ),
+                  ),
+                ),
+            ],
+          );
+        },
+        child: image,
+      ),
+    );
+
+    if (!widget.animate ||
+        LokalPerformanceScope.of(context) ||
+        MediaQuery.disableAnimationsOf(context))
+      return image;
+
+    final album = widget.albumName?.trim() ?? '';
+    final artist = widget.artistName?.trim() ?? '';
+    if (album.isEmpty || artist.isEmpty || !widget.motionEnabled) {
+      return kenBurns;
+    }
+
+    return MotionArtView(
+      title: album,
+      album: album,
+      artist: artist,
+      albumMode: true,
+      representativeSongTitle: widget.representativeSongTitle,
+      preferVertical: widget.preferVertical,
+      enabled: !MediaQuery.of(context).disableAnimations,
+      loadingFallback: image,
+      fallback: kenBurns,
+    );
+  }
+}

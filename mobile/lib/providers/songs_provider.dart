@@ -1,0 +1,775 @@
+import 'dart:async';
+
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+import '../core/utils/string_sort_utils.dart';
+import '../core/utils/uri_display_utils.dart';
+import '../models/song.dart';
+import '../data/repositories/song_repository.dart';
+import '../features/search/providers/local_device_search.dart';
+
+import 'package:flick/l10n/l10n.dart';
+
+/// Provider for the SongRepository.
+final songRepositoryProvider = Provider<SongRepository>((ref) {
+  return SongRepository();
+});
+
+/// Raw change notifications for the songs collection. Kept separate from
+/// [songRepositoryProvider] so tests can substitute a stream without a
+/// database.
+final songLibraryWatchProvider = Provider<Stream<void>>((ref) {
+  return ref.watch(songRepositoryProvider).watchSongs();
+});
+
+/// Debounced signal that the song library changed. Screens that snapshot
+/// repository data (albums, artists, folder browsers) listen to this to
+/// reload as post-scan metadata/artwork writes land, instead of only on
+/// their next cold open.
+///
+/// Throttled to at most one emission per 500ms plus a trailing one, so a
+/// long artwork backfill keeps refreshing the UI live without rebuilding it
+/// on every single write.
+final libraryChangeRevisionProvider = StreamProvider.autoDispose<int>((ref) {
+  final changes = ref.watch(songLibraryWatchProvider);
+  final controller = StreamController<int>();
+  var revision = 0;
+  Timer? timer;
+  var pending = false;
+
+  void scheduleEmission() {
+    if (timer != null) {
+      pending = true;
+      return;
+    }
+    timer = Timer(const Duration(milliseconds: 500), () {
+      timer = null;
+      if (!controller.isClosed) controller.add(++revision);
+      if (pending) {
+        pending = false;
+        scheduleEmission();
+      }
+    });
+  }
+
+  final subscription = changes.listen((_) {
+    scheduleEmission();
+  });
+
+  ref.onDispose(() {
+    timer?.cancel();
+    subscription.cancel();
+    controller.close();
+  });
+  return controller.stream;
+});
+
+/// Sort options for the song list.
+enum SongSortOption {
+  albumArtist,
+  title,
+  artist,
+  dateAdded,
+  fileType,
+  album,
+  year,
+  genre,
+}
+
+/// A group of songs within the same folder.
+class FolderGroup {
+  final String name;
+  final String key;
+  final String? folderUri;
+  final List<Song> songs;
+
+  const FolderGroup({
+    required this.name,
+    required this.key,
+    this.folderUri,
+    required this.songs,
+  });
+}
+
+/// Filter options for file types.
+///
+/// The set of extensions recognized by the scanner is defined in
+/// `library_scanner_service.dart` (`_looksLikeSupportedAudioExtension`) and the
+/// Rust scanner. Every supported extension must be matched by one of these
+/// filters.
+enum SongFileTypeFilter {
+  all,
+  flac,
+  mp3,
+  wav,
+  aac,
+  alac,
+  ogg,
+  opus,
+  aiff,
+  dsd,
+  wavpack,
+}
+
+extension SongFileTypeFilterExtension on SongFileTypeFilter {
+  String get displayName {
+    switch (this) {
+      case SongFileTypeFilter.all:
+        return l10n.allFormats;
+      case SongFileTypeFilter.flac:
+        return 'FLAC';
+      case SongFileTypeFilter.mp3:
+        return 'MP3';
+      case SongFileTypeFilter.wav:
+        return 'WAV';
+      case SongFileTypeFilter.aac:
+        return 'AAC';
+      case SongFileTypeFilter.alac:
+        return 'ALAC';
+      case SongFileTypeFilter.ogg:
+        return 'OGG';
+      case SongFileTypeFilter.opus:
+        return 'OPUS';
+      case SongFileTypeFilter.aiff:
+        return 'AIFF';
+      case SongFileTypeFilter.dsd:
+        return 'DSD';
+      case SongFileTypeFilter.wavpack:
+        return 'WAVPACK';
+    }
+  }
+
+  /// Extensions (lower-case, no dot) this filter matches. `null` means the
+  /// filter matches every file type.
+  Set<String>? get extensions {
+    switch (this) {
+      case SongFileTypeFilter.all:
+        return null;
+      case SongFileTypeFilter.flac:
+        return const {'flac'};
+      case SongFileTypeFilter.mp3:
+        return const {'mp3', 'mpeg'};
+      case SongFileTypeFilter.wav:
+        return const {'wav', 'wave'};
+      case SongFileTypeFilter.aac:
+        return const {'aac', 'm4a', 'mp4'};
+      case SongFileTypeFilter.alac:
+        return const {'alac', 'm4a'};
+      case SongFileTypeFilter.ogg:
+        return const {'ogg', 'oga', 'ogx', 'vorbis'};
+      case SongFileTypeFilter.opus:
+        return const {'opus', 'spx'};
+      case SongFileTypeFilter.aiff:
+        return const {'aif', 'aiff'};
+      case SongFileTypeFilter.dsd:
+        return const {'dsf', 'dff', 'wv-dsd', 'dsd'};
+      case SongFileTypeFilter.wavpack:
+        return const {'wv', 'wavpack'};
+    }
+  }
+
+  bool matches(String fileType) {
+    final extensions = this.extensions;
+    if (extensions == null) return true;
+
+    final normalized = fileType.replaceAll('.', '').toLowerCase().trim();
+    return extensions.contains(normalized);
+  }
+}
+
+/// State for the songs list with sorting.
+class SongsState {
+  final List<Song> songs;
+  final SongSortOption sortOption;
+  final SongFileTypeFilter fileTypeFilter;
+  final List<Song> sortedSongs;
+  final List<AlbumGroup> albumGroups;
+
+  const SongsState._({
+    required this.songs,
+    required this.sortOption,
+    required this.fileTypeFilter,
+    required this.sortedSongs,
+    required this.albumGroups,
+  });
+
+  factory SongsState({
+    List<Song> songs = const [],
+    SongSortOption sortOption = SongSortOption.albumArtist,
+    SongFileTypeFilter fileTypeFilter = SongFileTypeFilter.all,
+  }) {
+    return SongsState._(
+      songs: songs,
+      sortOption: sortOption,
+      fileTypeFilter: fileTypeFilter,
+      sortedSongs: computeSortedSongs(songs, sortOption, fileTypeFilter),
+      albumGroups: _computeAlbumGroups(songs, sortOption, fileTypeFilter),
+    );
+  }
+
+  SongsState copyWith({
+    List<Song>? songs,
+    SongSortOption? sortOption,
+    SongFileTypeFilter? fileTypeFilter,
+  }) {
+    return SongsState(
+      songs: songs ?? this.songs,
+      sortOption: sortOption ?? this.sortOption,
+      fileTypeFilter: fileTypeFilter ?? this.fileTypeFilter,
+    );
+  }
+
+  static List<Song> computeSortedSongs(
+    List<Song> songs,
+    SongSortOption sortOption,
+    SongFileTypeFilter fileTypeFilter,
+  ) {
+    var result = List<Song>.from(songs);
+
+    if (fileTypeFilter != SongFileTypeFilter.all) {
+      result = result
+          .where((song) => fileTypeFilter.matches(song.fileType))
+          .toList();
+    }
+
+    switch (sortOption) {
+      case SongSortOption.albumArtist:
+        result.sort((a, b) {
+          final artistA = a.albumArtist ?? a.artist;
+          final artistB = b.albumArtist ?? b.artist;
+          final artistCompare = compareCaseInsensitive(artistA, artistB);
+          if (artistCompare != 0) return artistCompare;
+          final albumCompare = compareCaseInsensitive(
+            a.album ?? '',
+            b.album ?? '',
+          );
+          if (albumCompare != 0) return albumCompare;
+
+          final discA = (a.discNumber != null && a.discNumber! > 0)
+              ? a.discNumber!
+              : 1;
+          final discB = (b.discNumber != null && b.discNumber! > 0)
+              ? b.discNumber!
+              : 1;
+          final discCompare = discA.compareTo(discB);
+          if (discCompare != 0) return discCompare;
+
+          final trackA = (a.trackNumber != null && a.trackNumber! > 0)
+              ? a.trackNumber
+              : null;
+          final trackB = (b.trackNumber != null && b.trackNumber! > 0)
+              ? b.trackNumber
+              : null;
+          final hasTrackA = trackA != null;
+          final hasTrackB = trackB != null;
+          if (hasTrackA && hasTrackB) {
+            final trackCompare = trackA.compareTo(trackB);
+            if (trackCompare != 0) return trackCompare;
+          } else if (hasTrackA != hasTrackB) {
+            return hasTrackA ? -1 : 1;
+          }
+
+          return compareCaseInsensitive(a.title, b.title);
+        });
+      case SongSortOption.title:
+        result.sort((a, b) => compareCaseInsensitive(a.title, b.title));
+      case SongSortOption.artist:
+        result.sort((a, b) => compareCaseInsensitive(a.artist, b.artist));
+      case SongSortOption.dateAdded:
+        result.sort((a, b) {
+          final dateA = a.dateAdded ?? DateTime.fromMillisecondsSinceEpoch(0);
+          final dateB = b.dateAdded ?? DateTime.fromMillisecondsSinceEpoch(0);
+          return dateB.compareTo(dateA);
+        });
+      case SongSortOption.fileType:
+        result.sort((a, b) => a.fileType.compareTo(b.fileType));
+      case SongSortOption.album:
+        result.sort((a, b) {
+          final albumA = a.album?.trim().isNotEmpty == true
+              ? a.album!.trim()
+              : l10n.unknownAlbum;
+          final albumB = b.album?.trim().isNotEmpty == true
+              ? b.album!.trim()
+              : l10n.unknownAlbum;
+          final albumCompare = compareCaseInsensitive(albumA, albumB);
+          if (albumCompare != 0) return albumCompare;
+
+          final artistA = a.albumArtist?.trim().isNotEmpty == true
+              ? a.albumArtist!.trim()
+              : a.artist.trim();
+          final artistB = b.albumArtist?.trim().isNotEmpty == true
+              ? b.albumArtist!.trim()
+              : b.artist.trim();
+          final artistCompare = compareCaseInsensitive(artistA, artistB);
+          if (artistCompare != 0) return artistCompare;
+
+          final discA = (a.discNumber != null && a.discNumber! > 0)
+              ? a.discNumber!
+              : 1;
+          final discB = (b.discNumber != null && b.discNumber! > 0)
+              ? b.discNumber!
+              : 1;
+          final discCompare = discA.compareTo(discB);
+          if (discCompare != 0) return discCompare;
+
+          final trackA = (a.trackNumber != null && a.trackNumber! > 0)
+              ? a.trackNumber
+              : null;
+          final trackB = (b.trackNumber != null && b.trackNumber! > 0)
+              ? b.trackNumber
+              : null;
+          final hasTrackA = trackA != null;
+          final hasTrackB = trackB != null;
+          if (hasTrackA && hasTrackB) {
+            final trackCompare = trackA.compareTo(trackB);
+            if (trackCompare != 0) return trackCompare;
+          } else if (hasTrackA != hasTrackB) {
+            return hasTrackA ? -1 : 1;
+          }
+
+          return compareCaseInsensitive(a.title, b.title);
+        });
+      case SongSortOption.year:
+        result.sort((a, b) {
+          final yearA = a.year ?? 0;
+          final yearB = b.year ?? 0;
+          final yearCompare = yearB.compareTo(yearA);
+          if (yearCompare != 0) return yearCompare;
+          return compareCaseInsensitive(a.title, b.title);
+        });
+      case SongSortOption.genre:
+        result.sort((a, b) {
+          final genreA = a.genre?.trim().isNotEmpty == true
+              ? a.genre!.trim()
+              : '\u{10FFFF}';
+          final genreB = b.genre?.trim().isNotEmpty == true
+              ? b.genre!.trim()
+              : '\u{10FFFF}';
+          final genreCompare = compareCaseInsensitive(genreA, genreB);
+          if (genreCompare != 0) return genreCompare;
+          return compareCaseInsensitive(a.title, b.title);
+        });
+    }
+    return result;
+  }
+
+  static List<AlbumGroup> _computeAlbumGroups(
+    List<Song> songs,
+    SongSortOption sortOption,
+    SongFileTypeFilter fileTypeFilter,
+  ) {
+    if (sortOption != SongSortOption.album) return [];
+
+    var result = List<Song>.from(songs);
+
+    if (fileTypeFilter != SongFileTypeFilter.all) {
+      result = result
+          .where((song) => fileTypeFilter.matches(song.fileType))
+          .toList();
+    }
+
+    final groupedSongs = <String, List<Song>>{};
+    final albumNames = <String, String>{};
+    final albumArtistsByKey = <String, Set<String>>{};
+
+    for (final song in result) {
+      final albumName = song.album?.trim().isNotEmpty == true
+          ? song.album!.trim()
+          : l10n.unknownAlbum;
+      final albumArtist = SongRepository.albumArtistForSong(song);
+      final key = albumName;
+
+      groupedSongs.putIfAbsent(key, () => []).add(song);
+      albumNames[key] = albumName;
+      albumArtistsByKey.putIfAbsent(key, () => <String>{}).add(albumArtist);
+    }
+
+    final groups = groupedSongs.entries.map((entry) {
+      final songsList = List<Song>.from(entry.value)
+        ..sort((a, b) {
+          final discA = (a.discNumber != null && a.discNumber! > 0)
+              ? a.discNumber!
+              : 1;
+          final discB = (b.discNumber != null && b.discNumber! > 0)
+              ? b.discNumber!
+              : 1;
+          final discCompare = discA.compareTo(discB);
+          if (discCompare != 0) return discCompare;
+
+          final trackA = (a.trackNumber != null && a.trackNumber! > 0)
+              ? a.trackNumber
+              : null;
+          final trackB = (b.trackNumber != null && b.trackNumber! > 0)
+              ? b.trackNumber
+              : null;
+          final hasTrackA = trackA != null;
+          final hasTrackB = trackB != null;
+          if (hasTrackA && hasTrackB) {
+            final trackCompare = trackA.compareTo(trackB);
+            if (trackCompare != 0) return trackCompare;
+          } else if (hasTrackA != hasTrackB) {
+            return hasTrackA ? -1 : 1;
+          }
+
+          final titleCompare = compareCaseInsensitive(a.title, b.title);
+          if (titleCompare != 0) return titleCompare;
+
+          return compareCaseInsensitive(a.artist, b.artist);
+        });
+
+      return AlbumGroup(
+        key: entry.key,
+        albumName: albumNames[entry.key] ?? l10n.unknownAlbum,
+        albumArtist: SongRepository.resolveGroupArtist(
+          albumArtistsByKey[entry.key] ?? const {},
+        ),
+        songs: songsList,
+      );
+    }).toList();
+
+    groups.sort((a, b) {
+      final artistCompare = compareCaseInsensitive(
+        a.albumArtist,
+        b.albumArtist,
+      );
+      if (artistCompare != 0) return artistCompare;
+      return compareCaseInsensitive(a.albumName, b.albumName);
+    });
+
+    return groups;
+  }
+
+  static String extractRelativeSubfolder(String? folderUri, String? filePath) {
+    if (folderUri == null || folderUri.isEmpty) return '';
+    if (filePath == null || filePath.isEmpty) return '';
+
+    final safRelative = _extractSafRelativePath(folderUri, filePath);
+    if (safRelative != null) return safRelative;
+
+    final rawRelative = _extractRawRelativePath(folderUri, filePath);
+    if (rawRelative != null) return rawRelative;
+
+    final base = folderUri.endsWith('/')
+        ? folderUri.substring(0, folderUri.length - 1)
+        : folderUri;
+    final uriBase = Uri.tryParse('$base/');
+    if (uriBase == null) return '';
+    final fileUri = Uri.tryParse(filePath);
+    if (fileUri == null) return '';
+    // A strip that matched nothing leaves the whole path behind; treating that
+    // as a relative path renders the full absolute path as a folder chain.
+    if (uriBase.path.isNotEmpty && !fileUri.path.startsWith(uriBase.path)) {
+      return '';
+    }
+    final relative = uriBase.path.isNotEmpty
+        ? fileUri.path.replaceFirst(uriBase.path, '')
+        : fileUri.path;
+    final withoutRoot = relative.startsWith('/')
+        ? relative.substring(1)
+        : relative;
+    final parts = withoutRoot
+        .split('/')
+        .map(decodeUriDisplayComponent)
+        .toList();
+    if (parts.length >= 2) return parts.sublist(0, parts.length - 1).join('/');
+    return '';
+  }
+
+  static String? _extractSafRelativePath(String folderUri, String filePath) {
+    final folder = Uri.tryParse(folderUri);
+    final file = Uri.tryParse(filePath);
+    if (folder == null || file == null) return null;
+    if (folder.scheme != 'content' || file.scheme != 'content') return null;
+
+    final rootId = _safPathId(folder, 'tree');
+    final documentId = _safPathId(file, 'document');
+    if (rootId == null || documentId == null) return null;
+    // Whole-volume roots ('1234-5678:', 'primary:') carry no trailing '/';
+    // child document ids continue straight after the colon.
+    final volumeRoot = rootId.endsWith(':');
+    final underRoot =
+        documentId == rootId ||
+        (volumeRoot
+            ? documentId.startsWith(rootId)
+            : documentId.startsWith('$rootId/'));
+    if (!underRoot) return '';
+
+    final relativeFile = documentId == rootId
+        ? ''
+        : documentId.substring(volumeRoot ? rootId.length : rootId.length + 1);
+    final parts = relativeFile
+        .split('/')
+        .where((part) => part.isNotEmpty)
+        .map(decodeUriDisplayComponent)
+        .toList();
+    if (parts.length >= 2) return parts.sublist(0, parts.length - 1).join('/');
+    return '';
+  }
+
+  /// Handles the mixed path space the scanners leave behind: a folder added
+  /// through SAF keeps its `content://` tree URI, but the Rust and MediaStore
+  /// walkers persist an absolute filesystem `filePath`, so the SAF branch
+  /// above cannot match. Strips in raw-path space instead. Returns null when
+  /// the branch does not apply, so the generic fallback still runs.
+  static String? _extractRawRelativePath(String folderUri, String filePath) {
+    final rawFile = _rawFilePath(filePath);
+    if (rawFile == null) return null;
+    final root = rawRootFromFolderUri(folderUri);
+    if (root == null) return null;
+    if (rawFile != root && !rawFile.startsWith('$root/')) return '';
+
+    final relativeFile = rawFile == root
+        ? ''
+        : rawFile.substring(root.length + 1);
+    final parts = relativeFile
+        .split('/')
+        .where((part) => part.isNotEmpty)
+        .toList();
+    if (parts.length >= 2) return parts.sublist(0, parts.length - 1).join('/');
+    return '';
+  }
+
+  /// Resolves a SAF tree URI to the raw filesystem root it maps to, using the
+  /// same convention as `LibraryScannerService.rawPathFromSafUri`: `primary:X`
+  /// lives at `/storage/emulated/0/X`, any other `vol:X` at `/storage/vol/X`.
+  /// An absolute path passes through. Returns null for anything else.
+  static String? rawRootFromFolderUri(String folderUri) {
+    if (folderUri.startsWith('/')) return _withoutTrailingSlash(folderUri);
+
+    final folder = Uri.tryParse(folderUri);
+    if (folder == null || folder.scheme != 'content') return null;
+    final treeId = _safPathId(folder, 'tree');
+    if (treeId == null) return null;
+
+    final colon = treeId.indexOf(':');
+    // A colon at the end is a whole-volume root (empty relative path).
+    if (colon <= 0) return null;
+    final volume = treeId.substring(0, colon);
+    final relative = treeId.substring(colon + 1);
+    final volumeRoot = volume == 'primary'
+        ? '/storage/emulated/0'
+        : '/storage/$volume';
+    return _withoutTrailingSlash('$volumeRoot/$relative');
+  }
+
+  /// Raw filesystem path for [filePath], unwrapping a `file://` URI, or null
+  /// when it is neither a `file://` URI nor an absolute path.
+  static String? _rawFilePath(String filePath) {
+    if (filePath.startsWith('file://')) {
+      return Uri.tryParse(filePath)?.toFilePath();
+    }
+    if (filePath.startsWith('/')) return filePath;
+    return null;
+  }
+
+  static String _withoutTrailingSlash(String path) {
+    return path.endsWith('/') ? path.substring(0, path.length - 1) : path;
+  }
+
+  static String? _safPathId(Uri uri, String marker) {
+    final segments = decodedUriPathSegments(uri);
+    final index = segments.indexOf(marker);
+    if (index < 0 || index + 1 >= segments.length) return null;
+    return segments[index + 1].replaceAll('\\', '/');
+  }
+
+  static String folderDisplayName(String? folderUri, String? filePath) {
+    if (folderUri == null || folderUri.isEmpty) {
+      if (filePath == null) return '';
+      final uri = Uri.tryParse(filePath);
+      if (uri == null) return filePath;
+      final segments = decodedUriPathSegments(uri);
+      if (segments.length >= 2) {
+        return segments[segments.length - 2];
+      }
+      return filePath;
+    }
+    final uri = Uri.tryParse(folderUri);
+    if (uri == null) return folderUri;
+    final segments = decodedUriPathSegments(uri);
+    return segments.isNotEmpty
+        ? _displayNameFromPathId(segments.last)
+        : folderUri;
+  }
+
+  static String _displayNameFromPathId(String pathId) {
+    final normalized = pathId.replaceAll('\\', '/');
+    final slashIndex = normalized.lastIndexOf('/');
+    if (slashIndex >= 0 && slashIndex + 1 < normalized.length) {
+      return normalized.substring(slashIndex + 1);
+    }
+
+    final colonIndex = normalized.lastIndexOf(':');
+    if (colonIndex >= 0 && colonIndex + 1 < normalized.length) {
+      return normalized.substring(colonIndex + 1);
+    }
+
+    return normalized;
+  }
+}
+
+/// AsyncNotifier for managing the songs list.
+/// Uses autoDispose to clean up when not being watched.
+class SongsNotifier extends AsyncNotifier<SongsState> {
+  static const _sortOptionKey = 'songs_sort_option';
+  static const _fileTypeFilterKey = 'songs_file_type_filter';
+  SongSortOption _sortOption = SongSortOption.albumArtist;
+  SongFileTypeFilter _fileTypeFilter = SongFileTypeFilter.all;
+  bool _sortChanged = false;
+  bool _fileTypeChanged = false;
+  Future<void> _sortWriteTail = Future<void>.value();
+  Future<void> _filterWriteTail = Future<void>.value();
+
+  @override
+  Future<SongsState> build() async {
+    final repository = ref.watch(songRepositoryProvider);
+    // Share the throttled revision: artwork/metadata batches must not trigger
+    // one full-library query, sort and regroup for each individual DB write.
+    ref.watch(libraryChangeRevisionProvider);
+
+    final savedSort = await _loadSortOption();
+    final savedFilter = await _loadFileTypeFilter();
+    // A library revision can rebuild this notifier while a user changes
+    // controls. Do not replace the newer choice with an older async load.
+    if (!_sortChanged) _sortOption = savedSort;
+    if (!_fileTypeChanged) _fileTypeFilter = savedFilter;
+
+    final songs = await repository.getAllSongs();
+    return SongsState(
+      songs: songs,
+      sortOption: _sortOption,
+      fileTypeFilter: _fileTypeFilter,
+    );
+  }
+
+  void setSortOption(SongSortOption option) {
+    _sortChanged = true;
+    _sortOption = option;
+    _sortWriteTail = _sortWriteTail
+        .then((_) => _saveSortOption(option))
+        .catchError((Object _) {});
+    final currentState = state.value;
+    if (currentState != null) {
+      state = AsyncData(currentState.copyWith(sortOption: option));
+    }
+  }
+
+  void setFileTypeFilter(SongFileTypeFilter filter) {
+    _fileTypeChanged = true;
+    _fileTypeFilter = filter;
+    _filterWriteTail = _filterWriteTail
+        .then((_) => _saveFileTypeFilter(filter))
+        .catchError((Object _) {});
+    final currentState = state.value;
+    if (currentState != null) {
+      state = AsyncData(currentState.copyWith(fileTypeFilter: filter));
+    }
+  }
+
+  Future<SongSortOption> _loadSortOption() async {
+    final prefs = await SharedPreferences.getInstance();
+    final value = prefs.getString(_sortOptionKey);
+    if (value == null) return SongSortOption.albumArtist;
+    return SongSortOption.values.firstWhere(
+      (opt) => opt.name == value,
+      orElse: () => SongSortOption.albumArtist,
+    );
+  }
+
+  Future<SongFileTypeFilter> _loadFileTypeFilter() async {
+    final prefs = await SharedPreferences.getInstance();
+    final value = prefs.getString(_fileTypeFilterKey);
+    if (value == null) return SongFileTypeFilter.all;
+    return SongFileTypeFilter.values.firstWhere(
+      (f) => f.name == value,
+      orElse: () => SongFileTypeFilter.all,
+    );
+  }
+
+  Future<void> _saveSortOption(SongSortOption option) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_sortOptionKey, option.name);
+  }
+
+  Future<void> _saveFileTypeFilter(SongFileTypeFilter filter) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_fileTypeFilterKey, filter.name);
+  }
+
+  /// Force refresh the songs list.
+  Future<void> refresh() async {
+    state = const AsyncLoading();
+    state = await AsyncValue.guard(() => build());
+  }
+}
+
+/// Main songs provider with async data loading.
+final songsProvider =
+    AsyncNotifierProvider.autoDispose<SongsNotifier, SongsState>(
+      SongsNotifier.new,
+    );
+
+/// Convenience provider for just the sorted song list.
+final sortedSongsProvider = Provider.autoDispose<AsyncValue<List<Song>>>((ref) {
+  return ref.watch(songsProvider).whenData((state) => state.sortedSongs);
+});
+
+/// Song count provider.
+final songCountProvider = Provider.autoDispose<int>((ref) {
+  return ref.watch(songsProvider).value?.songs.length ?? 0;
+});
+
+// ============================================================================
+// Album and Artist grouping providers
+// ============================================================================
+
+/// Songs grouped by album.
+final songsByAlbumProvider = FutureProvider.autoDispose<List<AlbumGroup>>((
+  ref,
+) async {
+  final repository = ref.watch(songRepositoryProvider);
+  return repository.getAlbumGroups();
+});
+
+/// Songs grouped by artist.
+final songsByArtistProvider =
+    FutureProvider.autoDispose<Map<String, List<Song>>>((ref) async {
+      final repository = ref.watch(songRepositoryProvider);
+      return repository.getSongsByArtist();
+    });
+
+// ============================================================================
+// Search provider
+// ============================================================================
+
+/// Notifier for search query state.
+class SearchQueryNotifier extends Notifier<String> {
+  @override
+  String build() => '';
+
+  void setQuery(String query) {
+    state = query;
+  }
+
+  void clear() {
+    state = '';
+  }
+}
+
+/// Search query state provider.
+final searchQueryProvider =
+    NotifierProvider.autoDispose<SearchQueryNotifier, String>(
+      SearchQueryNotifier.new,
+    );
+
+/// Filtered songs based on search query.
+final searchResultsProvider = FutureProvider.autoDispose<List<Song>>((
+  ref,
+) async {
+  final query = ref.watch(searchQueryProvider);
+  if (query.isEmpty) return [];
+
+  final repository = ref.watch(songRepositoryProvider);
+  return phoneLocalSearchSongs(await repository.searchSongs(query));
+});

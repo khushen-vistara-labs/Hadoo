@@ -1,0 +1,2212 @@
+import 'lyrics_matching.dart';
+import 'lyrics_flac_vorbis_reader.dart';
+
+import 'package:flick/data/database.dart';
+
+import 'dart:convert';
+import 'dart:io';
+
+import 'package:xml/xml.dart';
+
+import 'lyrics_sources.dart';
+
+import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+import 'package:flick/core/utils/app_log.dart';
+import 'package:flick/models/song.dart';
+import 'package:flick/services/online_lyrics_service.dart';
+
+/// A single word (or whitespace-joined token) within a lyric line, with an
+/// optional timing window for karaoke-style highlighting.
+class LyricsWord {
+  final Duration start;
+  final Duration end;
+  final String text;
+
+  const LyricsWord({
+    required this.start,
+    required this.end,
+    required this.text,
+  });
+}
+
+/// A single lyric line, optionally timestamped for synchronized display.
+/// [words] carries per-word timings when the source was enhanced LRC;
+/// otherwise it is null and the renderer keeps whole-line timing.
+class LyricsLine {
+  final Duration timestamp;
+  final String text;
+  final List<LyricsWord>? words;
+
+  /// Independently timed backing vocals that overlap the lead line.
+  final String? backgroundText;
+  final List<LyricsWord>? backgroundWords;
+
+  /// Optional voice label carried by Mornye/lrc.red LRC (not sung text).
+  final String? voice;
+
+  /// The line in another language, shown under it: in an LRC, the unstamped
+  /// line right under a stamped one (desktop Lokal v9.2's rule).
+  final String? translation;
+
+  const LyricsLine({
+    required this.timestamp,
+    required this.text,
+    this.words,
+    this.translation,
+    this.voice,
+    this.backgroundText,
+    this.backgroundWords,
+  });
+
+  LyricsLine withTranslation(String? translation) => LyricsLine(
+    timestamp: timestamp,
+    text: text,
+    words: words,
+    translation: translation,
+    voice: voice,
+    backgroundText: backgroundText,
+    backgroundWords: backgroundWords,
+  );
+
+  LyricsLine withBackground(String text, List<LyricsWord>? words) => LyricsLine(
+    timestamp: timestamp,
+    text: this.text,
+    words: this.words,
+    translation: translation,
+    voice: voice,
+    backgroundText: backgroundText == null || backgroundText!.isEmpty
+        ? text
+        : '$backgroundText $text',
+    backgroundWords: [...?backgroundWords, ...?words],
+  );
+}
+
+/// Parsed lyrics payload.
+class LyricsData {
+  final List<LyricsLine> lines;
+  final bool isSynchronized;
+  final String? source;
+  final String rawContent;
+  final String? language, translationLanguage;
+
+  const LyricsData({
+    required this.lines,
+    required this.isSynchronized,
+    this.source,
+    required this.rawContent,
+    this.language,
+    this.translationLanguage,
+  });
+}
+
+/// Last checked availability for an individual lyric provider on one song.
+class LyricsSourceHit {
+  final String status; // 'checking', 'hit', or 'miss'
+  final String? timing; // 'Syllable', 'Line', or 'Plain'
+  const LyricsSourceHit(this.status, [this.timing]);
+}
+
+class LyricsSaveResult {
+  final LyricsData data;
+  final String path;
+  final bool savedBesideSong;
+
+  const LyricsSaveResult({
+    required this.data,
+    required this.path,
+    required this.savedBesideSong,
+  });
+}
+
+class LyricsService {
+  static const MethodChannel _storageChannel = MethodChannel(
+    'com.mossapps.flick/storage',
+  );
+  static const String _manualLyricsOverridesKey = 'lyrics_manual_overrides_v1';
+  static const String _managedLyricsDirectoryName = 'lyrics';
+  static final RegExp _wordTimestampPattern = RegExp(
+    r'<(\d{1,2}:\d{2}(?::\d{2})?(?:\.\d{1,3})?)>',
+  );
+  static final RegExp _voicePrefixPattern = RegExp(
+    r'^\s*(v\d{1,4})\s*[:：]\s*',
+    caseSensitive: false,
+  );
+
+  // Mornye/lrc.red sometimes embeds speaker identifiers in the actual
+  // LRC text. Remove those identifiers from both the display line and any
+  // karaoke units, retaining timing and voice identity.
+  static (String, List<LyricsWord>?, String?) _stripVoicePrefix(
+    String text,
+    List<LyricsWord>? words,
+  ) {
+    final match = _voicePrefixPattern.firstMatch(text);
+    if (match == null) return (text, words, null);
+    final cleanedText = text.substring(match.end).trimLeft();
+    if (cleanedText.isEmpty) return (text, words, null);
+    final voice = match.group(1)!.toLowerCase();
+    if (words == null || words.isEmpty) {
+      return (cleanedText, words, voice);
+    }
+
+    final timedText = words.map((word) => word.text).join();
+    final timedMarker = _voicePrefixPattern.firstMatch(timedText);
+    if (timedMarker == null) {
+      // The prefix may be outside the timed spans. Keep already-clean words,
+      // but never allow mismatched timed content to reintroduce a marker.
+      String normalize(String value) =>
+          value.replaceAll(RegExp(r'\s+'), ' ').trim();
+      return (
+        cleanedText,
+        normalize(timedText) == normalize(cleanedText) ? words : null,
+        voice,
+      );
+    }
+    var remaining = timedMarker.end;
+    final cleanedWords = <LyricsWord>[];
+    for (final word in words) {
+      if (remaining >= word.text.length) {
+        remaining -= word.text.length;
+        continue;
+      }
+      final suffix = word.text.substring(remaining);
+      remaining = 0;
+      final visible = cleanedWords.isEmpty ? suffix.trimLeft() : suffix;
+      if (visible.isNotEmpty) {
+        cleanedWords.add(
+          LyricsWord(start: word.start, end: word.end, text: visible),
+        );
+      }
+    }
+    return (
+      cleanedText,
+      remaining == 0 && cleanedWords.isNotEmpty ? cleanedWords : null,
+      voice,
+    );
+  }
+
+  /// The independently timed supporting voice is part of the lyrics, not a
+  /// translation or a second online source. Existing source ranking only
+  /// measures lead timing and can silently replace a complete local lyric set
+  /// with a lead-only word-timed copy.
+  static int supportingVocalCount(LyricsData? lyrics) =>
+      lyrics?.lines
+          .where(
+            (line) =>
+                line.voice == 'bg' ||
+                line.backgroundText?.trim().isNotEmpty == true,
+          )
+          .length ??
+      0;
+
+  /// Merge backing vocals from different representations of this SAME song
+  /// without replacing the chosen lead, translation, or word timings.
+  /// Each voice is matched by its own onset rather than the previous LRC row.
+  static LyricsData? mergeSupportingVocals(
+    LyricsData? preferred,
+    Iterable<LyricsData?> others,
+  ) {
+    if (preferred == null || preferred.lines.isEmpty) return preferred;
+    final lines = preferred.lines.toList();
+    final seen = <String>{};
+
+    String signature(String text, Duration time) =>
+        '${time.inMilliseconds}|${text.trim().replaceAll(RegExp(r'\s+'), ' ')}';
+
+    for (final line in lines) {
+      if (line.backgroundText?.trim().isNotEmpty != true) continue;
+      final onset = line.backgroundWords?.isNotEmpty == true
+          ? line.backgroundWords!.first.start
+          : line.timestamp;
+      seen.add(signature(line.backgroundText!, onset));
+    }
+
+    var changed = false;
+    for (final data in others) {
+      if (data == null || identical(data, preferred)) continue;
+      for (final voice in data.lines) {
+        // Supporting vocals may originate as independent LRC-only entries
+        // with no lead in their native metadata field.
+        final standalone = voice.voice == 'bg';
+        final text = (standalone ? voice.text : voice.backgroundText)?.trim();
+        if (text == null || text.isEmpty) continue;
+        final words = standalone ? voice.words : voice.backgroundWords;
+        final onset = words?.isNotEmpty == true
+            ? words!.first.start
+            : voice.timestamp;
+        if (!seen.add(signature(text, onset))) continue;
+        var target = 0;
+        final limit = onset + const Duration(milliseconds: 20);
+        for (var i = 0; i < lines.length; i++) {
+          if (lines[i].timestamp <= limit &&
+              (lines[target].timestamp > limit ||
+                  lines[i].timestamp >= lines[target].timestamp)) {
+            target = i;
+          }
+        }
+        lines[target] = lines[target].withBackground(text, words);
+        changed = true;
+      }
+    }
+
+    if (!changed) return preferred;
+    return LyricsData(
+      lines: lines,
+      isSynchronized: preferred.isSynchronized,
+      rawContent: preferred.rawContent,
+      source: preferred.source,
+      language: preferred.language,
+      translationLanguage: preferred.translationLanguage,
+    );
+  }
+
+  LyricsService({this.online});
+
+  /// Where lyrics are looked up online (LRCLIB unless given).
+  final OnlineLyricsService? online;
+  final Map<String, LyricsData?> _cache = {};
+  // Shared across the player and the prefetcher's LyricsService instance.
+  // A source receives a green check only after usable lyrics were actually
+  // parsed for this recording; stale hits never carry over to another song.
+  static final ValueNotifier<int> sourceHitsRevision = ValueNotifier<int>(0);
+  static final Map<String, Map<String, LyricsSourceHit>> _sourceHits = {};
+  static final Map<String, DateTime> _sourceHitChecks = {};
+  static final Map<String, Future<void>> _sourceProbes = {};
+  static const _sourceHitTtl = Duration(minutes: 10);
+
+  static String _hitKey(Song song) =>
+      '${song.id}|${song.title}|${song.artist}|${song.duration.inMilliseconds}';
+
+  static LyricsSourceHit? sourceHitFor(Song song, String provider) =>
+      _sourceHits[_hitKey(song)]?[provider];
+
+  static void _setSourceHit(Song song, String provider, LyricsSourceHit value) {
+    final key = _hitKey(song);
+    if (!_sourceHits.containsKey(key) && _sourceHits.length >= 24) {
+      final oldest = _sourceHits.keys.first;
+      _sourceHits.remove(oldest);
+      _sourceHitChecks.remove(oldest);
+    }
+    final byProvider = _sourceHits.putIfAbsent(key, () => {});
+    byProvider[provider] = value;
+    sourceHitsRevision.value++;
+  }
+
+  /// Probe only when the chooser is opened. Three bounded workers, 10-minute
+  /// result reuse, no automatic network fanout for ordinary playback.
+  Future<void> probeSourceHits(Song song) {
+    final key = _hitKey(song);
+    final running = _sourceProbes[key];
+    if (running != null) return running;
+    final checked = _sourceHitChecks[key];
+    if (checked != null && DateTime.now().difference(checked) < _sourceHitTtl) {
+      return Future.value();
+    }
+    final ids = <String>[
+      'local',
+      ...lyricsSources.keys,
+    ].where((id) => _sourceHits[key]?[id]?.status != 'hit').toList();
+    for (final id in ids) {
+      _setSourceHit(song, id, const LyricsSourceHit('checking'));
+    }
+    final future = _probeSourceHits(song, ids);
+    _sourceProbes[key] = future;
+    return future.whenComplete(() {
+      _sourceProbes.remove(key);
+    });
+  }
+
+  Future<void> _probeSourceHits(Song song, List<String> ids) async {
+    var index = 0;
+    Future<void> worker() async {
+      while (index < ids.length) {
+        final id = ids[index++];
+        LyricsData? result;
+        try {
+          result =
+              await (id == 'local'
+                      ? loadLyricsForSong(song, source: 'local')
+                      : fetchOnlineLyrics(song, source: id))
+                  .timeout(const Duration(seconds: 20), onTimeout: () => null);
+        } catch (_) {}
+        _setSourceHit(
+          song,
+          id,
+          result != null && result.lines.isNotEmpty
+              ? LyricsSourceHit(
+                  'hit',
+                  result.lines.any((l) => l.words?.isNotEmpty == true)
+                      ? 'Syllable'
+                      : result.isSynchronized
+                      ? 'Line'
+                      : 'Plain',
+                )
+              : const LyricsSourceHit('miss'),
+        );
+      }
+    }
+
+    await Future.wait(List.generate(3, (_) => worker()));
+    _sourceHitChecks[_hitKey(song)] = DateTime.now();
+  }
+
+  static int _desktopRevision = 0;
+  int _seenDesktopRevision = 0;
+
+  /// Notifies search results when local lyric sources are saved, replaced, or
+  /// detached. Also includes lyrics delivered by the desktop sync channel.
+  static final ValueNotifier<int> contentRevision = ValueNotifier<int>(0);
+  int _seenContentRevision = contentRevision.value;
+
+  /// The song's own lyrics (a manual pick, its tags, a file beside it). With
+  /// [fetchOnline], a song that carries none is looked up on LRCLIB, as
+  /// desktop's "Fetch lyrics automatically" does; nothing is written to disk.
+  Future<LyricsData?> loadLyricsForSong(
+    Song song, {
+    bool forceRefresh = false,
+    bool fetchOnline = false,
+    bool refreshOnline = false,
+    String source = 'auto',
+    bool Function()? stillCurrent,
+  }) async {
+    if (refreshOnline) OnlineLyricsService.clearLookupCache();
+    if (_seenDesktopRevision != _desktopRevision ||
+        _seenContentRevision != contentRevision.value) {
+      _cache.clear();
+      _seenDesktopRevision = _desktopRevision;
+      _seenContentRevision = contentRevision.value;
+    }
+    if (source != 'auto' && source != 'local')
+      return fetchOnlineLyrics(
+        song,
+        source: source,
+        stillCurrent: stillCurrent,
+      );
+    final own = await _loadOwnLyrics(song, forceRefresh: forceRefresh);
+    if (!fetchOnline ||
+        source == 'local' ||
+        (!refreshOnline &&
+            own?.lines.any(
+                  (l) => l.voice != 'bg' && l.words?.isNotEmpty == true,
+                ) ==
+                true))
+      return own;
+    if (own != null && await getManualLyricsPathForSong(song) != null)
+      return own;
+    final found = await fetchOnlineLyrics(song, stillCurrent: stillCurrent);
+    int rank(LyricsData? data) =>
+        data == null ||
+            !data.lines.any((l) => l.voice != 'bg' && l.text.trim().isNotEmpty)
+        ? 0
+        : data.lines.any((l) => l.voice != 'bg' && l.words?.isNotEmpty == true)
+        ? 3
+        : data.isSynchronized
+        ? 2
+        : 1;
+    final best = rank(found) > rank(own) ? found : own ?? found;
+    return mergeSupportingVocals(best, [own, found]);
+  }
+
+  /// Ordered online fallback, or an explicit source selected during playback.
+  Future<LyricsData?> fetchOnlineLyrics(
+    Song song, {
+    String source = 'auto',
+    bool Function()? stillCurrent,
+  }) async {
+    if (song.title.trim().isEmpty || song.artist.trim().isEmpty) return null;
+    final settings = online == null
+        ? await LyricsSourcesState.load()
+        : const LyricsSourcesState();
+    final sources = source == 'auto'
+        ? (online != null
+              ? ['lrclib']
+              : settings.order.where((id) => !settings.disabled.contains(id)))
+        : [source];
+    var active = true;
+    bool current() => active && (stillCurrent?.call() ?? true);
+    final query = song.copyWith(
+      title: lyricsSearchTitle(song.title),
+      artist: lyricsSearchArtist(song.artist),
+    );
+    Future<LyricsData?> fetch(String id) async {
+      if (!current()) return null;
+      try {
+        String? text;
+        if (id == 'lrclib') {
+          final result = online != null
+              ? await online!.fetchExact(
+                  artist: song.artist,
+                  title: song.title,
+                  album: song.album,
+                  duration: song.duration,
+                )
+              : await OnlineLyricsService().fetchBest(
+                  artist: song.artist,
+                  title: song.title,
+                  album: song.album,
+                  duration: song.duration,
+                );
+          if (result != null && !result.instrumental) text = result.bestLyrics;
+        } else {
+          text = await AdditionalLyricsSources.fetch(
+            id,
+            query,
+            stillCurrent: current,
+          );
+        }
+        if (!current() || text == null || text.trim().isEmpty) return null;
+        if (text.trimLeft().startsWith('<') &&
+            !text.contains('<tt') &&
+            !text.contains('<line'))
+          return null;
+        final parsed = _parseLyrics(text, source: lyricsSources[id] ?? id);
+        if (parsed.lines.isEmpty) return null;
+        // Populate the chooser from lyrics the ordinary auto-lookup already
+        // found. Opening it should not re-fetch known successful providers.
+        _setSourceHit(
+          song,
+          id,
+          LyricsSourceHit(
+            'hit',
+            parsed.lines.any((line) => line.words?.isNotEmpty == true)
+                ? 'Syllable'
+                : parsed.isSynchronized
+                ? 'Line'
+                : 'Plain',
+          ),
+        );
+        return parsed;
+      } catch (_) {
+        return null;
+      }
+    }
+
+    // Start together, consume in saved priority order. Plain-only lyrics.ovh
+    // is lazy, and plain text can never preempt a synchronized result.
+    final jobs = {
+      for (final id in sources)
+        if (id != 'lyricsovh')
+          id: fetch(id)
+              .timeout(const Duration(seconds: 18), onTimeout: () => null),
+    };
+    LyricsData? lineFallback, plainFallback;
+    try {
+      for (final id in sources) {
+        if (!current()) return null;
+        if (id == 'lyricsovh' &&
+            (lineFallback != null || plainFallback != null))
+          continue;
+        final parsed = await (jobs[id] ?? fetch(id));
+        if (parsed == null) continue;
+        if (source != 'auto') return parsed;
+        if (parsed.lines.any((line) => line.words?.isNotEmpty == true))
+          return parsed;
+        if (parsed.isSynchronized) {
+          if (!settings.preferWords) return parsed;
+          lineFallback ??= parsed;
+        } else {
+          plainFallback ??= parsed;
+        }
+      }
+      return lineFallback ?? plainFallback;
+    } finally {
+      active = false;
+    }
+  }
+
+  Future<LyricsData?> _loadOwnLyrics(
+    Song song, {
+    bool forceRefresh = false,
+  }) async {
+    final filePath = song.filePath;
+    if (filePath == null || filePath.isEmpty) return null;
+
+    if (forceRefresh) {
+      _cache.remove(filePath);
+    }
+
+    if (!forceRefresh && _cache.containsKey(filePath)) {
+      return _cache[filePath];
+    }
+
+    final manualPath = await getManualLyricsPathForSong(song);
+    if (manualPath != null && manualPath.isNotEmpty) {
+      final manualLoaded = await _loadLyricsFromAbsolutePath(manualPath);
+      if (manualLoaded != null && manualLoaded.content.trim().isNotEmpty) {
+        final parsed = _parseLyrics(
+          manualLoaded.content,
+          source: manualLoaded.source,
+        );
+        _cache[filePath] = parsed;
+        return parsed;
+      }
+
+      await clearManualLyricsPathForSong(song);
+    }
+
+    // Read the FLAC's own lyrics regardless of whether an earlier Desktop
+    // handoff supplied word-timed lead lyrics. A lead-only payload is NOT a
+    // complete replacement for local independently timed backing vocals.
+    final desktop = await _desktopLyrics(song);
+    final sidecar = await _loadLyricsText(filePath);
+    final embedded = await _loadEmbeddedLyricsText(song);
+    final sidecarData = sidecar?.content.trim().isNotEmpty == true
+        ? _parseLyrics(sidecar!.content, source: sidecar.source)
+        : null;
+    final embeddedData = embedded?.content.trim().isNotEmpty == true
+        ? _parseLyrics(embedded!.content, source: embedded.source)
+        : null;
+    AppLog.instance.add(
+      '[LyricsLocalParsed] embeddedBg=${supportingVocalCount(embeddedData)} '
+      'sidecarBg=${supportingVocalCount(sidecarData)} '
+      'desktopBg=${supportingVocalCount(desktop)}',
+    );
+
+    // A sidecar is the explicitly supplied local source. Otherwise preserve
+    // word timing from linked Desktop lyrics, but overlay backing vocals from
+    // the actual audio file even when the lead is equally word-synchronized.
+    bool hasLead(LyricsData? data) =>
+        data?.lines.any(
+          (line) => line.voice != 'bg' && line.text.trim().isNotEmpty,
+        ) ==
+        true;
+    final desktopTimed =
+        desktop?.lines.any(
+          (line) => line.voice != 'bg' && line.words?.isNotEmpty == true,
+        ) ==
+        true;
+    final ordered = <LyricsData?>[
+      sidecarData,
+      if (desktopTimed) desktop,
+      embeddedData,
+      desktop,
+    ];
+    // Never choose a bg-only field over another source's actual lead.
+    final primary = ordered.firstWhere(
+      hasLead,
+      orElse: () =>
+          ordered.firstWhere((data) => data != null, orElse: () => null),
+    );
+    final selected = mergeSupportingVocals(primary, [
+      embeddedData,
+      sidecarData,
+      desktop,
+    ]);
+    AppLog.instance.add(
+      '[LyricsLocalSelected] bg=${supportingVocalCount(selected)} '
+      'leadLines=${selected?.lines.where((l) => l.voice != 'bg').length ?? 0}',
+    );
+    _cache[filePath] = selected;
+    return selected;
+  }
+
+  static LyricsData? fromDesktop(Map<String, dynamic> payload) {
+    final rows = payload['lines'];
+    if (rows is! List) return null;
+    Duration seconds(Object? value) => Duration(
+      microseconds: ((value is num ? value.toDouble() : 0) * 1000000).round(),
+    );
+    final lines = <LyricsLine>[];
+    for (final row in rows.whereType<Map>()) {
+      if (row['gap'] == true) continue;
+      final words = <LyricsWord>[];
+      for (final word
+          in (row['words'] is List ? row['words'] as List : const [])
+              .whereType<Map>()) {
+        if (word['time'] is! num || word['end'] is! num) continue;
+        words.add(
+          LyricsWord(
+            start: seconds(word['time']),
+            end: seconds(word['end']),
+            text: '${word['word'] ?? ''}${word['space'] == true ? ' ' : ''}',
+          ),
+        );
+      }
+      final backgroundWords = <LyricsWord>[];
+      for (final word
+          in (row['bgWords'] is List ? row['bgWords'] as List : const [])
+              .whereType<Map>()) {
+        if (word['time'] is! num || word['end'] is! num) continue;
+        backgroundWords.add(
+          LyricsWord(
+            start: seconds(word['time']),
+            end: seconds(word['end']),
+            text: "${word['word'] ?? ''}${word['space'] == true ? ' ' : ''}",
+          ),
+        );
+      }
+      final backgroundText = row['bgText']?.toString();
+      final text = row['text']?.toString() ?? '';
+      if (text.trim().isEmpty && (backgroundText?.trim().isEmpty ?? true))
+        continue;
+      final (cleanText, cleanWords, voice) = _stripVoicePrefix(
+        text,
+        words.isEmpty ? null : words,
+      );
+      final translation = row['translation'];
+      lines.add(
+        LyricsLine(
+          timestamp: seconds(row['time']),
+          text: cleanText,
+          words: cleanWords,
+          backgroundText: backgroundText,
+          backgroundWords: backgroundWords.isEmpty ? null : backgroundWords,
+          voice: voice ?? row['agent']?.toString(),
+          translation: translation is Map
+              ? translation['text']?.toString()
+              : translation?.toString(),
+        ),
+      );
+    }
+    if (lines.isEmpty) return null;
+    lines.sort((a, b) => a.timestamp.compareTo(b.timestamp));
+    return LyricsData(
+      lines: lines,
+      isSynchronized:
+          payload['type'] == 'synced' ||
+          payload['type'] == 'syllable' ||
+          payload['sync'] == 'syllable' ||
+          payload['sync'] == 'line',
+      source: payload['source']?.toString() ?? 'Desktop',
+      rawContent: jsonEncode(payload),
+      language: payload['language']?.toString(),
+      translationLanguage: payload['translationLang']?.toString(),
+    );
+  }
+
+  static Future<File> _desktopFile(Song song) async {
+    final directory = Directory(
+      '${(await getApplicationDocumentsDirectory()).path}/desktop_lyrics',
+    );
+    await directory.create(recursive: true);
+    return File('${directory.path}/${Uri.encodeComponent(song.id)}.json');
+  }
+
+  static Future<void> storeDesktopLyrics(
+    Song song,
+    Map<String, dynamic> payload,
+  ) async {
+    final candidate = fromDesktop(payload);
+    if (candidate == null) return;
+    final file = await _desktopFile(song);
+    final encoded = jsonEncode(payload);
+    int rank(LyricsData data) =>
+        data.lines.any((l) => l.words?.isNotEmpty == true)
+        ? 3
+        : data.isSynchronized
+        ? 2
+        : 1;
+    if (await file.exists()) {
+      try {
+        final raw = await file.readAsString();
+        if (raw == encoded) return;
+        final existing = fromDesktop(
+          Map<String, dynamic>.from(jsonDecode(raw) as Map),
+        );
+        if (existing != null && rank(existing) > rank(candidate)) return;
+      } catch (_) {}
+    }
+    final part = File('${file.path}.part');
+    await part.writeAsString(encoded, flush: true);
+    await part.rename(file.path);
+    _desktopRevision++;
+    contentRevision.value++;
+  }
+
+  static Future<LyricsData?> _desktopLyrics(Song song) async {
+    try {
+      final file = await _desktopFile(song);
+      if (!await file.exists()) return null;
+      return fromDesktop(
+        Map<String, dynamic>.from(jsonDecode(await file.readAsString()) as Map),
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<String?> getManualLyricsPathForSong(Song song) async {
+    final filePath = song.filePath;
+    if (filePath == null || filePath.isEmpty) return null;
+
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString(_manualLyricsOverridesKey);
+    if (raw == null || raw.isEmpty) return null;
+
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is! Map) return null;
+      final value = decoded[filePath];
+      if (value is String && value.isNotEmpty) {
+        return value;
+      }
+    } catch (_) {
+      // Ignore malformed preference payload and fall back to auto lookup.
+    }
+
+    return null;
+  }
+
+  Future<void> clearManualLyricsPathForSong(Song song) async {
+    await _setManualLyricsPath(song, null);
+  }
+
+  Future<LyricsSaveResult> importLyricsForSong({
+    required Song song,
+    required String fileName,
+    required String content,
+  }) async {
+    final extension = _preferredLyricsExtension(fileName);
+    final savedPath = await _writeManagedLyricsCopy(
+      song: song,
+      extension: extension,
+      content: content,
+    );
+    await _setManualLyricsPath(song, savedPath);
+    final data =
+        (await loadLyricsForSong(song, forceRefresh: true)) ??
+        _parseLyrics(content, source: savedPath);
+    return LyricsSaveResult(
+      data: data,
+      path: savedPath,
+      savedBesideSong: false,
+    );
+  }
+
+  Future<LyricsSaveResult> saveLyricsForSong({
+    required Song song,
+    required String content,
+  }) async {
+    final sidecarPath = suggestSidecarLrcPath(song);
+    var savedBesideSong = false;
+    late final String savedPath;
+
+    if (sidecarPath != null) {
+      try {
+        final file = File(sidecarPath);
+        await file.parent.create(recursive: true);
+        await file.writeAsString(content);
+        await _setManualLyricsPath(song, null);
+        savedBesideSong = true;
+        savedPath = file.path;
+      } catch (_) {
+        savedPath = await _writeManagedLyricsCopy(
+          song: song,
+          extension: 'lrc',
+          content: content,
+        );
+        await _setManualLyricsPath(song, savedPath);
+      }
+    } else {
+      savedPath = await _writeManagedLyricsCopy(
+        song: song,
+        extension: 'lrc',
+        content: content,
+      );
+      await _setManualLyricsPath(song, savedPath);
+    }
+
+    final data =
+        (await loadLyricsForSong(song, forceRefresh: true)) ??
+        _parseLyrics(content, source: savedPath);
+    return LyricsSaveResult(
+      data: data,
+      path: savedPath,
+      savedBesideSong: savedBesideSong,
+    );
+  }
+
+  Future<LyricsSaveResult> saveLyricsToPath({
+    required Song song,
+    required String content,
+    required String path,
+  }) async {
+    final file = File(path);
+    final alreadyExists = await file.exists();
+    if (!alreadyExists) {
+      await file.parent.create(recursive: true);
+      await file.writeAsString(content);
+    }
+    await _setManualLyricsPath(song, path);
+    final data =
+        (await loadLyricsForSong(song, forceRefresh: true)) ??
+        _parseLyrics(content, source: path);
+    return LyricsSaveResult(data: data, path: path, savedBesideSong: false);
+  }
+
+  Future<LyricsSaveResult> saveLyricsToManaged({
+    required Song song,
+    required String content,
+  }) async {
+    final path = await _writeManagedLyricsCopy(
+      song: song,
+      extension: 'lrc',
+      content: content,
+    );
+    await _setManualLyricsPath(song, path);
+    final data =
+        (await loadLyricsForSong(song, forceRefresh: true)) ??
+        _parseLyrics(content, source: path);
+    return LyricsSaveResult(data: data, path: path, savedBesideSong: false);
+  }
+
+  int findCurrentLineIndex(LyricsData lyrics, Duration position) {
+    if (!lyrics.isSynchronized || lyrics.lines.isEmpty) return -1;
+
+    final targetMs = position.inMilliseconds;
+    int left = 0;
+    int right = lyrics.lines.length - 1;
+    int result = -1;
+
+    while (left <= right) {
+      final mid = left + ((right - left) ~/ 2);
+      final lineMs = lyrics.lines[mid].timestamp.inMilliseconds;
+      if (lineMs <= targetMs) {
+        result = mid;
+        left = mid + 1;
+      } else {
+        right = mid - 1;
+      }
+    }
+
+    return result;
+  }
+
+  /// Whitespace-token matches used for karaoke word segmentation.
+  static List<RegExpMatch> tokenMatches(String text) =>
+      _tokenPattern.allMatches(text).toList();
+
+  static final RegExp _tokenPattern = RegExp(r'\S+\s*');
+
+  /// Splits a [LyricsWord] whose text spans multiple tokens into one segment
+  /// per token, distributing the word's window proportionally to token
+  /// length. Each segment renders with its own gradient, so a line that wraps
+  /// across rows sweeps in reading order instead of highlighting the same
+  /// horizontal band on every row.
+  static List<LyricsWord> splitKaraokeWord(LyricsWord word) {
+    final matches = tokenMatches(word.text);
+    if (matches.length <= 1) return [word];
+
+    final leading = word.text.substring(0, matches.first.start);
+    final windowMs = word.end.inMilliseconds - word.start.inMilliseconds;
+
+    final weights = [
+      for (final match in matches)
+        (match.group(0) ?? '').trim().length.clamp(1, 64),
+    ];
+    final weightSum = weights.fold<int>(0, (a, b) => a + b);
+
+    final segments = <LyricsWord>[];
+    var consumed = 0;
+    for (var i = 0; i < matches.length; i++) {
+      final text = (i == 0 ? leading : '') + (matches[i].group(0) ?? '');
+      if (windowMs <= 0 || weightSum <= 0) {
+        segments.add(LyricsWord(start: word.start, end: word.end, text: text));
+        continue;
+      }
+      final startRatio = consumed / weightSum;
+      consumed += weights[i];
+      final endRatio = consumed / weightSum;
+      segments.add(
+        LyricsWord(
+          start:
+              word.start +
+              Duration(milliseconds: (startRatio * windowMs).round()),
+          end:
+              word.start +
+              Duration(milliseconds: (endRatio * windowMs).round()),
+          text: text,
+        ),
+      );
+    }
+    return segments;
+  }
+
+  /// Fill progress (0..1) of a word at [position]. Values below the window
+  /// are unsung, above fully sung.
+  static double fillForWord(LyricsWord word, Duration position) {
+    final startMs = word.start.inMilliseconds;
+    final endMs = word.end.inMilliseconds;
+    if (endMs <= startMs) return position >= word.end ? 1.0 : 0.0;
+    final ratio =
+        (position.inMilliseconds - startMs).toDouble() / (endMs - startMs);
+    return ratio.clamp(0.0, 1.0);
+  }
+
+  /// Per-word timing windows for the given line. Enhanced-LRC lines chain
+  /// their real timestamps. Plain synced lines carry no word data, so they
+  /// get a single whole-line window instead of guessed per-word timing —
+  /// the karaoke sweep then tracks real data only.
+  /// Prepare word windows once for the fullscreen flowing-lyrics renderer.
+  /// Embedded enhanced LRC stores word starts without ends (end == start);
+  /// painting those directly makes the highlight jump in 1 ms steps.
+  /// Preserve explicit end times from providers and leave original data intact.
+  List<LyricsLine> playbackLines(LyricsData lyrics) {
+    final rendered = <LyricsLine>[];
+    for (var i = 0; i < lyrics.lines.length; i++) {
+      final line = lyrics.lines[i];
+      final words = line.words;
+      if (words == null ||
+          words.isEmpty ||
+          words.every((word) => word.end > word.start)) {
+        rendered.add(line);
+        continue;
+      }
+      rendered.add(
+        LyricsLine(
+          timestamp: line.timestamp,
+          text: line.text,
+          words: resolveWords(lyrics, i),
+          translation: line.translation,
+          voice: line.voice,
+          backgroundText: line.backgroundText,
+          backgroundWords: line.backgroundWords,
+        ),
+      );
+    }
+    return rendered;
+  }
+
+  List<LyricsWord> resolveWords(LyricsData lyrics, int lineIndex) {
+    final line = lyrics.lines[lineIndex];
+    final lineEnd = _lineEndTime(lyrics, lineIndex);
+
+    final existing = line.words;
+    if (existing != null && existing.isNotEmpty) {
+      return [
+        for (var i = 0; i < existing.length; i++)
+          LyricsWord(
+            start: existing[i].start,
+            end: i + 1 < existing.length
+                ? existing[i + 1].start > existing[i].start
+                      ? existing[i + 1].start
+                      : existing[i].start
+                : _tailTrimmedEnd(existing[i].start, lineEnd),
+            text: existing[i].text,
+          ),
+      ];
+    }
+
+    if (line.text.trim().isEmpty) return const [];
+
+    var end = _tailTrimmedEnd(line.timestamp, lineEnd);
+    final maxWindow = const Duration(seconds: 6);
+    if (end - line.timestamp > maxWindow) {
+      end = line.timestamp + maxWindow;
+    }
+    return [LyricsWord(start: line.timestamp, end: end, text: line.text)];
+  }
+
+  Duration _lineEndTime(LyricsData lyrics, int index) {
+    final ts = lyrics.lines[index].timestamp;
+    // Concurrent lines may share the same timestamp. Do not give the first
+    // one an arbitrary five-second end just because its immediate successor
+    // starts at the same time; both should end against the next later line.
+    for (var i = index + 1; i < lyrics.lines.length; i++) {
+      final next = lyrics.lines[i].timestamp;
+      if (next > ts) return next;
+    }
+    return ts + const Duration(seconds: 5);
+  }
+
+  /// Fraction of a line's lifetime the karaoke sweep spans. The remaining
+  /// tail rests fully filled, so the scroll to the next line never starts
+  /// while words are still filling.
+  static const double _sweepWindowFactor = 0.85;
+
+  Duration _tailTrimmedEnd(Duration start, Duration lineEnd) {
+    final remainingMs = (lineEnd - start).inMilliseconds;
+    if (remainingMs <= 0) return start + const Duration(seconds: 4);
+    return start +
+        Duration(milliseconds: (remainingMs * _sweepWindowFactor).round());
+  }
+
+  List<LyricsWord>? _extractWords(String body, int offsetMs) {
+    final times = <Duration>[];
+    final starts = <int>[];
+    final ends = <int>[];
+
+    for (final match in _wordTimestampPattern.allMatches(body)) {
+      final parsed = _parseTimestamp(match.group(1) ?? '');
+      if (parsed == null) continue;
+      final adjustedMs = parsed.inMilliseconds + offsetMs;
+      times.add(Duration(milliseconds: adjustedMs < 0 ? 0 : adjustedMs));
+      starts.add(match.start);
+      ends.add(match.end);
+    }
+    if (times.isEmpty) return null;
+
+    final words = <LyricsWord>[];
+    for (var i = 0; i < times.length; i++) {
+      final segStart = i == 0 ? 0 : ends[i];
+      final segEnd = i + 1 < times.length ? starts[i + 1] : body.length;
+      final segment = body
+          .substring(segStart, segEnd)
+          .replaceAll(_wordTimestampPattern, '');
+      if (segment.isEmpty && i > 0) continue;
+      var explicitEnd = times[i];
+      if (i + 1 < times.length && times[i + 1] > times[i]) {
+        final afterNext = i + 2 < times.length ? starts[i + 2] : body.length;
+        // Consecutive markers with no sung text between them encode a word
+        // end followed by a vocal gap. Keep ordinary start-only ELRC's existing
+        // playback completion policy, while retaining explicitly saved gaps.
+        if (body.substring(ends[i + 1], afterNext).trim().isEmpty) {
+          explicitEnd = times[i + 1];
+        }
+      }
+      words.add(LyricsWord(start: times[i], end: explicitEnd, text: segment));
+    }
+    return words.isEmpty ? null : words;
+  }
+
+  LyricsData parseLyricsText(String raw, {String? source}) {
+    return _parseLyrics(raw, source: source);
+  }
+
+  Duration? parseTimestamp(String timestamp) {
+    return _parseTimestamp(timestamp);
+  }
+
+  String _formatClock(Duration duration) {
+    final totalMinutes = duration.inMinutes;
+    final seconds = duration.inSeconds.remainder(60);
+    final centiseconds = (duration.inMilliseconds.remainder(1000) ~/ 10);
+    return '${totalMinutes.toString().padLeft(2, '0')}:${seconds.toString().padLeft(2, '0')}.${centiseconds.toString().padLeft(2, '0')}';
+  }
+
+  String formatTimestamp(Duration duration) {
+    return '[${_formatClock(duration)}]';
+  }
+
+  String formatLengthTag(Duration duration) {
+    return '[length:${_formatClock(duration)}]';
+  }
+
+  String buildLrcContent({
+    required List<LyricsLine> lines,
+    Song? song,
+    Duration? length,
+  }) {
+    final buffer = StringBuffer();
+    if (song?.title case final title? when title.trim().isNotEmpty) {
+      buffer.writeln('[ti:${title.trim()}]');
+    }
+    if (song?.artist case final artist? when artist.trim().isNotEmpty) {
+      buffer.writeln('[ar:${artist.trim()}]');
+    }
+    if (song?.album case final album? when album.trim().isNotEmpty) {
+      buffer.writeln('[al:${album.trim()}]');
+    }
+    if (length != null) {
+      buffer.writeln(formatLengthTag(length));
+    }
+    if (buffer.isNotEmpty) {
+      buffer.writeln();
+    }
+
+    final timestampCounts = <int, int>{};
+    for (final line in lines) {
+      final time = line.timestamp.inMilliseconds;
+      timestampCounts[time] = (timestampCounts[time] ?? 0) + 1;
+    }
+    var untaggedTranslations = 0;
+    for (var index = 0; index < lines.length; index++) {
+      final line = lines[index];
+      final words = line.words;
+      if (words != null && words.isNotEmpty) {
+        final enhanced = words
+            .map((w) => '<${_formatClock(w.start)}>${w.text}')
+            .join();
+        buffer.writeln('${formatTimestamp(line.timestamp)}$enhanced');
+      } else {
+        buffer.writeln('${formatTimestamp(line.timestamp)}${line.text}');
+      }
+      // Re-emit separately timed backing vocals in enhanced-LRC exports.
+      if (line.backgroundText?.trim().isNotEmpty == true) {
+        final bgWords = line.backgroundWords;
+        if (bgWords != null && bgWords.isNotEmpty) {
+          final timed = bgWords
+              .map((w) => '<${_formatClock(w.start)}>${w.text}')
+              .join();
+          final tail = bgWords.last.end > bgWords.last.start
+              ? '<${_formatClock(bgWords.last.end)}>'
+              : '';
+          buffer.writeln('[bg:$timed$tail]');
+        } else {
+          buffer.writeln('[bg:${line.backgroundText}]');
+        }
+      }
+      // Duplicate the timestamp so external bilingual-LRC parsers can pair
+      // the translated line with the original rather than treating it as
+      // unsynchronized commentary.
+      if (line.translation case final translation?
+          when translation.trim().isNotEmpty &&
+              translation.trim() != line.text.trim()) {
+        if ((timestampCounts[line.timestamp.inMilliseconds] ?? 0) > 1) {
+          buffer.writeln('[lokaltr:${index + untaggedTranslations}]');
+        } else {
+          untaggedTranslations++;
+        }
+        buffer.writeln(
+          '${formatTimestamp(line.timestamp)}${translation.trim()}',
+        );
+      }
+    }
+    return buffer.toString().trimRight();
+  }
+
+  String? suggestSidecarLrcPath(Song song) {
+    final filePath = song.filePath;
+    if (filePath == null || filePath.isEmpty) return null;
+    final localPath = _resolveLocalPath(filePath);
+    if (localPath == null || localPath.isEmpty) return null;
+
+    final audioFile = File(localPath);
+    final parent = audioFile.parent;
+    final stem = _basenameWithoutExtension(audioFile.path);
+    return '${parent.path}${Platform.pathSeparator}$stem.lrc';
+  }
+
+  /// Android MediaStore / SAF can open a recording by content Uri when the
+  /// file path persisted by a scanner is inaccessible under scoped storage.
+  /// The Song model retains only filePath; the scanner also persists
+  /// mediaStoreUri on its Isar row, which playback can use but the lyrics
+  /// reader previously never attempted.
+  @visibleForTesting
+  static List<String> embeddedUriCandidates(
+    String filePath, {
+    String? mediaStoreUri,
+  }) {
+    final candidates = <String>[filePath];
+    final fallback = mediaStoreUri?.trim();
+    if (fallback != null &&
+        fallback.startsWith('content://') &&
+        !candidates.contains(fallback)) {
+      candidates.add(fallback);
+    }
+    return candidates;
+  }
+
+  Future<String?> _storedMediaStoreUriForSong(Song song) async {
+    // Only consult the local collection. External/network Song ids are not
+    // necessarily Isar ids and must never be redirected to unrelated files.
+    if (!Database.isInitialized || song.isNetworkSource || song.isExternal) {
+      return null;
+    }
+    final id = int.tryParse(song.id);
+    if (id == null) return null;
+    try {
+      final row = await Database.songs.get(id);
+      if (row == null || row.filePath != song.filePath) return null;
+      return row.mediaStoreUri;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Supporting vocals are an independently timed vocal lane, not a choice
+  /// of lead lyric source. Resolve them directly from the stored recording,
+  /// including its MediaStore URI, without relying on cached lead lyrics.
+  Future<LyricsData?> loadEmbeddedSupportingVocals(Song song) async {
+    if (song.filePath == null || song.filePath!.isEmpty) {
+      AppLog.instance.add('[LyricsBG] embedded skipped=no-audio-path');
+      return null;
+    }
+    try {
+      final embedded = await _loadEmbeddedLyricsText(song);
+      final parsed = embedded == null
+          ? null
+          : _parseLyrics(embedded.content, source: embedded.source);
+      final count = supportingVocalCount(parsed);
+      AppLog.instance.add(
+        '[LyricsBG] directExtract bg=$count '
+        'source=${embedded?.source ?? 'none'} '
+        'hasLead=${parsed?.lines.any((line) => line.voice != 'bg') == true}',
+      );
+      return count == 0 ? null : parsed;
+    } catch (error) {
+      AppLog.instance.add(
+        '[LyricsBG] embeddedExtractionError=${error.runtimeType}',
+      );
+      return null;
+    }
+  }
+
+  Future<_LoadedLyrics?> _loadEmbeddedLyricsText(Song song) async {
+    final filePath = song.filePath;
+    if (filePath == null || filePath.isEmpty) return null;
+    final storedUri = await _storedMediaStoreUriForSong(song);
+    final candidates = embeddedUriCandidates(
+      filePath,
+      mediaStoreUri: storedUri,
+    );
+    _LoadedLyrics? selected;
+    var nativeSuccess = 0;
+    var persistedUriUsed = false;
+    var bestCount = -1;
+    for (final uri in candidates) {
+      try {
+        final result = await _storageChannel.invokeMapMethod<String, dynamic>(
+          'readEmbeddedLyrics',
+          {'audioUri': uri},
+        );
+        final content = result?['content'] as String?;
+        if (content == null || content.trim().isEmpty) continue;
+        nativeSuccess++;
+        final count = FlacVorbisLyricsReader.backgroundCount(content);
+        if (count > bestCount) {
+          bestCount = count;
+          persistedUriUsed = uri != filePath;
+          selected = _LoadedLyrics(
+            content: content,
+            source: (result?['source'] as String?) ?? 'embedded',
+          );
+        }
+      } catch (error) {
+        AppLog.instance.add(
+          '[LyricsEmbedded] nativeReadFailed='
+          '${error.runtimeType} usingMediaStore=${uri != filePath}',
+        );
+      }
+    }
+
+    // A second, Flutter-native reader also supports filesystem-backed FLACs.
+    // Select the version containing most backing events, not merely the
+    // first metadata value Android reports.
+    final path = _resolveLocalPath(filePath);
+    final direct = path == null
+        ? null
+        : await FlacVorbisLyricsReader.readFile(path);
+    final directBg = FlacVorbisLyricsReader.backgroundCount(direct);
+    if (direct != null && directBg > bestCount) {
+      selected = _LoadedLyrics(
+        content: direct,
+        source: 'embedded:vorbis:direct',
+      );
+      bestCount = directBg;
+    }
+
+    AppLog.instance.add(
+      '[LyricsEmbedded] attempts=${candidates.length} '
+      'nativeSuccess=$nativeSuccess persistedMediaStoreUri='
+      '${storedUri != null} usedMediaStore=$persistedUriUsed '
+      'directBg=$directBg selectedBg=${bestCount.clamp(0, 1000000)}',
+    );
+    return selected;
+  }
+
+  Future<_LoadedLyrics?> _loadLyricsFromAbsolutePath(
+    String absolutePath,
+  ) async {
+    final file = File(absolutePath);
+    if (!await file.exists()) return null;
+    final content = await _readTextFile(file);
+    if (content == null || content.trim().isEmpty) return null;
+    return _LoadedLyrics(content: content, source: file.path);
+  }
+
+  Future<_LoadedLyrics?> _loadLyricsText(String filePath) async {
+    final parsedUri = Uri.tryParse(filePath);
+    final isAndroidContentUri =
+        !kIsWeb &&
+        defaultTargetPlatform == TargetPlatform.android &&
+        parsedUri?.scheme == 'content';
+
+    if (isAndroidContentUri) {
+      try {
+        final result = await _storageChannel.invokeMapMethod<String, dynamic>(
+          'readSiblingLyrics',
+          {'audioUri': filePath},
+        );
+        final content = result?['content'] as String?;
+        if (content != null && content.trim().isNotEmpty) {
+          return _LoadedLyrics(
+            content: content,
+            source: result?['name'] as String? ?? result?['uri'] as String?,
+          );
+        }
+      } catch (_) {
+        // Best-effort only. Fall back to local path resolution.
+      }
+    }
+
+    final localPath = _resolveLocalPath(filePath);
+    if (localPath == null || localPath.isEmpty) return null;
+
+    final audioFile = File(localPath);
+    final parent = audioFile.parent;
+    final stem = _basenameWithoutExtension(audioFile.path);
+    final sep = Platform.pathSeparator;
+
+    final candidates = <String>[
+      '${parent.path}$sep$stem.ttml',
+      '${parent.path}$sep$stem.elrc',
+      '${parent.path}$sep$stem.lrc',
+      '${parent.path}$sep$stem.txt',
+      '${parent.path}$sep$stem.xml',
+      '${parent.path}$sep$stem.LRC',
+      '${parent.path}$sep$stem.TXT',
+      '${parent.path}$sep$stem.XML',
+    ];
+
+    for (final candidatePath in candidates) {
+      final file = File(candidatePath);
+      if (!await file.exists()) continue;
+
+      final content = await _readTextFile(file);
+      if (content != null && content.trim().isNotEmpty) {
+        return _LoadedLyrics(content: content, source: file.path);
+      }
+    }
+
+    return null;
+  }
+
+  String? _resolveLocalPath(String filePath) {
+    if (RegExp(r'^[a-zA-Z]:\\').hasMatch(filePath)) {
+      return filePath;
+    }
+
+    final parsed = Uri.tryParse(filePath);
+    if (parsed != null && parsed.scheme == 'file') {
+      return parsed.toFilePath();
+    }
+
+    if (parsed != null && parsed.scheme.isNotEmpty) {
+      return null;
+    }
+
+    return filePath;
+  }
+
+  String _basenameWithoutExtension(String path) {
+    final normalized = path.replaceAll('\\', '/');
+    final filename = normalized.split('/').last;
+    final dotIndex = filename.lastIndexOf('.');
+    if (dotIndex <= 0) return filename;
+    return filename.substring(0, dotIndex);
+  }
+
+  Future<String?> _readTextFile(File file) async {
+    try {
+      return await file.readAsString();
+    } catch (_) {
+      try {
+        return await file.readAsString(encoding: latin1);
+      } catch (_) {
+        return null;
+      }
+    }
+  }
+
+  /// Desktop stores full-resolution lead, backing and translation timelines
+  /// in the FLAC VORBIS_COMMENT named LOKAL_LYRICS. Portable LYRICS strips
+  /// backing voices into parentheses, so parsing only that tag loses the lane.
+  LyricsData? _parseLokalPrivateLyrics(String raw, {String? source}) {
+    if (!FlacVorbisLyricsReader.isLokalPrivateLyrics(raw)) return null;
+    try {
+      final data = jsonDecode(raw) as Map;
+      Duration? at(Object? seconds) {
+        if (seconds is! num || !seconds.isFinite || seconds < 0) return null;
+        return Duration(microseconds: (seconds * 1000000).round());
+      }
+
+      List<LyricsWord>? units(Object? entries) {
+        if (entries is! List) return null;
+        final output = <LyricsWord>[];
+        for (final unit in entries) {
+          if (unit is! List || unit.length < 3 || unit[0] is! String) continue;
+          final start = at(unit[1]);
+          final end = at(unit[2]);
+          if (start == null || end == null || end < start) continue;
+          final spaced = unit.length > 3 && unit[3] == 1;
+          output.add(
+            LyricsWord(
+              start: start,
+              end: end,
+              text: (unit[0] as String) + (spaced ? ' ' : ''),
+            ),
+          );
+        }
+        return output.isEmpty ? null : output;
+      }
+
+      final lines = <LyricsLine>[];
+      for (final value in data['lines'] as List) {
+        if (value is! Map) continue;
+        final time = at(value['t']);
+        if (time == null || value['x'] is! String) continue;
+        final text = value['x'] as String;
+        final background =
+            value['b'] is String && (value['b'] as String).trim().isNotEmpty
+            ? value['b'] as String
+            : null;
+        lines.add(
+          LyricsLine(
+            timestamp: time,
+            text: text,
+            words: units(value['w']),
+            backgroundText: background,
+            backgroundWords: units(value['bw']),
+            translation: value['tr'] is String ? value['tr'] as String : null,
+            voice: value['a'] is String ? value['a'] as String : null,
+          ),
+        );
+      }
+      if (lines.isEmpty) return null;
+      lines.sort((a, b) => a.timestamp.compareTo(b.timestamp));
+      return LyricsData(
+        lines: lines,
+        isSynchronized: data['sync'] != 'none',
+        source: source ?? 'embedded:lokal',
+        rawContent: raw,
+        language: data['language'] is String
+            ? data['language'] as String
+            : null,
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Desktop's post-processing separates a final parenthesized reply from
+  /// the sung lead. BiniLyrics TTML often encodes this as ordinary timed text,
+  /// rather than an explicit x-bg role, so Mobile must split the same units.
+  ///
+  /// Avoid splitting mid-word suffixes such as "wait(ing)", lines containing
+  /// only "(oh)", and any lyric that already has a structural backing lane.
+  LyricsLine _splitTrailingBackingVoice(LyricsLine line) {
+    if (line.voice == 'bg' ||
+        line.backgroundText?.trim().isNotEmpty == true ||
+        !line.text.trimRight().endsWith(')'))
+      return line;
+    final text = line.text.trimRight();
+    var depth = 0;
+    int? opening;
+    for (var i = text.length - 1; i >= 0; i--) {
+      if (text[i] == ')') {
+        depth++;
+      } else if (text[i] == '(') {
+        depth--;
+        if (depth == 0) {
+          opening = i;
+          break;
+        }
+      }
+    }
+    if (opening == null || opening == 0) return line;
+    // A suffix inside a word is not a second vocalist: "wait(ing)".
+    // Real trailing replies have a word boundary before the open bracket.
+    if (!RegExp(r'\s').hasMatch(text[opening - 1])) return line;
+    final lead = text.substring(0, opening).trimRight();
+    final backing = text.substring(opening).trim();
+    if (lead.isEmpty ||
+        !RegExp(r'[\p{L}\p{N}]', unicode: true).hasMatch(backing))
+      return line;
+
+    final words = line.words;
+    List<LyricsWord>? leadWords;
+    List<LyricsWord>? backingWords;
+    if (words?.isNotEmpty == true) {
+      // Only divide genuinely timed syllables at a whole-unit boundary.
+      // If a bracket starts within a syllable, keep its original lyric and
+      // timings rather than fabricate a second vocalist's timestamps.
+      var prefix = '';
+      var splitAt = -1;
+      for (var i = 0; i < words!.length - 1; i++) {
+        prefix += words[i].text;
+        final normalized = prefix.replaceAll(RegExp(r'\s+'), ' ').trimRight();
+        if (normalized == lead &&
+            words[i + 1].text.trimLeft().startsWith('(')) {
+          splitAt = i + 1;
+          break;
+        }
+      }
+      if (splitAt <= 0) return line;
+      leadWords = words.sublist(0, splitAt);
+      backingWords = words.sublist(splitAt);
+    }
+
+    return LyricsLine(
+      timestamp: line.timestamp,
+      text: lead,
+      words: leadWords,
+      translation: line.translation,
+      voice: line.voice,
+      backgroundText: backing,
+      backgroundWords: backingWords,
+    );
+  }
+
+  LyricsData _splitTrailingBackingVoices(LyricsData lyrics) {
+    if (!lyrics.isSynchronized) return lyrics;
+    var changed = false;
+    final lines = lyrics.lines.map((line) {
+      final updated = _splitTrailingBackingVoice(line);
+      if (!identical(updated, line)) changed = true;
+      return updated;
+    }).toList();
+    if (!changed) return lyrics;
+    return LyricsData(
+      lines: lines,
+      isSynchronized: lyrics.isSynchronized,
+      source: lyrics.source,
+      rawContent: lyrics.rawContent,
+      language: lyrics.language,
+      translationLanguage: lyrics.translationLanguage,
+    );
+  }
+
+  LyricsData _parseLyrics(String raw, {String? source}) {
+    final trimmed = raw.trim();
+    if (trimmed.startsWith('{')) {
+      final private = _parseLokalPrivateLyrics(trimmed, source: source);
+      if (private != null) return _splitTrailingBackingVoices(private);
+    }
+    if (trimmed.startsWith('<?xml') || trimmed.startsWith('<')) {
+      final xmlData = _parseXmlLyrics(trimmed, source: source);
+      if (xmlData != null) return _splitTrailingBackingVoices(xmlData);
+    }
+
+    final normalized = raw
+        .replaceAll('\r\n', '\n')
+        .replaceAll('\r', '\n')
+        .replaceFirst(RegExp(r'^\uFEFF'), '');
+    final rows = normalized.split('\n');
+
+    final timestampPattern = RegExp(
+      r'\[(\d{1,2}:\d{2}(?::\d{2})?(?:\.\d{1,3})?)\]',
+    );
+    final offsetPattern = RegExp(
+      r'^\s*\[offset:([+-]?\d+)\]\s*$',
+      caseSensitive: false,
+    );
+    final metadataPattern = RegExp(r'^\s*\[[a-zA-Z]+:.*\]\s*$');
+    final backingPattern = RegExp(
+      r'^\s*\[bg\s*:(.*)\]\s*$',
+      caseSensitive: false,
+    );
+
+    var offsetMs = 0;
+    var hasTimestamps = false;
+    final parsedLines = <LyricsLine>[];
+    // Unstamped rows, kept apart: in a synced file one right under a stamped
+    // line is that line's translation; the rest are notes and credits.
+    final plainLines = <LyricsLine>[];
+    final translations = <(List<int>, String)>[];
+    // A backing voice's timestamp, not the previous text row, determines
+    // which lead it belongs to. Some enhanced-LRC tags group [bg:] rows.
+    final backingRows = <(String, List<LyricsWord>, Duration)>[];
+    // An optional association tag is emitted only for simultaneous vocal
+    // groups, where an otherwise portable timestamped translation would be
+    // indistinguishable from another sung voice.
+    final taggedTranslation = RegExp(r'^\[lokaltr:(\d+)\]$');
+    int? taggedSourceIndex;
+    var previous = <int>[]; // indexes the last stamped row made
+
+    for (final row in rows) {
+      final line = row.trimRight();
+      if (line.trim().isEmpty) {
+        previous = [];
+        continue;
+      }
+
+      final offsetMatch = offsetPattern.firstMatch(line);
+      if (offsetMatch != null) {
+        offsetMs = int.tryParse(offsetMatch.group(1) ?? '') ?? offsetMs;
+        continue;
+      }
+
+      final marker = taggedTranslation.firstMatch(line.trim());
+      if (marker != null) {
+        taggedSourceIndex = int.tryParse(marker.group(1)!);
+        previous = [];
+        continue;
+      }
+
+      // [bg:] is timed separately and might be interleaved, separated by
+      // blank lines or collected in its own block. Keep it until all leads
+      // have been parsed; never interpret it as metadata or translation.
+      final backing = backingPattern.firstMatch(line);
+      if (backing != null) {
+        final body = backing.group(1)!;
+        final text = body.replaceAll(_wordTimestampPattern, '').trim();
+        if (text.isNotEmpty) {
+          final rawWords =
+              (_extractWords(body, offsetMs) ?? const <LyricsWord>[])
+                  .where((w) => w.text.trim().isNotEmpty)
+                  .toList();
+          final stamps = _wordTimestampPattern.allMatches(body).toList();
+          final tail = stamps.isEmpty
+              ? null
+              : _parseTimestamp(stamps.last.group(1) ?? '');
+          final tailMs = tail == null ? null : tail.inMilliseconds + offsetMs;
+          final words = <LyricsWord>[
+            for (var i = 0; i < rawWords.length; i++)
+              LyricsWord(
+                start: rawWords[i].start,
+                end:
+                    i + 1 < rawWords.length &&
+                        rawWords[i + 1].start > rawWords[i].start
+                    ? rawWords[i + 1].start
+                    : i + 1 == rawWords.length &&
+                          tailMs != null &&
+                          tailMs > rawWords[i].start.inMilliseconds
+                    ? Duration(milliseconds: tailMs)
+                    : rawWords[i].start + const Duration(milliseconds: 500),
+                text: rawWords[i].text,
+              ),
+          ];
+          if (words.isNotEmpty) {
+            // Timed supporting vocals are real lyric events even if there is
+            // no lead row in the same tag. Do not discard bg-only payloads.
+            hasTimestamps = true;
+            backingRows.add((text, words, words.first.start));
+          } else if (previous.isNotEmpty) {
+            // Untimed annotations can still follow their immediately
+            // preceding lead; timed vocals never depend on textual ordering.
+            for (final index in previous) {
+              parsedLines[index] = parsedLines[index].withBackground(
+                text,
+                null,
+              );
+            }
+          }
+        }
+        continue;
+      }
+
+      final matches = timestampPattern.allMatches(line).toList();
+      if (matches.isNotEmpty) {
+        hasTimestamps = true;
+        final body = line.replaceAll(timestampPattern, '');
+        final rawWords = _extractWords(body, offsetMs);
+        final rawText = body.replaceAll(_wordTimestampPattern, '').trim();
+        final (lyricText, words, voice) = _stripVoicePrefix(rawText, rawWords);
+        previous = [];
+        final target = taggedSourceIndex;
+        taggedSourceIndex = null;
+        if (target != null &&
+            target >= 0 &&
+            target < parsedLines.length &&
+            matches.length == 1 &&
+            lyricText.isNotEmpty &&
+            parsedLines[target].translation == null) {
+          final time = _parseTimestamp(matches.single.group(1) ?? '');
+          if (time != null &&
+              parsedLines[target].timestamp.inMilliseconds ==
+                  (time.inMilliseconds + offsetMs).clamp(0, 1 << 62)) {
+            parsedLines[target] = parsedLines[target].withTranslation(
+              lyricText,
+            );
+            continue;
+          }
+        }
+        for (final match in matches) {
+          final parsedTime = _parseTimestamp(match.group(1) ?? '');
+          if (parsedTime == null) continue;
+
+          final adjustedMs = parsedTime.inMilliseconds + offsetMs;
+          final clamped = Duration(
+            milliseconds: adjustedMs < 0 ? 0 : adjustedMs,
+          );
+          if (lyricText.isEmpty) continue;
+          previous.add(parsedLines.length);
+          parsedLines.add(
+            LyricsLine(
+              timestamp: clamped,
+              text: lyricText,
+              words: words,
+              voice: voice,
+            ),
+          );
+        }
+        continue;
+      }
+
+      if (metadataPattern.hasMatch(line)) {
+        previous = [];
+        continue;
+      }
+
+      final original = line.trim().replaceAll(RegExp(r'\s+'), ' ');
+      final (text, _, voice) = _stripVoicePrefix(original, null);
+      if (previous.isNotEmpty) translations.add((previous, text));
+      previous = [];
+      plainLines.add(
+        LyricsLine(timestamp: Duration.zero, text: text, voice: voice),
+      );
+    }
+
+    if (hasTimestamps) {
+      if (parsedLines.isEmpty && backingRows.isNotEmpty) {
+        // Some Vorbis tags contain ONLY [bg:] entries. Preserve them as
+        // independently timed vocals; another source may supply the lead.
+        for (final (text, words, onset) in backingRows) {
+          parsedLines.add(
+            LyricsLine(timestamp: onset, text: text, words: words, voice: 'bg'),
+          );
+        }
+        backingRows.clear();
+      }
+      // Pair background vocals with the latest lead whose timestamp is at
+      // or before the background onset. This also handles [bg:] rows that
+      // appear before their lead in file order.
+      for (final (text, words, onset) in backingRows) {
+        if (parsedLines.isEmpty) break;
+        var target = 0;
+        final tolerance = onset + const Duration(milliseconds: 20);
+        for (var i = 0; i < parsedLines.length; i++) {
+          final candidate = parsedLines[i].timestamp;
+          if (candidate <= tolerance &&
+              (parsedLines[target].timestamp > tolerance ||
+                  candidate >= parsedLines[target].timestamp)) {
+            target = i;
+          }
+        }
+        parsedLines[target] = parsedLines[target].withBackground(text, words);
+      }
+      // A stray note isn't a translation: a translated file has one under at
+      // least half its sung lines.
+      final sung = parsedLines.map((line) => line.timestamp).toSet().length;
+      if (translations.isNotEmpty && translations.length >= sung / 2) {
+        for (final (indexes, text) in translations) {
+          for (final index in indexes) {
+            parsedLines[index] = parsedLines[index].withTranslation(text);
+          }
+        }
+      }
+      // Bilingual LRC commonly repeats the original timestamp for its
+      // translation. Fold adjacent pairs before sorting so original/subline
+      // ordering survives; leave simultaneous word-timed or 3+ vocal parts
+      // separate. Unstamped translations above remain supported.
+      final bilingualLines = <LyricsLine>[];
+      for (var i = 0; i < parsedLines.length;) {
+        var end = i + 1;
+        while (end < parsedLines.length &&
+            parsedLines[end].timestamp == parsedLines[i].timestamp) {
+          end++;
+        }
+        if (end == i + 2 &&
+            parsedLines[i].voice == null &&
+            parsedLines[i + 1].voice == null &&
+            parsedLines[i].translation == null &&
+            parsedLines[i + 1].translation == null &&
+            parsedLines[i + 1].words == null &&
+            parsedLines[i].text.trim() != parsedLines[i + 1].text.trim()) {
+          bilingualLines.add(
+            parsedLines[i].withTranslation(parsedLines[i + 1].text),
+          );
+        } else {
+          bilingualLines.addAll(parsedLines.getRange(i, end));
+        }
+        i = end;
+      }
+      bilingualLines.sort((a, b) => a.timestamp.compareTo(b.timestamp));
+      return _splitTrailingBackingVoices(
+        LyricsData(
+          lines: bilingualLines,
+          isSynchronized: true,
+          source: source,
+          rawContent: raw,
+        ),
+      );
+    }
+
+    return LyricsData(
+      lines: plainLines.where((line) => line.text.isNotEmpty).toList(),
+      isSynchronized: false,
+      source: source,
+      rawContent: raw,
+    );
+  }
+
+  LyricsData? _parseXmlLyrics(String xml, {String? source}) {
+    try {
+      final document = XmlDocument.parse(xml);
+      Duration? time(String? value) {
+        if (value == null) return null;
+        if (value.endsWith('ms'))
+          return Duration(
+            microseconds:
+                ((double.tryParse(value.substring(0, value.length - 2)) ?? 0) *
+                        1000)
+                    .round(),
+          );
+        if (value.endsWith('s'))
+          return Duration(
+            microseconds:
+                ((double.tryParse(value.substring(0, value.length - 1)) ?? 0) *
+                        1000000)
+                    .round(),
+          );
+        final parts = value.split(':');
+        if (parts.isEmpty) return null;
+        var seconds = 0.0;
+        for (final part in parts) {
+          final number = double.tryParse(part);
+          if (number == null) return null;
+          seconds = seconds * 60 + number;
+        }
+        return Duration(microseconds: (seconds * 1000000).round());
+      }
+
+      // Apple Music/Bini TTML can mark answering singers with ttm:role="x-bg".
+      // Namespaced attributes must be read by local name, not getAttribute(),
+      // which misses the ttm prefix on Android.
+      String? role(XmlElement element) => element.attributes
+          .where((attribute) => attribute.name.local == 'role')
+          .firstOrNull
+          ?.value;
+
+      String leadText(XmlNode node) {
+        if (node is XmlText) return node.value;
+        if (node is! XmlElement) return '';
+        if (const {'x-bg', 'x-translation', 'x-roman'}.contains(role(node))) {
+          return '';
+        }
+        return node.children.map(leadText).join();
+      }
+
+      String backingText(XmlElement paragraph) {
+        final parts = <String>[];
+        void walk(XmlNode node) {
+          if (node is! XmlElement) return;
+          if (role(node) == 'x-bg') {
+            final text = node.innerText.trim();
+            if (text.isNotEmpty) parts.add(text);
+            return;
+          }
+          if (const {'x-translation', 'x-roman'}.contains(role(node))) return;
+          for (final child in node.children) walk(child);
+        }
+
+        walk(paragraph);
+        return parts.join(' ').replaceAll(RegExp(r'\s+'), ' ').trim();
+      }
+
+      final paragraphs = document.descendants.whereType<XmlElement>().where(
+        (e) => e.name.local == 'p',
+      );
+      final lines = <LyricsLine>[];
+      final plain = <LyricsLine>[];
+      for (final paragraph in paragraphs) {
+        final start = time(paragraph.getAttribute('begin'));
+        final rawText = leadText(paragraph)
+            .replaceAll(RegExp(r'\s+'), ' ')
+            .trim();
+        final bgText = backingText(paragraph);
+        if (rawText.isEmpty && bgText.isEmpty) continue;
+        if (start == null) {
+          final (text, _, voice) = _stripVoicePrefix(rawText, null);
+          if (text.isNotEmpty) {
+            plain.add(
+              LyricsLine(
+                timestamp: Duration.zero,
+                text: text,
+                voice: voice,
+                backgroundText: bgText.isEmpty ? null : bgText,
+              ),
+            );
+          }
+          continue;
+        }
+        final words = <LyricsWord>[];
+        final bgWords = <LyricsWord>[];
+        for (final span in paragraph.descendants.whereType<XmlElement>().where(
+          (e) => e.name.local == 'span',
+        )) {
+          final begin = time(span.getAttribute('begin')),
+              end = time(span.getAttribute('end'));
+          if (begin == null ||
+              end == null ||
+              end < begin ||
+              span.innerText.trim().isEmpty) {
+            continue;
+          }
+          if (span.descendants.whereType<XmlElement>().any(
+            (child) => child.getAttribute('begin') != null,
+          ))
+            continue;
+          // The x-bg role is often on an untimed enclosing span. Walk back
+          // to the paragraph to assign each timed leaf to its own vocal lane.
+          var owner = span as XmlNode?;
+          var backing = false;
+          var skipped = false;
+          while (owner != null && !identical(owner, paragraph)) {
+            if (owner is XmlElement) {
+              final marking = role(owner);
+              if (marking == 'x-bg') backing = true;
+              if (marking == 'x-roman' || marking == 'x-translation') {
+                skipped = true;
+                break;
+              }
+            }
+            owner = owner.parent;
+          }
+          if (skipped) continue;
+          final tail = span.nextSibling;
+          final separator = tail is XmlText && tail.value.trim().isEmpty
+              ? tail.value
+              : '';
+          (backing ? bgWords : words).add(
+            LyricsWord(
+              start: begin,
+              end: end,
+              text: span.innerText + separator,
+            ),
+          );
+        }
+        final (text, cleanedWords, voice) = _stripVoicePrefix(
+          rawText,
+          words.isEmpty ? null : words,
+        );
+        // A background-only TTML paragraph must not become a new lead row.
+        if (text.isEmpty && bgText.isNotEmpty) {
+          lines.add(
+            LyricsLine(
+              timestamp: bgWords.isNotEmpty ? bgWords.first.start : start,
+              text: bgText,
+              words: bgWords.isEmpty ? null : bgWords,
+              voice: 'bg',
+            ),
+          );
+          continue;
+        }
+        lines.add(
+          LyricsLine(
+            timestamp: start,
+            text: text,
+            words: cleanedWords,
+            voice: voice,
+            backgroundText: bgText.isEmpty ? null : bgText,
+            backgroundWords: bgWords.isEmpty ? null : bgWords,
+          ),
+        );
+      }
+      if (lines.isNotEmpty || plain.isNotEmpty) {
+        final timed = lines.isNotEmpty;
+        if (!timed) lines.addAll(plain);
+        lines.sort((a, b) => a.timestamp.compareTo(b.timestamp));
+        return LyricsData(
+          lines: lines,
+          isSynchronized: timed,
+          source: source,
+          rawContent: xml,
+          language: document.rootElement.attributes
+              .where((a) => a.name.local == 'lang')
+              .firstOrNull
+              ?.value,
+        );
+      }
+    } catch (_) {
+      /* Try the legacy XML formats below. */
+    }
+    try {
+      final linePattern = RegExp(
+        r'<line\s+start="(\d+)"\s*>([^<]*)</line>',
+        caseSensitive: false,
+      );
+      final altPattern = RegExp(
+        r'<line\s+start="(\d{1,2}):(\d{2})\.(\d{2})"\s*>([^<]*)</line>',
+        caseSensitive: false,
+      );
+
+      final lines = <LyricsLine>[];
+      var hasTimestamps = false;
+
+      for (final match in linePattern.allMatches(xml)) {
+        hasTimestamps = true;
+        final ms = int.tryParse(match.group(1) ?? '') ?? 0;
+        final original = match.group(2)?.trim() ?? '';
+        final (text, _, voice) = _stripVoicePrefix(original, null);
+        if (text.isNotEmpty) {
+          lines.add(
+            LyricsLine(
+              timestamp: Duration(milliseconds: ms),
+              text: text,
+              voice: voice,
+            ),
+          );
+        }
+      }
+
+      if (lines.isEmpty) {
+        for (final match in altPattern.allMatches(xml)) {
+          hasTimestamps = true;
+          final minutes = int.tryParse(match.group(1) ?? '0') ?? 0;
+          final seconds = int.tryParse(match.group(2) ?? '0') ?? 0;
+          final centis = int.tryParse(match.group(3) ?? '0') ?? 0;
+          final ms = (minutes * 60 + seconds) * 1000 + centis * 10;
+          final original = match.group(4)?.trim() ?? '';
+          final (text, _, voice) = _stripVoicePrefix(original, null);
+          if (text.isNotEmpty) {
+            lines.add(
+              LyricsLine(
+                timestamp: Duration(milliseconds: ms),
+                text: text,
+                voice: voice,
+              ),
+            );
+          }
+        }
+      }
+
+      if (lines.isNotEmpty) {
+        lines.sort((a, b) => a.timestamp.compareTo(b.timestamp));
+        return LyricsData(
+          lines: lines,
+          isSynchronized: hasTimestamps,
+          source: source,
+          rawContent: xml,
+        );
+      }
+    } catch (_) {
+      // Fall through to plain-text parser
+    }
+    return null;
+  }
+
+  Duration? _parseTimestamp(String timestamp) {
+    final trimmed = timestamp.trim();
+
+    var match = RegExp(r'^(\d{1,2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?$')
+        .firstMatch(trimmed);
+    if (match != null) {
+      final hours = int.tryParse(match.group(1) ?? '') ?? 0;
+      final minutes = int.tryParse(match.group(2) ?? '') ?? 0;
+      final seconds = int.tryParse(match.group(3) ?? '') ?? 0;
+      return Duration(
+        hours: hours,
+        minutes: minutes,
+        seconds: seconds,
+        milliseconds: _parseFraction(match.group(4)),
+      );
+    }
+
+    match = RegExp(r'^(\d{1,2}):(\d{2})(?:\.(\d{1,3}))?$').firstMatch(trimmed);
+    if (match == null) return null;
+
+    final minutes = int.tryParse(match.group(1) ?? '');
+    final seconds = int.tryParse(match.group(2) ?? '');
+    if (minutes == null || seconds == null) return null;
+
+    return Duration(
+      minutes: minutes,
+      seconds: seconds,
+      milliseconds: _parseFraction(match.group(3)),
+    );
+  }
+
+  int _parseFraction(String? fractionRaw) {
+    if (fractionRaw == null || fractionRaw.isEmpty) return 0;
+    if (fractionRaw.length == 1) return int.parse(fractionRaw) * 100;
+    if (fractionRaw.length == 2) return int.parse(fractionRaw) * 10;
+    return int.parse(fractionRaw.substring(0, 3));
+  }
+
+  Future<void> _setManualLyricsPath(Song song, String? manualPath) async {
+    final filePath = song.filePath;
+    if (filePath == null || filePath.isEmpty) return;
+
+    final prefs = await SharedPreferences.getInstance();
+    final existingRaw = prefs.getString(_manualLyricsOverridesKey);
+    final map = <String, String>{};
+    if (existingRaw != null && existingRaw.isNotEmpty) {
+      try {
+        final decoded = jsonDecode(existingRaw);
+        if (decoded is Map) {
+          for (final entry in decoded.entries) {
+            if (entry.key is String && entry.value is String) {
+              map[entry.key as String] = entry.value as String;
+            }
+          }
+        }
+      } catch (_) {
+        // Reset malformed preferences payload.
+      }
+    }
+
+    if (manualPath == null || manualPath.isEmpty) {
+      map.remove(filePath);
+    } else {
+      map[filePath] = manualPath;
+    }
+
+    if (map.isEmpty) {
+      await prefs.remove(_manualLyricsOverridesKey);
+    } else {
+      await prefs.setString(_manualLyricsOverridesKey, jsonEncode(map));
+    }
+    _cache.remove(filePath);
+    // This runs for imported, saved, replaced and cleared manual/sidecar
+    // lyrics. Invalidate search and all LyricsService instance caches.
+    contentRevision.value++;
+  }
+
+  Future<String> _writeManagedLyricsCopy({
+    required Song song,
+    required String extension,
+    required String content,
+  }) async {
+    final documentsDirectory = await getApplicationDocumentsDirectory();
+    final lyricsDirectory = Directory(
+      '${documentsDirectory.path}${Platform.pathSeparator}$_managedLyricsDirectoryName',
+    );
+    await lyricsDirectory.create(recursive: true);
+
+    final prefs = await SharedPreferences.getInstance();
+    final matchAudioFilename =
+        prefs.getBool('lyrics_match_audio_filename') ?? false;
+
+    final String safeStem;
+    if (matchAudioFilename) {
+      final filePath = song.filePath;
+      if (filePath != null && filePath.isNotEmpty) {
+        final localPath = _resolveLocalPath(filePath);
+        if (localPath != null && localPath.isNotEmpty) {
+          safeStem = _basenameWithoutExtension(localPath);
+        } else {
+          safeStem = _safeLyricsStem(song);
+        }
+      } else {
+        safeStem = _safeLyricsStem(song);
+      }
+    } else {
+      safeStem = _safeLyricsStem(song);
+    }
+
+    final file = File(
+      '${lyricsDirectory.path}${Platform.pathSeparator}$safeStem.$extension',
+    );
+    await file.writeAsString(content);
+    return file.path;
+  }
+
+  String _preferredLyricsExtension(String fileName) {
+    final normalized = fileName.toLowerCase();
+    if (normalized.endsWith('.txt')) return 'txt';
+    if (normalized.endsWith('.xml')) return 'xml';
+    return 'lrc';
+  }
+
+  String _safeLyricsStem(Song song) {
+    final parts = [
+      if (song.artist.trim().isNotEmpty) song.artist.trim(),
+      if (song.title.trim().isNotEmpty) song.title.trim(),
+      song.id,
+    ];
+    final stem = parts.join('_');
+    return stem.replaceAll(RegExp(r'[^a-zA-Z0-9._-]+'), '_');
+  }
+}
+
+class _LoadedLyrics {
+  final String content;
+  final String? source;
+
+  const _LoadedLyrics({required this.content, this.source});
+}

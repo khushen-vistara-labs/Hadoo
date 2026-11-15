@@ -1,0 +1,57 @@
+// Build-only overlay for the locked rive_native 0.1.11 (MIT, Rive Inc.).
+// Native/Dart sources and setup are still supplied by the original package.
+// See README.md here for the upstream reference and removal conditions.
+group = 'app.rive.rive_native'
+version = '1.0'
+
+apply plugin: 'com.android.library'
+
+android {
+    namespace = 'app.rive.rive_native'
+    compileSdk = 35
+    ndkVersion = rootProject.project(':app').android.ndkVersion
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_11
+        targetCompatibility = JavaVersion.VERSION_11
+    }
+    sourceSets {
+        main.java.srcDirs += 'src/main/kotlin'
+        test.java.srcDirs += 'src/test/kotlin'
+    }
+    defaultConfig {
+        minSdk = 21
+    }
+}
+
+kotlin {
+    compilerOptions {
+        jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_11
+    }
+}
+
+// Preserve upstream setup and its explicit opt-out/prebuilt checks. Paths are
+// resolved against the original package projectDir, not this overlay directory.
+def setup = tasks.register('runRiveNativeSetup', Exec) {
+    description = 'Prepare the original Rive native libraries'
+    group = 'build'
+    onlyIf {
+        def skipByProperty = project.findProperty('rive.native.skipSetup') == 'true'
+        def hasPrebuiltLibs = !fileTree('src/main/jniLibs').matching {
+            include '**/*.so'
+        }.isEmpty()
+        !skipByProperty && !hasPrebuiltLibs
+    }
+    workingDir = rootProject.projectDir.parentFile
+    if (System.getProperty('os.name').toLowerCase().contains('windows')) {
+        commandLine 'cmd', '/C', 'dart', 'run', 'rive_native:setup', '--verbose', '-p', 'android'
+    } else {
+        commandLine 'dart', 'run', 'rive_native:setup', '--verbose', '-p', 'android'
+    }
+    ignoreExitValue = false
+}
+
+tasks.matching {
+    it.name == 'preBuild' || it.name.startsWith('externalNativeBuild')
+}.configureEach {
+    dependsOn setup
+}

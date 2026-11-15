@@ -1,25 +1,26 @@
-Hadoo
+Hadoo 2.0
 Copyright (C) 2026 Hadoo contributors.
+Hadoo original code is GPL-3.0-only; see LICENSE.
 
-Hadoo is an independent collection of branding assets, build tooling and
-configuration for local modification of a user-supplied YouTube Music APK.
-Hadoo's original source code is licensed under GPL-3.0-only; see LICENSE.
+The standalone mobile application derives from Lokal Mobile (GPL-3.0),
+commit cc87c6c7511ba2f2ad99c2aa0f783fd389164948.
+https://github.com/lokal-music/mobile
 
-Hadoo uses unmodified, separately downloaded Morphe Desktop and Morphe Patches.
-It also compiles its own Hadoo defaults add-on from the source in tools/.
-Their copyright, license terms and notices remain applicable. Verbatim upstream
-notices are preserved in third_party/morphe-desktop.NOTICE and
-third_party/morphe-patches.NOTICE. Their upstream sources are:
+The imported source includes MIT-licensed Flick and other components. Original
+notices remain in mobile/THIRD_PARTY_NOTICES.md and the bundled license files.
+Do not remove these notices when redistributing Hadoo. The native Cast SDK and
+other dependencies retain their original terms; they are not relicensed here.
+
+Hadoo modifications include application identity, original Hadoo artwork,
+JetBrains Mono (SIL OFL 1.1), terminal styling, build entry points, offline car
+browsing and native CarPlay integration. The font license is preserved in
+mobile/assets/fonts/JetBrainsMono-OFL.txt.
+
+The legacy Morphe tooling is retained separately. Its unmodified upstream
+notices remain in third_party/morphe-desktop.NOTICE and
+third_party/morphe-patches.NOTICE. Morphe is based on prior ReVanced work.
 https://github.com/MorpheApp/morphe-desktop
 https://github.com/MorpheApp/morphe-patches
 
-Morphe is based on prior ReVanced work. Original upstream author notices are
-retained by the downloaded tools and patch bundle. Hadoo is a separate project
-and does not claim authorship of those projects.
-
-The YouTube Music application, its proprietary source and service content are
-not included in or relicensed by this repository. The output of a local build
-is a modified proprietary application, not a wholly open-source application.
-
-Hadoo is not affiliated with or endorsed by Google, YouTube or Morphe.
-Third-party names and trademarks belong to their respective owners.
+Third-party trademarks and content remain their owners' property. No proprietary Google app,
+account tokens, music, signing keys or downloaded toolchains are distributed here.

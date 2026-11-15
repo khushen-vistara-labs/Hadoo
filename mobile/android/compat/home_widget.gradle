@@ -1,0 +1,38 @@
+// Build-only overlay for home_widget 0.10.0, using AGP's Kotlin compiler.
+// Original plugin sources/manifest/resources remain in their package directory.
+group = 'es.antonborri.home_widget'
+version = '1.0-SNAPSHOT'
+
+apply plugin: 'com.android.library'
+
+android {
+    namespace = 'es.antonborri.home_widget'
+    compileSdk = 35
+    sourceSets {
+        main.java.srcDirs += 'src/main/kotlin'
+    }
+    defaultConfig {
+        minSdk = 23
+    }
+    lint {
+        disable 'InvalidPackage'
+    }
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_1_8
+        targetCompatibility = JavaVersion.VERSION_1_8
+    }
+}
+
+kotlin {
+    compilerOptions {
+        jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_1_8
+    }
+}
+
+dependencies {
+    // Kotlin stdlib is supplied/aligned by AGP's built-in Kotlin integration.
+    api 'androidx.glance:glance-appwidget:1.2.0'
+    implementation 'androidx.core:core:1.13.1'
+    implementation 'androidx.work:work-runtime-ktx:2.11.2'
+    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2'
+}

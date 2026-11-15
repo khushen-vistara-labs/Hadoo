@@ -1,0 +1,98 @@
+/// Current marketing version of the app (matches the `version` field in
+/// `pubspec.yaml`). Bump in lockstep with each release.
+const String kAppVersion = '2.0.0-dev.8';
+const String kAppBuild = '2007';
+/// Human-friendly version label, e.g. `0.22.1-beta.3 (build 29)`.
+const String kAppVersionLabel = '$kAppVersion (build $kAppBuild)';
+
+/// App-wide constants for Flick Player.
+class AppConstants {
+  AppConstants._();
+
+  // Animation durations – mutable so they can be zeroed out when animations
+  // are disabled.
+  static Duration animationFast = const Duration(milliseconds: 110);
+  static Duration animationNormal = const Duration(milliseconds: 210);
+  static Duration animationSlow = const Duration(milliseconds: 360);
+  static Duration animationVerySlow = const Duration(milliseconds: 480);
+  static Duration animationDialog = const Duration(milliseconds: 260);
+
+  /// Enables or disables all app-wide animation durations.
+  static void setAnimationsEnabled(bool enabled) {
+    if (enabled) {
+      animationFast = const Duration(milliseconds: 110);
+      animationNormal = const Duration(milliseconds: 210);
+      animationSlow = const Duration(milliseconds: 360);
+      animationVerySlow = const Duration(milliseconds: 480);
+      animationDialog = const Duration(milliseconds: 260);
+    } else {
+      animationFast = Duration.zero;
+      animationNormal = Duration.zero;
+      animationSlow = Duration.zero;
+      animationVerySlow = Duration.zero;
+      animationDialog = Duration.zero;
+    }
+  }
+
+  // Spacing values
+  static const double spacingXxs = 4.0;
+  static const double spacingXs = 8.0;
+  static const double spacingSm = 12.0;
+  static const double spacingMd = 16.0;
+  static const double spacingLg = 24.0;
+  static const double spacingXl = 32.0;
+  static const double spacingXxl = 48.0;
+
+  // Border radius values
+  static const double radiusXs = 4.0;
+  static const double radiusSm = 8.0;
+  static const double radiusMd = 12.0;
+  static const double radiusLg = 16.0;
+  static const double radiusXl = 24.0;
+  static const double radiusRound = 100.0;
+
+  // Glassmorphism settings
+  static const double glassBlurSigma = 15.0;
+  static const double glassBlurSigmaLight = 10.0;
+  static const double glassBlurSigmaStrong = 20.0;
+
+  // Navigation bar
+  static const double navBarHeight = 80.0;
+  static const double navBarIconSize = 28.0;
+  static const double navBarBottomPadding = 20.0;
+
+  // Song card
+  static const double songCardArtSize = 64.0;
+  static const double songCardArtSizeLarge = 100.0;
+
+  // Responsive base sizes (scaled by Responsive utility)
+  // Icons
+  static const double iconSizeXs = 12.0;
+  static const double iconSizeSm = 16.0;
+  static const double iconSizeMd = 20.0;
+  static const double iconSizeLg = 24.0;
+  static const double iconSizeXl = 32.0;
+
+  // Font sizes
+  static const double fontSizeXs = 10.0;
+  static const double fontSizeSm = 12.0;
+  static const double fontSizeMd = 14.0;
+  static const double fontSizeLg = 16.0;
+  static const double fontSizeXl = 20.0;
+  static const double fontSizeXxl = 24.0;
+  static const double fontSizeDisplay = 32.0;
+
+  // Card dimensions
+  static const double cardWidthSm = 100.0;
+  static const double cardWidthMd = 120.0;
+  static const double cardWidthLg = 160.0;
+  static const double cardHeightSm = 120.0;
+  static const double cardHeightMd = 160.0;
+  static const double cardHeightLg = 200.0;
+
+  // Container sizes
+  static const double containerSizeSm = 40.0;
+  static const double containerSizeMd = 48.0;
+  static const double containerSizeLg = 64.0;
+  static const double containerSizeXl = 72.0;
+}

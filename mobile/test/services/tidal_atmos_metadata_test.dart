@@ -1,0 +1,66 @@
+import 'package:flick/services/tidal_atmos_metadata.dart';
+import 'package:flick/features/morneye/morneye_packages.dart';
+import 'package:flutter_test/flutter_test.dart';
+
+void main() {
+  test('finds Dolby Atmos in the catalog modes, not only the quality tier', () {
+    expect(tidalAtmosAvailable({
+      'audioQuality': 'LOW', 'audioModes': ['STEREO', 'DOLBY_ATMOS'],
+    }), isTrue);
+    expect(tidalAtmosAvailable({'audio_mode': 'DOLBY_ATMOS'}), isTrue);
+    expect(tidalAtmosAvailable({'audio_modes': 'DOLBY_ATMOS'}), isTrue);
+    expect(tidalAtmosAvailable({'audio_quality': 'DOLBY_ATMOS'}), isTrue);
+  });
+
+  test('Mornye Tidal search maps its string audio_modes to Atmos', () {
+    final track = MorneyeTrack.of({
+      'id': '123',
+      'name': 'Atmos version',
+      'artists': ['Artist'],
+      'audio_quality': 'High',
+      'audio_modes': 'DOLBY_ATMOS',
+    }, 'a-1234567890');
+    expect(track.atmosAvailable, isTrue);
+    expect(track.quality, 'High');
+
+
+  });
+
+  test('Amazon comma-separated audio modes remain explicit, not inferred from codec', () {
+    expect(tidalAtmosAvailable({'audio_modes': 'STEREO,DOLBY_ATMOS'}), isTrue);
+    expect(tidalAtmosAvailable({'audio_modes': 'STEREO; ATMOS'}), isTrue);
+    expect(tidalAtmosAvailable({'audio_modes': 'STEREO', 'audio_codec': 'ac4'}), isFalse);
+  });
+
+  test('explicit E-AC-3 JOC and AC-4 Atmos modes share the Atmos badge', () {
+    expect(tidalAtmosAvailable({'audio_modes': 'E-AC-3 JOC'}), isTrue);
+    expect(tidalAtmosAvailable({'audio_modes': 'EAC3_JOC'}), isTrue);
+    expect(tidalAtmosAvailable({'audio_modes': 'AC-4 Atmos'}), isTrue);
+    expect(tidalAtmosAvailable({'audio_modes': 'AC4_ATMOS'}), isTrue);
+    expect(tidalAtmosAvailable({'codec': 'ac4'}), isFalse);
+    expect(tidalAtmosAvailable({'audio_modes': 'E-AC-3'}), isFalse);
+    expect(tidalAtmosAvailable({'audio_modes': 'AC-4'}), isFalse);
+  });
+
+  test('explicit Amazon spatial modes select the correct codec', () {
+    expect(morneyeExplicitAtmosMode({'audio_modes': 'E_AC_3_JOC'}), 'EAC3_JOC');
+    expect(morneyeAmazonAtmosCodec({'audio_modes': 'E_AC_3_JOC'}), 'eac3-joc');
+    expect(morneyeAmazonAtmosCodec({'audio_modes': 'AC_4_ATMOS'}), 'ac4');
+    expect(morneyeExplicitAtmosMode({'audioQualities': ['HD', 'ATMOS']}), 'DOLBY_ATMOS');
+    expect(morneyeAmazonAtmosCodec({'audioQualities': ['ATMOS']}), isNull,
+        reason: 'A generic catalogue flag does not specify the codec');
+    expect(morneyeAmazonAtmosCodec({'audio_modes': 'E-AC-3'}), isNull);
+    expect(morneyeAmazonAtmosCodec({'audio_modes': 'AC-4'}), isNull);
+    expect(morneyeAmazonAtmosCodec({}), isNull);
+  });
+
+  test('lossless, hi-res and multichannel alone do not prove Atmos', () {
+    expect(tidalAtmosAvailable({
+      'audioQuality': 'HI_RES_LOSSLESS', 'audioModes': ['STEREO'],
+    }), isFalse);
+    expect(tidalAtmosAvailable({
+      'codec': 'eac3', 'channels': 6, 'audioMode': 'STEREO',
+    }), isFalse);
+    expect(tidalAtmosAvailable({}), isFalse);
+  });
+}

@@ -10,7 +10,7 @@ Describe the resulting Hadoo behavior.
 
 - [ ] `./hadoo check`
 - [ ] `./hadoo setup`
-- [ ] `./hadoo patches`
+- [ ] Relevant Android / iOS native build (or reason it could not run)
 - [ ] Device testing described, or explicitly marked as pending
 
 ## Screenshots

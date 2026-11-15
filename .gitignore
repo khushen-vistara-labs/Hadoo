@@ -6,6 +6,7 @@ __pycache__/
 .env.*
 !.env.example
 *.apk
+*.ipa
 *.apkm
 *.apks
 *.xapk
@@ -16,6 +17,26 @@ __pycache__/
 *.bks
 *.p12
 *.pfx
+*.p8
 *.pem
 *.key
+*.mobileprovision
+*.xcarchive/
 *.log
+
+# Standalone mobile build outputs and local native toolchains
+mobile/.dart_tool/
+mobile/.flutter-plugins-dependencies
+mobile/build/
+mobile/coverage/
+mobile/rust/target/
+mobile/rust_builder/target/
+mobile/**/Pods/
+mobile/**/.symlinks/
+mobile/android/local.properties
+mobile/ios/Flutter/Generated.xcconfig
+mobile/ios/Flutter/flutter_export_environment.sh
+mobile/**/ephemeral/
+
+!mobile/android/gradle/wrapper/gradle-wrapper.jar
+mobile/third_party/discord/*.zip.gpg

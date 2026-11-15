@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none">
+  <!-- Same CD hub and offset sticker silhouette as Android's Lokal notification glyph. -->
+  <circle cx="12" cy="12" r="9.5" stroke="#fff" stroke-width="1.7"/>
+  <circle cx="12" cy="12" r="3.6" stroke="#fff" stroke-width="1.5"/>
+  <circle cx="12" cy="12" r="1.9" stroke="#fff" stroke-width="1.15"/>
+  <path d="M17.6 9.2h3.6q.8 0 .8.8v4q0 .8-.8.8h-3.6q-.8 0-.8-.8v-4q0-.8.8-.8z" fill="#fff"/>
+</svg>

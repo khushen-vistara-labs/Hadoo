@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Hadoo CD placeholder when no album artwork is available. -->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item>
+        <shape android:shape="rectangle">
+            <solid android:color="#2A2A2A" />
+            <corners android:radius="12dp" />
+        </shape>
+    </item>
+    <item
+        android:gravity="center"
+        android:width="54dp"
+        android:height="54dp"
+        android:drawable="@drawable/ic_notification" />
+</layer-list>

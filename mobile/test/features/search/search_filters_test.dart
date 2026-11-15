@@ -1,0 +1,233 @@
+import 'package:flutter/foundation.dart';
+import 'package:flick/features/search/providers/search_filter_provider.dart';
+import 'package:flick/features/search/models/search_category.dart';
+import 'package:flick/features/search/widgets/search_filter_chips.dart';
+import 'package:flick/core/theme/lokal_theme.dart';
+import 'package:flick/core/theme/lokal_tokens.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+void main() {
+  test('iPhone restores the foreground Soulseek scope', () async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
+    addTearDown(() => debugDefaultTargetPlatformOverride = null);
+    SharedPreferences.setMockInitialValues({
+      'search_selected_scope_v1': 'soulseek',
+    });
+    final container = ProviderContainer();
+    addTearDown(container.dispose);
+    container.read(searchScopeProvider);
+    await Future<void>.delayed(const Duration(milliseconds: 20));
+    expect(soulseekScopeAvailable, isTrue);
+    expect(container.read(searchScopeProvider), SearchScope.soulseek);
+    container.read(searchScopeProvider.notifier).select(SearchScope.soulseek);
+    expect(container.read(searchScopeProvider), SearchScope.soulseek);
+  });
+
+  setUp(() => SharedPreferences.setMockInitialValues({}));
+  test(
+    'Search scope restores after app restart and user changes win',
+    () async {
+      SharedPreferences.setMockInitialValues({
+        'search_selected_scope_v1': SearchScope.online.name,
+      });
+      final first = ProviderContainer();
+      first.read(searchScopeProvider);
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      expect(first.read(searchScopeProvider), SearchScope.online);
+      first.read(searchScopeProvider.notifier).select(SearchScope.all);
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      final prefs = await SharedPreferences.getInstance();
+      expect(prefs.getString('search_selected_scope_v1'), 'all');
+      first.dispose();
+
+      final second = ProviderContainer();
+      addTearDown(second.dispose);
+      second.read(searchScopeProvider);
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      expect(second.read(searchScopeProvider), SearchScope.all);
+    },
+  );
+
+  test(
+    'Soulseek is a separate persisted scope, never mixed into local search',
+    () async {
+      final c = ProviderContainer();
+      addTearDown(c.dispose);
+      c.read(searchScopeProvider.notifier).select(SearchScope.soulseek);
+      expect(c.read(searchScopeProvider), SearchScope.soulseek);
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      expect(
+        (await SharedPreferences.getInstance()).getString(
+          'search_selected_scope_v1',
+        ),
+        'soulseek',
+      );
+    },
+  );
+
+  test(
+    'a category isolates immediately, and retired All maps to Songs',
+    () async {
+      final c = ProviderContainer();
+      addTearDown(c.dispose);
+      final f = c.read(searchFilterProvider.notifier);
+      expect(c.read(searchFilterProvider), {SearchCategory.songs});
+      f.toggle(SearchCategory.albums);
+      expect(c.read(searchFilterProvider), {SearchCategory.albums});
+      f.toggle(SearchCategory.albums);
+      expect(c.read(searchFilterProvider), {SearchCategory.albums});
+      await Future<void>.delayed(Duration.zero);
+      expect(c.read(searchFilterProvider), {
+        SearchCategory.albums,
+      }); // Hydration cannot undo a tap.
+      f.toggle(SearchCategory.artists);
+      expect(c.read(searchFilterProvider), {SearchCategory.artists});
+      f.select(SearchCategory.songs);
+      expect(c.read(searchFilterProvider), {SearchCategory.songs});
+    },
+  );
+  test('old exclusion mask does not restore a disabled-all dead end', () async {
+    SharedPreferences.setMockInitialValues({
+      'search_enabled_categories': <String>[],
+    });
+    final c = ProviderContainer();
+    addTearDown(c.dispose);
+    c.read(searchFilterProvider);
+    await Future<void>.delayed(Duration.zero);
+    expect(c.read(searchFilterProvider), {SearchCategory.songs});
+  });
+  test(
+    'retired categories migrate to Songs; all four filters work in both scopes',
+    () {
+      final c = ProviderContainer();
+      addTearDown(c.dispose);
+      final f = c.read(searchFilterProvider.notifier);
+      final scope = c.read(searchScopeProvider.notifier);
+      expect(visibleSearchCategories, [
+        SearchCategory.songs,
+        SearchCategory.artists,
+        SearchCategory.albums,
+        SearchCategory.lyrics,
+      ]);
+      scope.select(SearchScope.online);
+      for (final category in visibleSearchCategories) {
+        f.select(category);
+        expect(c.read(searchFilterProvider), {category});
+        expect(c.read(searchScopeProvider), SearchScope.online);
+      }
+      f.select(SearchCategory.folders);
+      expect(c.read(searchFilterProvider), {SearchCategory.songs});
+      expect(c.read(searchScopeProvider), SearchScope.online);
+      scope.select(SearchScope.library);
+      f.select(SearchCategory.albumArtists);
+      expect(c.read(searchFilterProvider), {SearchCategory.songs});
+    },
+  );
+  testWidgets(
+    'category and scope controls respond directly on a narrow phone',
+    (tester) async {
+      tester.view.physicalSize = const Size(390, 844);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      final c = ProviderContainer();
+      addTearDown(c.dispose);
+      await tester.pumpWidget(
+        UncontrolledProviderScope(
+          container: c,
+          child: MaterialApp(
+            theme: LokalTheme.build(LokalTokens.themes[LokalThemeId.dark]!),
+            home: Scaffold(
+              body: Consumer(
+                builder: (context, ref, _) {
+                  final enabled = ref.watch(searchFilterProvider);
+                  return SearchFilterChips(
+                    enabled: enabled,
+                    scope: ref.watch(searchScopeProvider),
+                    onScopeChanged: ref
+                        .read(searchScopeProvider.notifier)
+                        .select,
+                    onToggle: ref.read(searchFilterProvider.notifier).select,
+                  );
+                },
+              ),
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Albums'));
+      await tester.pumpAndSettle();
+      expect(c.read(searchFilterProvider), {SearchCategory.albums});
+      expect(
+        tester
+            .widget<ChoiceChip>(find.widgetWithText(ChoiceChip, 'Albums'))
+            .selected,
+        true,
+      );
+      expect(
+        tester
+            .widget<ChoiceChip>(find.widgetWithText(ChoiceChip, 'Songs'))
+            .selected,
+        false,
+      );
+      await tester.tap(find.text('Online'));
+      await tester.pumpAndSettle();
+      expect(c.read(searchScopeProvider), SearchScope.online);
+      expect(find.text('All'), findsOneWidget);
+      expect(find.text('Lyrics'), findsOneWidget);
+      expect(find.text('Folders'), findsNothing);
+      expect(find.text('Year'), findsNothing);
+      expect(find.text('Album Artists'), findsNothing);
+      expect(find.text('Playlists'), findsNothing);
+      expect(c.read(searchFilterProvider), {SearchCategory.albums});
+      await tester.ensureVisible(find.widgetWithText(ChoiceChip, 'Lyrics'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Lyrics'));
+      await tester.pumpAndSettle();
+      expect(c.read(searchFilterProvider), {SearchCategory.lyrics});
+      // The fourth source is also horizontally scrollable and should be
+      // reachable without changing the selected result type.
+      await tester.ensureVisible(find.text('Soulseek'));
+      await tester.pumpAndSettle();
+      final allLeftBefore = tester.getTopLeft(find.text('All')).dx;
+      await tester.tap(find.text('Soulseek'));
+      await tester.pumpAndSettle();
+      // Switching tabs cannot re-center or slide the entire source pill row.
+      expect(
+        tester.getTopLeft(find.text('All')).dx,
+        closeTo(allLeftBefore, 1.0),
+      );
+      expect(c.read(searchScopeProvider), SearchScope.soulseek);
+      expect(find.byType(ChoiceChip), findsNothing);
+      // Soulseek has no result-type chips, but its account card must not
+      // touch the scope selector: every tab reserves a 16px content gutter.
+      expect(
+        tester.getBottomLeft(find.byType(SearchFilterChips)).dy -
+            tester.getBottomLeft(find.byType(SegmentedButton<SearchScope>)).dy,
+        closeTo(16, 0.1),
+      );
+      await tester.ensureVisible(find.text('All'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('All'));
+      await tester.pumpAndSettle();
+      expect(c.read(searchScopeProvider), SearchScope.all);
+      await tester.tap(find.text('Local'));
+      await tester.pumpAndSettle();
+      expect(c.read(searchScopeProvider), SearchScope.library);
+      expect(c.read(searchFilterProvider), {SearchCategory.lyrics});
+      expect(find.widgetWithText(ChoiceChip, 'Lyrics'), findsOneWidget);
+      expect(find.text('Choose a result type'), findsNothing);
+      expect(find.text('This category searches your library'), findsNothing);
+      expect(
+        tester.getBottomLeft(find.byType(SearchFilterChips)).dy -
+            tester.getBottomLeft(find.byType(ListView)).dy,
+        closeTo(16, 0.1),
+      );
+      expect(tester.takeException(), isNull);
+    },
+  );
+}

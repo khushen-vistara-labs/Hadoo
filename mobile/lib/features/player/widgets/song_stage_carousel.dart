@@ -1,0 +1,405 @@
+import 'dart:math' as math;
+
+import 'cloud_cover_reveal.dart';
+
+import 'package:flutter/material.dart';
+import 'package:flick/widgets/lokal/lokal_toast.dart';
+import 'package:flutter/scheduler.dart' show TickerCanceled;
+import 'package:flutter/services.dart';
+import 'package:flick/models/song.dart';
+
+/// Cover stages follow the finger, then keep the incoming neighbour in place
+/// while playback commits. Controls and the artwork backdrop stay stationary.
+class SongStageCarousel extends StatefulWidget {
+  const SongStageCarousel({
+    super.key,
+    required this.currentSong,
+    required this.nextSong,
+    required this.prevSong,
+    required this.stageBuilder,
+    required this.onNext,
+    required this.onPrevious,
+    this.enabled = true,
+    this.buttonDissolve = false,
+    this.animateButtonDissolve = true,
+    this.maskOutgoingOnDissolve = false,
+    this.allowUnresolvedSwipe = false,
+    this.coverGap = 0,
+    this.onDragStateChanged,
+  });
+  final Song currentSong;
+  final Song? nextSong, prevSong;
+  final Widget Function(Song song) stageBuilder;
+  final Future<void> Function() onNext, onPrevious;
+  final bool enabled;
+
+  /// Transport buttons dissolve; horizontal drags keep the original slide.
+  final bool buttonDissolve;
+
+  /// Disabling animations makes buttons switch immediately, not slide.
+  final bool animateButtonDissolve;
+
+  /// Complementary outgoing mask for the translucent fullscreen sleeve.
+  final bool maskOutgoingOnDissolve;
+
+  /// A remote transport can skip even when the paired desktop has not yet
+  /// published its adjacent queue thumbnails. Local playback stays strict.
+  final bool allowUnresolvedSwipe;
+
+  /// Empty space between adjacent covers during a horizontal swipe.
+  /// Set to zero for full-bleed posters; boxed artwork can use a visible gap.
+  final double coverGap;
+  final ValueChanged<bool>? onDragStateChanged;
+
+  @override
+  State<SongStageCarousel> createState() => SongStageCarouselState();
+}
+
+class SongStageCarouselState extends State<SongStageCarousel>
+    with TickerProviderStateMixin {
+  late final _controller = AnimationController(vsync: this);
+  late final _dissolve =
+      AnimationController(
+        vsync: this,
+        duration: const Duration(milliseconds: 2400),
+        value: 1,
+      )..addStatusListener((status) {
+        if (status == AnimationStatus.completed && mounted) {
+          setState(() => _dissolveFrom = null);
+        }
+      });
+  Song? _dissolveFrom;
+  bool _buttonChangePending = false;
+  late Animation<double> _animation;
+  double _offset = 0;
+  bool _dragging = false, _animating = false, _committing = false;
+  late Song _current;
+  Song? _next, _previous;
+
+  @override
+  void initState() {
+    super.initState();
+    _syncSongs();
+    _controller.addListener(() {
+      if (_animating) setState(() => _offset = _animation.value);
+    });
+  }
+
+  void _syncSongs() {
+    _current = widget.currentSong;
+    _next = widget.nextSong;
+    _previous = widget.prevSong;
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (MediaQuery.disableAnimationsOf(context)) {
+      _buttonChangePending = false;
+      if (_dissolveFrom != null) {
+        _dissolve.stop();
+        _dissolveFrom = null;
+        _dissolve.value = 1;
+      }
+    }
+  }
+
+  @override
+  void didUpdateWidget(SongStageCarousel oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.currentSong.id != widget.currentSong.id) {
+      final reveal =
+          _buttonChangePending &&
+          widget.buttonDissolve &&
+          widget.animateButtonDissolve;
+      _buttonChangePending = false;
+      _controller.stop();
+      _animating = false;
+      _offset = 0;
+      _dragging = false;
+      widget.onDragStateChanged?.call(false);
+      _dissolve.stop();
+      _dissolveFrom = reveal ? _current : null;
+      _syncSongs();
+      if (reveal) {
+        // Start only once the real playback target is known. Shuffle and
+        // source-dependent next songs may differ from the queue preview.
+        _dissolve.forward(from: 0);
+      } else {
+        _dissolve.value = 1;
+      }
+    } else if (!_dragging && !_animating && !_committing && _offset == 0) {
+      // Queue notifications can arrive before the current-song notification.
+      // Never swap the visible incoming neighbour during a pending commit.
+      _syncSongs();
+    }
+    if (!widget.animateButtonDissolve && _dissolveFrom != null) {
+      _dissolve.stop();
+      _dissolveFrom = null;
+    }
+  }
+
+  double get _width => context.size?.width ?? MediaQuery.sizeOf(context).width;
+  double get _stride =>
+      _width + widget.coverGap.clamp(0.0, _width * .16).toDouble();
+
+  Future<bool> _moveTo(double target) async {
+    if (!mounted) return false;
+    if (MediaQuery.disableAnimationsOf(context)) {
+      setState(() => _offset = target);
+      return true;
+    }
+    _animating = true;
+    _animation = Tween(
+      begin: _offset,
+      end: target,
+    ).animate(CurvedAnimation(parent: _controller, curve: Curves.easeOutCubic));
+    // A short remainder settles quickly; it does not restart a full slide.
+    final distance = ((_offset - target).abs() / math.max(_width, 1)).clamp(
+      0.0,
+      1.0,
+    );
+    _controller.duration = Duration(
+      milliseconds: (180 + 160 * distance).round(),
+    );
+    try {
+      await _controller.forward(from: 0).orCancel;
+      return mounted;
+    } on TickerCanceled {
+      return false;
+    } finally {
+      _animating = false;
+    }
+  }
+
+  Future<void> animateToNext() => _buttonChange(true);
+
+  Future<void> animateToPrevious() => _buttonChange(false);
+
+  Future<void> _buttonChange(bool next) async {
+    if (_committing || _animating || _dragging || _buttonChangePending) return;
+    final change = next ? widget.onNext : widget.onPrevious;
+    if (!widget.buttonDissolve) {
+      // Classic player and cover swipes retain their existing slide motion.
+      if (!widget.enabled || (next ? _next : _previous) == null) {
+        await change();
+      } else {
+        await _commit(next);
+      }
+      return;
+    }
+
+    final animate =
+        widget.enabled &&
+        widget.animateButtonDissolve &&
+        !MediaQuery.disableAnimationsOf(context);
+    if (animate) {
+      _buttonChangePending = true;
+      // Rapid consecutive skips settle to the last incoming cover, like
+      // desktop. Audio is never held back for the visual transition.
+      _dissolve.stop();
+      if (_dissolveFrom != null) {
+        setState(() => _dissolveFrom = null);
+      }
+    }
+    try {
+      await change();
+    } catch (error) {
+      if (mounted) {
+        LokalToast.fromSnackBar(
+          context,
+          SnackBar(content: Text(error.toString())),
+        );
+      }
+    } finally {
+      // A notifier can schedule the new song's widget rebuild *after* the
+      // playback Future completes (especially with an already-buffered
+      // track). Keep the request armed through that frame; otherwise fast
+      // skips randomly fail to animate. No-op skips clear on the next frame.
+      if (_buttonChangePending) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted) _buttonChangePending = false;
+        });
+        // A no-op at the queue boundary may not trigger a player rebuild.
+        WidgetsBinding.instance.scheduleFrame();
+      }
+    }
+  }
+
+  Future<void> _commit(bool next) async {
+    if (_committing) return;
+    _committing = true;
+    final before = _current.id;
+    try {
+      if (!await _moveTo(next ? -_stride : _stride)) return;
+      HapticFeedback.selectionClick();
+      if (next) {
+        await widget.onNext();
+      } else {
+        await widget.onPrevious();
+      }
+      // Notifier callbacks schedule the parent's rebuild; the playback future
+      // can finish before didUpdateWidget receives the newly selected song.
+      // Keep the incoming stage centred until that rebuild has run.
+      if (mounted) await WidgetsBinding.instance.endOfFrame;
+      // didUpdateWidget replaces the centred incoming stage. If playback did
+      // not advance, return to the real current song rather than snapping it.
+      if (mounted && _current.id == before) await _moveTo(0);
+    } catch (error) {
+      if (mounted) {
+        await _moveTo(0);
+        if (mounted)
+          LokalToast.fromSnackBar(
+            context,
+            SnackBar(content: Text(error.toString())),
+          );
+      }
+    } finally {
+      _committing = false;
+      if (mounted && _offset == 0) setState(_syncSongs);
+    }
+  }
+
+  void _start(DragStartDetails details) {
+    if (!widget.enabled || _committing || _buttonChangePending) return;
+    if (_dissolveFrom != null) {
+      // The finger always owns the stage: cancel only the visual overlay.
+      _dissolve.stop();
+      setState(() => _dissolveFrom = null);
+    }
+    _controller.stop();
+    _animating = false;
+    _dragging = true;
+    widget.onDragStateChanged?.call(true);
+  }
+
+  void _update(DragUpdateDetails details) => _updateDelta(details.delta.dx);
+
+  // Both the inline cover gesture and the full-bleed chrome gesture use the
+  // same horizontal delta. Do not fabricate DragUpdateDetails: newer Flutter
+  // SDKs require positional fields even for synthetic gesture details.
+  void _updateDelta(double horizontalDelta) {
+    if (!_dragging || !widget.enabled) return;
+    var delta = horizontalDelta;
+    if (!widget.allowUnresolvedSwipe &&
+        ((delta < 0 && _next == null) || (delta > 0 && _previous == null))) {
+      delta *= .32 * math.exp(-_offset.abs() / math.max(_width * .6, 1));
+    }
+    setState(() => _offset = (_offset + delta).clamp(-_stride, _stride));
+  }
+
+  Future<void> _end(DragEndDetails details) =>
+      _finishDrag(details.primaryVelocity ?? 0);
+
+  Future<void> _finishDrag(double velocity) async {
+    if (!_dragging) return;
+    _dragging = false;
+    widget.onDragStateChanged?.call(false);
+    final goNext =
+        velocity <= -700 || (velocity.abs() < 700 && _offset < -_stride * .25);
+    final goPrevious =
+        velocity >= 700 || (velocity.abs() < 700 && _offset > _stride * .25);
+    if (goNext && _next != null) {
+      await _commit(true);
+    } else if (goPrevious && _previous != null) {
+      await _commit(false);
+    } else if (goNext && widget.allowUnresolvedSwipe) {
+      await widget.onNext();
+      await _moveTo(0);
+    } else if (goPrevious && widget.allowUnresolvedSwipe) {
+      await widget.onPrevious();
+      await _moveTo(0);
+    } else {
+      await _moveTo(0);
+    }
+  }
+
+  void _cancel() {
+    if (!_dragging) return;
+    _dragging = false;
+    widget.onDragStateChanged?.call(false);
+    _moveTo(0);
+  }
+
+  /// A full-bleed player renders its cover behind the control chrome. Let a
+  /// hit-testable, transparent artwork slot in that chrome forward horizontal
+  /// drag deltas to the *same* carousel, preserving the normal slide physics.
+  void startExternalDrag() => _start(DragStartDetails());
+  void updateExternalDrag(double delta) => _updateDelta(delta);
+  Future<void> endExternalDrag(double velocity) => _finishDrag(velocity);
+  void cancelExternalDrag() => _cancel();
+
+  @override
+  void dispose() {
+    _dissolve.dispose();
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => LayoutBuilder(
+    builder: (context, constraints) {
+      final width = constraints.maxWidth;
+      if (width <= 0) return const SizedBox.shrink();
+      final stride = width + widget.coverGap.clamp(0.0, width * .16).toDouble();
+      Widget stage(Song song, double offset, String slot) {
+        final repeated =
+            [
+              _previous,
+              _next,
+              _current,
+            ].where((item) => item?.id == song.id).length >
+            1;
+        return Transform.translate(
+          // A neighbour keeps its decoded image when it becomes the centre.
+          // Slot suffixes also allow queues containing the same song twice.
+          key: ValueKey((song.id, repeated ? slot : null)),
+          offset: Offset(offset, 0),
+          child: RepaintBoundary(child: widget.stageBuilder(song)),
+        );
+      }
+
+      return ClipRect(
+        child: GestureDetector(
+          behavior: HitTestBehavior.translucent,
+          onHorizontalDragStart: _start,
+          onHorizontalDragUpdate: _update,
+          onHorizontalDragEnd: _end,
+          onHorizontalDragCancel: _cancel,
+          child: Stack(
+            fit: StackFit.expand,
+            children: [
+              if (_dissolveFrom case final oldSong?)
+                // On fullscreen still covers the banner's lower edge is
+                // intentionally transparent. Without an inverse mask the old
+                // banner bleeds through it and disappears in a hard rectangle
+                // only at the very end of the transport animation.
+                widget.maskOutgoingOnDissolve
+                    ? CloudCoverReveal(
+                        progress: _dissolve,
+                        seed: _current.id.hashCode,
+                        inverted: true,
+                        blur: false,
+                        child: stage(oldSong, 0, 'outgoing'),
+                      )
+                    : stage(oldSong, 0, 'outgoing')
+              else ...[
+                if (_previous != null)
+                  stage(_previous!, -stride + _offset, 'previous'),
+                if (_next != null) stage(_next!, stride + _offset, 'next'),
+              ],
+              if (_dissolveFrom != null)
+                CloudCoverReveal(
+                  progress: _dissolve,
+                  seed: _current.id.hashCode,
+                  child: stage(_current, 0, 'incoming'),
+                )
+              else
+                stage(_current, _offset, 'current'),
+            ],
+          ),
+        ),
+      );
+    },
+  );
+}

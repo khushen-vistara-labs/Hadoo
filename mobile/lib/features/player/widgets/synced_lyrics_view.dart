@@ -1,0 +1,829 @@
+import 'animated_lyric_subline.dart';
+import 'lyrics_focus_timing.dart';
+import 'player_lyric_style.dart';
+
+import 'dart:async';
+
+import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart' show ScrollCacheExtent, ScrollDirection;
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+import 'package:flick/core/theme/app_theme.dart';
+import 'package:flick/features/player/widgets/album_color_helpers.dart';
+import 'package:flick/features/player/widgets/karaoke_lyric_line.dart';
+import 'package:flick/features/player/widgets/lyrics_alignment.dart';
+import 'package:flick/providers/app_preferences_provider.dart';
+import 'package:flick/services/lyrics_service.dart';
+import 'package:flick/services/player_service.dart';
+
+/// Active background vocals may continue after a newer lead starts. Keep
+/// their independent word windows visible with the current lead, instead of
+/// making the background singer disappear when the parent row loses focus.
+List<int> overlappingBackgroundVocalIndices(
+  LyricsData lyrics,
+  Duration position,
+  int focusedIndex,
+) {
+  final active = <int>[];
+  for (var i = 0; i < lyrics.lines.length; i++) {
+    if (i == focusedIndex) continue;
+    final voice = lyrics.lines[i];
+    final words = voice.backgroundWords;
+    if (words == null || words.isEmpty) continue;
+    if (words.any((word) => word.start <= position && position < word.end)) {
+      active.add(i);
+    }
+  }
+  return active;
+}
+
+/// A standalone backing voice is not a separate lead row in scrolling lyrics.
+List<int> visibleLeadLyricIndices(LyricsData lyrics) {
+  final lead = [
+    for (var i = 0; i < lyrics.lines.length; i++)
+      if (lyrics.lines[i].voice != 'bg') i,
+  ];
+  return lead.isNotEmpty
+      ? lead
+      : List<int>.generate(lyrics.lines.length, (i) => i);
+}
+
+/// The index here refers to the visible rows, not the backing-only source rows.
+int focusedVisibleLyricIndex(LyricsData lyrics, Duration position) {
+  final visible = visibleLeadLyricIndices(lyrics);
+  final leads = [for (final i in visible) lyrics.lines[i]];
+  return focusedLeadUntilVocalsFinish(leads, position);
+}
+
+class ActiveSupportingVocal {
+  final int lineIndex;
+  final bool standalone;
+  const ActiveSupportingVocal(this.lineIndex, this.standalone);
+}
+
+/// Attach any concurrent background singer visually to the *current* lead,
+/// including a singer whose original parent lead has already scrolled away.
+List<ActiveSupportingVocal> activeSupportingVocals(
+  LyricsData lyrics,
+  Duration position,
+  int focusedLineIndex,
+) {
+  if (focusedLineIndex < 0) return const [];
+  final hasLead = lyrics.lines.any((l) => l.voice != 'bg');
+  final found = <ActiveSupportingVocal>[];
+  for (var i = 0; i < lyrics.lines.length; i++) {
+    final line = lyrics.lines[i];
+    final standalone = line.voice == 'bg';
+    if (standalone && !hasLead) continue;
+    final text = standalone ? line.text : line.backgroundText;
+    if (text?.trim().isNotEmpty != true) continue;
+    final words = standalone ? line.words : line.backgroundWords;
+    if (words == null || words.isEmpty) {
+      if (!standalone && i == focusedLineIndex) {
+        found.add(ActiveSupportingVocal(i, false));
+      }
+      continue;
+    }
+    final start = words.first.start;
+    var end = words.last.end;
+    if (end <= words.last.start) {
+      end = words.last.start + const Duration(milliseconds: 500);
+    }
+    if (position >= start && position < end) {
+      found.add(ActiveSupportingVocal(i, standalone));
+    }
+  }
+  return found;
+}
+
+/// Synced lyrics list with a fixed focus anchor: the active line pins at
+/// [_anchorFraction] of the viewport height, per-line geometry comes from a
+/// measured-height registry (TextPainter estimates until real sizes arrive),
+/// and animations are single-flight — a new target simply interrupts the
+/// previous animateTo.
+///
+/// User drags suspend auto-following; it resumes after [_followResumeMs] of
+/// idle, or immediately on a tap-to-seek or external seek.
+class SyncedLyricsView extends ConsumerStatefulWidget {
+  final PlayerService playerService;
+  final LyricsService lyricsService;
+  final LyricsData lyrics;
+  final Color? albumColor;
+
+  /// Playback clock to follow. Defaults to the player's own position, but
+  /// carousel peek stages pass a static source so only the playing song's
+  /// lyrics run.
+  final ValueNotifier<Duration>? positionNotifier;
+
+  /// Remote transports can seek without touching the Android audio engine.
+  final Future<void> Function(Duration)? onSeek;
+  final ValueNotifier<bool>? playingNotifier;
+
+  /// False for peek stages: renders statically without following playback.
+  final bool active;
+  final bool fullPlayerTypography;
+
+  const SyncedLyricsView({
+    super.key,
+    required this.playerService,
+    required this.lyricsService,
+    required this.lyrics,
+    this.albumColor,
+    this.positionNotifier,
+    this.onSeek,
+    this.playingNotifier,
+    this.active = true,
+    this.fullPlayerTypography = false,
+  });
+
+  @override
+  ConsumerState<SyncedLyricsView> createState() => _SyncedLyricsViewState();
+}
+
+class _SyncedLyricsViewState extends ConsumerState<SyncedLyricsView> {
+  static const double _anchorFraction = 0.32;
+  static const int _followResumeMs = 3200;
+  static const int _seekBackThresholdMs = 1200;
+  static const int _seekForwardThresholdMs = 3000;
+  static const double _measureEpsilonPx = 0.5;
+  static const double _correctionMinDeltaPx = 6;
+
+  final ScrollController _scrollController = ScrollController();
+
+  List<int> _visibleLineIndices = const [];
+  List<double> _inactiveEstimates = const [];
+  List<double> _activeEstimates = const [];
+  List<double?> _measuredHeights = const [];
+  List<double> _lineTops = const [];
+  double? _estimatesForWidth;
+  LyricsData? _estimatesForLyrics;
+  Object? _estimatesEnvironment;
+
+  int _activeLineIndex = -1;
+  Duration _lastTickPosition = Duration.zero;
+  bool _following = true;
+  Timer? _followResumeTimer;
+  bool _needsInitialJump = true;
+
+  ValueNotifier<Duration> get _positionNotifier =>
+      widget.positionNotifier ?? widget.playerService.positionNotifier;
+
+  @override
+  void initState() {
+    super.initState();
+    _positionNotifier.addListener(_onPositionChanged);
+  }
+
+  @override
+  void didUpdateWidget(covariant SyncedLyricsView oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    final oldNotifier =
+        oldWidget.positionNotifier ?? oldWidget.playerService.positionNotifier;
+    if (!identical(oldNotifier, _positionNotifier)) {
+      oldNotifier.removeListener(_onPositionChanged);
+      _positionNotifier.addListener(_onPositionChanged);
+    }
+    if (oldWidget.fullPlayerTypography != widget.fullPlayerTypography) {
+      _estimatesForWidth = null;
+    }
+    if (!identical(oldWidget.lyrics, widget.lyrics)) {
+      _estimatesForWidth = null;
+      final oldLines = oldWidget.lyrics.lines, newLines = widget.lyrics.lines;
+      if (oldLines.length != newLines.length ||
+          Iterable<int>.generate(newLines.length).any(
+            (i) =>
+                oldLines[i].timestamp != newLines[i].timestamp ||
+                oldLines[i].text != newLines[i].text,
+          )) {
+        _needsInitialJump = true;
+      }
+    }
+    if (oldWidget.active != widget.active && widget.active) {
+      _needsInitialJump = true;
+    }
+  }
+
+  @override
+  void dispose() {
+    _followResumeTimer?.cancel();
+    _positionNotifier.removeListener(_onPositionChanged);
+    _scrollController.dispose();
+    super.dispose();
+  }
+
+  void _onPositionChanged() {
+    if (!widget.active) return;
+    final position = _positionNotifier.value;
+    final deltaMs = position.inMilliseconds - _lastTickPosition.inMilliseconds;
+    _lastTickPosition = position;
+    final isSeekBack = deltaMs <= -_seekBackThresholdMs;
+    final isSeek = isSeekBack || deltaMs >= _seekForwardThresholdMs;
+
+    final newIndex = focusedVisibleLyricIndex(widget.lyrics, position);
+    if (newIndex == _activeLineIndex) {
+      if (isSeek) _resumeFollow();
+      return;
+    }
+
+    // Transient position dips from the audio engine must not scroll back.
+    if (newIndex < _activeLineIndex && !isSeekBack) return;
+
+    _setActiveIndex(newIndex);
+    if (isSeek) _resumeFollow(animateNow: false);
+    if (_following) {
+      _animateToActiveLine(immediate: isSeek);
+    }
+  }
+
+  void _syncToPosition() {
+    final position = _positionNotifier.value;
+    _lastTickPosition = position;
+    final newIndex = focusedVisibleLyricIndex(widget.lyrics, position);
+    if (newIndex != _activeLineIndex) {
+      _setActiveIndex(newIndex);
+    }
+    _jumpToActiveLine();
+  }
+
+  Future<void> _seekToLine(int index) async {
+    if (index < 0 || index >= _visibleLineIndices.length) return;
+    final target = widget.lyrics.lines[_visibleLineIndices[index]].timestamp;
+    if (widget.onSeek == null) {
+      widget.playerService.positionNotifier.value = target;
+    } else {
+      _positionNotifier.value = target;
+    }
+    _lastTickPosition = target;
+    _resumeFollow(animateNow: false);
+    _setActiveIndex(index);
+    _animateToActiveLine();
+    if (widget.onSeek != null) {
+      await widget.onSeek!(target);
+    } else {
+      await widget.playerService.seek(target);
+    }
+  }
+
+  // --- geometry ---------------------------------------------------------
+
+  void _ensureEstimates(double listWidth, bool karaokeEnabled) {
+    final environment = Object.hash(
+      MediaQuery.textScalerOf(context),
+      Directionality.of(context),
+      widget.fullPlayerTypography,
+      karaokeEnabled,
+    );
+    if (_estimatesForWidth == listWidth &&
+        _estimatesEnvironment == environment &&
+        identical(_estimatesForLyrics, widget.lyrics)) {
+      return;
+    }
+    _visibleLineIndices = visibleLeadLyricIndices(widget.lyrics);
+    final lines = [
+      for (final index in _visibleLineIndices) widget.lyrics.lines[index],
+    ];
+    final textWidth = listWidth - 44 > 24 ? listWidth - 44 : 24.0;
+    final inactive = <double>[];
+    final active = <double>[];
+    for (final line in lines) {
+      final background = line.backgroundText;
+      final bgHeight = background == null || background.isEmpty
+          ? 0.0
+          : 6 + _estimateTextHeight(background, 15, 1.3, 2, textWidth);
+      // Background vocals occupy space only while actually singing beneath
+      // the active line. Do not leave an empty subline under inactive rows.
+      inactive.add(32 + _estimateTextHeight(line.text, 17, 1.24, 2, textWidth));
+      active.add(
+        28 +
+            _estimateTextHeight(line.text, 22, 1.18, 3, textWidth) +
+            // LyricMotionLine reserves eight pixels for the syllable lift.
+            (karaokeEnabled && line.words?.isNotEmpty == true ? 8 : 0) +
+            bgHeight,
+      );
+    }
+    _inactiveEstimates = inactive;
+    _activeEstimates = active;
+    _measuredHeights = List<double?>.filled(lines.length, null);
+    _lineTops = List<double>.filled(lines.length, 0);
+    _estimatesForWidth = listWidth;
+    _estimatesForLyrics = widget.lyrics;
+    _estimatesEnvironment = environment;
+    _recomputeTops();
+  }
+
+  double _estimateTextHeight(
+    String text,
+    double fontSize,
+    double heightFactor,
+    int maxLines,
+    double maxWidth,
+  ) {
+    final painter = TextPainter(
+      text: TextSpan(
+        text: text,
+        style: widget.fullPlayerTypography && (fontSize == 22 || fontSize == 17)
+            ? _textStyle(maxLines == 3, 1)
+            : TextStyle(
+                fontFamily: 'HadooMono',
+                fontFamilyFallback: AppTheme.fontFamilyFallback,
+                fontSize: fontSize,
+                height: heightFactor,
+                fontWeight: maxLines == 3 ? FontWeight.w700 : FontWeight.w500,
+              ),
+      ),
+      textDirection: Directionality.of(context),
+      textScaler: MediaQuery.textScalerOf(context),
+      maxLines: widget.fullPlayerTypography ? null : maxLines,
+    );
+    painter.layout(maxWidth: maxWidth);
+    final height = painter.height;
+    painter.dispose();
+    return height;
+  }
+
+  double _heightOf(int index) {
+    final measured = index < _measuredHeights.length
+        ? _measuredHeights[index]
+        : null;
+    if (measured != null) return measured;
+    return index == _activeLineIndex
+        ? _activeEstimates[index]
+        : _inactiveEstimates[index];
+  }
+
+  void _recomputeTops() {
+    final count = _visibleLineIndices.length;
+    if (_lineTops.length != count) {
+      _lineTops = List<double>.filled(count, 0);
+    }
+    var top = 0.0;
+    for (var i = 0; i < count; i++) {
+      _lineTops[i] = top;
+      top += _heightOf(i);
+    }
+  }
+
+  void _onLineMeasured(int index, double height) {
+    if (index >= _measuredHeights.length) return;
+    final current = _heightOf(index);
+    if ((current - height).abs() <= _measureEpsilonPx) {
+      _measuredHeights[index] = height;
+      return;
+    }
+    _measuredHeights[index] = height;
+    _recomputeTops();
+    if (_following && _scrollController.hasClients) {
+      final target = _targetFor(_activeLineIndex);
+      if (target != null &&
+          (target - _scrollController.offset).abs() > _correctionMinDeltaPx) {
+        _animateToActiveLine();
+      }
+    }
+  }
+
+  void _setActiveIndex(int index) {
+    if (index == _activeLineIndex) return;
+    if (_activeLineIndex >= 0 && _activeLineIndex < _measuredHeights.length) {
+      _measuredHeights[_activeLineIndex] = null;
+    }
+    _activeLineIndex = index;
+    if (index >= 0 && index < _measuredHeights.length) {
+      _measuredHeights[index] = null;
+    }
+    _recomputeTops();
+    setState(() {});
+  }
+
+  // --- scrolling --------------------------------------------------------
+
+  double? _targetFor(int index) {
+    if (!_scrollController.hasClients) return null;
+    final position = _scrollController.position;
+    final viewport = position.viewportDimension;
+    final anchorPx = viewport * _anchorFraction;
+    if (index < 0) return 0.0;
+    if (index >= _lineTops.length) return null;
+    final center =
+        viewport * _anchorFraction + _lineTops[index] + _heightOf(index) / 2;
+    return (center - anchorPx).clamp(0.0, position.maxScrollExtent);
+  }
+
+  void _animateToActiveLine({bool immediate = false}) {
+    if (!_scrollController.hasClients) return;
+    final target = _targetFor(_activeLineIndex);
+    if (target == null) return;
+    final distance = (target - _scrollController.offset).abs();
+    final durationMs = immediate
+        ? 350
+        : (250 + distance * 0.6).clamp(250, 600).round();
+    _scrollController
+        .animateTo(
+          target,
+          duration: Duration(milliseconds: durationMs),
+          curve: Curves.easeOutCubic,
+        )
+        .catchError((_) {});
+  }
+
+  void _jumpToActiveLine() {
+    if (!_scrollController.hasClients) return;
+    final target = _targetFor(_activeLineIndex);
+    if (target == null) return;
+    _scrollController.jumpTo(target);
+  }
+
+  void _suspendFollow() {
+    _followResumeTimer?.cancel();
+    _followResumeTimer = Timer(
+      const Duration(milliseconds: _followResumeMs),
+      () {
+        if (!mounted) return;
+        _following = true;
+        _animateToActiveLine();
+      },
+    );
+    _following = false;
+  }
+
+  void _resumeFollow({bool animateNow = true}) {
+    _followResumeTimer?.cancel();
+    _following = true;
+    if (animateNow) _animateToActiveLine();
+  }
+
+  bool _onScrollNotification(ScrollNotification notification) {
+    final userDragging =
+        (notification is ScrollStartNotification &&
+            notification.dragDetails != null) ||
+        (notification is ScrollUpdateNotification &&
+            notification.dragDetails != null) ||
+        (notification is UserScrollNotification &&
+            notification.direction != ScrollDirection.idle);
+    if (userDragging) _suspendFollow();
+    return false;
+  }
+
+  // --- rendering --------------------------------------------------------
+
+  double _opacityForIndex(int index) {
+    if (_activeLineIndex < 0) return 0.72;
+    final distance = (index - _activeLineIndex).abs();
+    switch (distance) {
+      case 0:
+        return 1;
+      case 1:
+        return 0.56;
+      case 2:
+        return 0.36;
+      case 3:
+        return 0.24;
+      default:
+        return 0.18;
+    }
+  }
+
+  TextStyle _textStyle(bool isActive, double opacity) {
+    if (widget.fullPlayerTypography) {
+      return playerLyricStyle.copyWith(
+        fontSize: isActive ? 31 : 28,
+        color: Colors.white.withValues(alpha: opacity),
+      );
+    }
+    return TextStyle(
+      fontFamily: 'HadooMono',
+      fontSize: isActive ? 22 : 17,
+      height: isActive ? 1.18 : 1.24,
+      fontWeight: isActive ? FontWeight.w700 : FontWeight.w500,
+      color: Colors.white.withValues(alpha: opacity),
+    );
+  }
+
+  StrutStyle _strutStyle(bool isActive) {
+    if (widget.fullPlayerTypography) {
+      return StrutStyle.fromTextStyle(_textStyle(isActive, 1));
+    }
+    return StrutStyle(
+      fontFamily: 'HadooMono',
+      fontSize: isActive ? 22 : 17,
+      height: isActive ? 1.18 : 1.24,
+      forceStrutHeight: true,
+    );
+  }
+
+  Color get _sungColor {
+    final albumColor = widget.albumColor;
+    if (albumColor != null) {
+      return albumAccent(albumColor, 0.7, lightness: 0.88);
+    }
+    return Colors.white;
+  }
+
+  Widget _buildLine(
+    BuildContext context,
+    int index,
+    LyricsAlignment alignment, {
+    required bool karaokeEnabled,
+  }) {
+    final lyricIndex = _visibleLineIndices[index];
+    final line = widget.lyrics.lines[lyricIndex];
+    final isActive = index == _activeLineIndex;
+    final isSupportingVoice = line.voice == 'bg';
+
+    final content = isActive && karaokeEnabled
+        ? Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            child: KaraokeLyricLine(
+              playerService: widget.playerService,
+              lyricsService: widget.lyricsService,
+              lyrics: widget.lyrics,
+              lineIndex: lyricIndex,
+              textAlign: alignment.textAlign,
+              style: isSupportingVoice
+                  ? _textStyle(
+                      true,
+                      1,
+                    ).copyWith(fontSize: 16, fontStyle: FontStyle.italic)
+                  : _textStyle(true, 1),
+              sungColor: isSupportingVoice
+                  ? _sungColor.withValues(alpha: .83)
+                  : _sungColor,
+              unsungColor: Colors.white.withValues(alpha: 0.30),
+              positionNotifier: _positionNotifier,
+              playingNotifier: widget.playingNotifier,
+              active: widget.active,
+            ),
+          )
+        : Padding(
+            padding: EdgeInsets.symmetric(
+              horizontal: 12,
+              vertical: isActive ? 8 : 10,
+            ),
+            child: Text(
+              line.text,
+              maxLines: widget.fullPlayerTypography ? null : 2,
+              overflow: TextOverflow.fade,
+              textAlign: alignment.textAlign,
+              style:
+                  _textStyle(
+                    isActive,
+                    isActive ? 1 : _opacityForIndex(index),
+                  ).copyWith(
+                    fontSize: isSupportingVoice ? 16 : null,
+                    fontStyle: isSupportingVoice ? FontStyle.italic : null,
+                  ),
+              strutStyle: _strutStyle(isActive),
+            ),
+          );
+
+    return _MeasuredLine(
+      index: index,
+      onMeasured: _onLineMeasured,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 6),
+        child: Material(
+          color: Colors.transparent,
+          child: InkWell(
+            borderRadius: BorderRadius.circular(22),
+            onTap: () => unawaited(_seekToLine(index)),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                content,
+                // The backing singer sits immediately below the playing
+                // lead, never in a separate large lyric row.
+                ValueListenableBuilder<Duration>(
+                  valueListenable: _positionNotifier,
+                  builder: (context, position, _) {
+                    final backing = isActive && widget.active
+                        ? activeSupportingVocals(
+                            widget.lyrics,
+                            position,
+                            lyricIndex,
+                          )
+                        : const <ActiveSupportingVocal>[];
+                    final reduceMotion = MediaQuery.disableAnimationsOf(
+                      context,
+                    );
+                    return lyricSizeTransition(
+                      context,
+                      duration: const Duration(milliseconds: 340),
+                      child: AnimatedSwitcher(
+                        duration: reduceMotion
+                            ? Duration.zero
+                            : const Duration(milliseconds: 300),
+                        switchInCurve: Curves.easeOutCubic,
+                        switchOutCurve: Curves.easeInCubic,
+                        transitionBuilder: (child, animation) => FadeTransition(
+                          opacity: animation,
+                          child: SlideTransition(
+                            position: Tween<Offset>(
+                              begin: const Offset(0, .14),
+                              end: Offset.zero,
+                            ).animate(animation),
+                            child: child,
+                          ),
+                        ),
+                        child: backing.isEmpty
+                            ? const SizedBox(
+                                key: ValueKey('no-active-bg'),
+                                width: double.infinity,
+                              )
+                            : Column(
+                                key: ValueKey(
+                                  backing
+                                      .map(
+                                        (voice) =>
+                                            voice.lineIndex.toString() +
+                                            ':' +
+                                            voice.standalone.toString(),
+                                      )
+                                      .join('|'),
+                                ),
+                                crossAxisAlignment: CrossAxisAlignment.stretch,
+                                children: [
+                                  for (final voice in backing)
+                                    Padding(
+                                      key: ValueKey(
+                                        'active-bg-${voice.lineIndex}-${voice.standalone}',
+                                      ),
+                                      padding: const EdgeInsets.only(
+                                        left: 12,
+                                        right: 12,
+                                        top: 2,
+                                        bottom: 5,
+                                      ),
+                                      child: karaokeEnabled
+                                          ? KaraokeLyricLine(
+                                              playerService:
+                                                  widget.playerService,
+                                              lyricsService:
+                                                  widget.lyricsService,
+                                              lyrics: widget.lyrics,
+                                              lineIndex: voice.lineIndex,
+                                              backgroundVoice:
+                                                  !voice.standalone,
+                                              textAlign: alignment.textAlign,
+                                              style: const TextStyle(
+                                                fontFamily: 'HadooMono',
+                                                fontSize: 16,
+                                                height: 1.25,
+                                                fontWeight: FontWeight.w600,
+                                              ),
+                                              sungColor: _sungColor.withValues(
+                                                alpha: .84,
+                                              ),
+                                              unsungColor: Colors.white
+                                                  .withValues(alpha: .38),
+                                              positionNotifier:
+                                                  _positionNotifier,
+                                              playingNotifier:
+                                                  widget.playingNotifier,
+                                              active: widget.active,
+                                            )
+                                          : Text(
+                                              voice.standalone
+                                                  ? widget
+                                                        .lyrics
+                                                        .lines[voice.lineIndex]
+                                                        .text
+                                                  : widget
+                                                            .lyrics
+                                                            .lines[voice
+                                                                .lineIndex]
+                                                            .backgroundText ??
+                                                        '',
+                                              textAlign: alignment.textAlign,
+                                              style: TextStyle(
+                                                fontFamily: 'HadooMono',
+                                                fontSize: 16,
+                                                height: 1.25,
+                                                fontWeight: FontWeight.w600,
+                                                color: Colors.white.withValues(
+                                                  alpha: .78,
+                                                ),
+                                              ),
+                                            ),
+                                    ),
+                                ],
+                              ),
+                      ),
+                    );
+                  },
+                ),
+                AnimatedLyricSubline(
+                  text: line.translation,
+                  textAlign: alignment.textAlign,
+                  style: TextStyle(
+                    fontSize: 15,
+                    height: 1.3,
+                    color: Colors.white.withValues(alpha: isActive ? .72 : .35),
+                  ),
+                  motionChild:
+                      isActive &&
+                          karaokeEnabled &&
+                          line.words?.isNotEmpty == true &&
+                          line.translation?.trim().isNotEmpty == true
+                      ? KaraokeLyricLine(
+                          playerService: widget.playerService,
+                          lyricsService: widget.lyricsService,
+                          lyrics: widget.lyrics,
+                          lineIndex: lyricIndex,
+                          sublineText: line.translation,
+                          textAlign: alignment.textAlign,
+                          style: const TextStyle(fontSize: 15, height: 1.3),
+                          sungColor: _sungColor.withValues(alpha: .86),
+                          unsungColor: Colors.white.withValues(alpha: .35),
+                          positionNotifier: _positionNotifier,
+                          playingNotifier: widget.playingNotifier,
+                          active: widget.active,
+                        )
+                      : null,
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final alignment = resolveLyricsAlignment(
+      ref.watch(appPreferencesProvider).lyricsTextAlign,
+    );
+    final karaokeEnabled = ref.watch(appPreferencesProvider).karaokeEnabled;
+
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        _ensureEstimates(constraints.maxWidth, karaokeEnabled);
+        if (_needsInitialJump) {
+          _needsInitialJump = false;
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (mounted) _syncToPosition();
+          });
+        }
+
+        final anchorPx = constraints.maxHeight * _anchorFraction;
+        return NotificationListener<ScrollNotification>(
+          onNotification: _onScrollNotification,
+          child: ListView.builder(
+            controller: _scrollController,
+            scrollCacheExtent: ScrollCacheExtent.pixels(900),
+            padding: EdgeInsets.only(
+              top: anchorPx,
+              bottom: constraints.maxHeight - anchorPx,
+              left: 10,
+              right: 10,
+            ),
+            itemCount: _visibleLineIndices.length,
+            itemBuilder: (context, index) => _buildLine(
+              context,
+              index,
+              alignment,
+              karaokeEnabled: karaokeEnabled,
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+/// Reports its rendered height after each frame so the parent can keep its
+/// line geometry registry in sync with reality.
+class _MeasuredLine extends StatefulWidget {
+  final int index;
+  final void Function(int index, double height) onMeasured;
+  final Widget child;
+
+  const _MeasuredLine({
+    required this.index,
+    required this.onMeasured,
+    required this.child,
+  });
+
+  @override
+  State<_MeasuredLine> createState() => _MeasuredLineState();
+}
+
+class _MeasuredLineState extends State<_MeasuredLine> {
+  double? _reported;
+
+  @override
+  Widget build(BuildContext context) {
+    WidgetsBinding.instance.addPostFrameCallback((_) => _report());
+    return widget.child;
+  }
+
+  void _report() {
+    if (!mounted) return;
+    final size = context.size;
+    if (size == null) return;
+    if (_reported != null && (_reported! - size.height).abs() <= 0.5) {
+      return;
+    }
+    _reported = size.height;
+    widget.onMeasured(widget.index, size.height);
+  }
+}

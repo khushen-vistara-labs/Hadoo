@@ -1,0 +1,16 @@
+{
+  "schema": 1,
+  "base": {
+    "repository": "https://github.com/lokal-music/mobile",
+    "commit": "cc87c6c7511ba2f2ad99c2aa0f783fd389164948",
+    "license": "GPL-3.0",
+    "imported_at": "2026-11-14",
+    "directory": "mobile"
+  },
+  "reference": {
+    "repository": "https://github.com/Yigder/Prism",
+    "commit": "be2035a76c4690724e35bc1a98e6bc62ab8e82c1",
+    "license": "GPL-3.0",
+    "role": "Feature and architecture reference; Kotlin source is not merged into the Flutter runtime."
+  }
+}

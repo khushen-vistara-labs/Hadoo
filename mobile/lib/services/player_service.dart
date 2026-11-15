@@ -1,0 +1,9969 @@
+import 'package:flick/services/ios_local_audio_requests.dart';
+import 'package:flick/services/local_audio_lifecycle.dart';
+import 'package:flick/services/ios_local_audio_players.dart';
+import 'package:flick/features/discovery/discovery_models.dart';
+import 'package:flick/features/discovery/discovery_progressive_streams.dart';
+import 'package:flick/features/morneye/morneye_live_playback.dart';
+import 'package:flick/features/konnekted/library/replayable_stream_songs.dart';
+import 'package:flick/services/online_radio_recommendations.dart';
+import 'package:flick/services/automix_analysis_cache.dart';
+import 'package:flick/services/automix_stem_clip.dart';
+
+import 'link/link_journal.dart';
+
+import 'dart:async';
+import 'dart:io';
+import 'dart:math' as math;
+
+import 'package:audio_session/audio_session.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
+import 'package:just_audio/just_audio.dart' as just_audio;
+import 'package:flick/models/advance_list_order.dart';
+import 'package:flick/models/audio_engine_type.dart';
+import 'package:flick/models/audio_output_diagnostics.dart';
+import 'package:flick/models/playback_context.dart';
+import 'package:flick/models/playback_state.dart';
+import 'package:flick/models/shuffle_mode.dart';
+import 'package:flick/models/song.dart';
+import 'package:flick/services/atmos_diagnostics.dart';
+import 'package:flick/src/rust/api/audio_api.dart' as rust_audio;
+import 'package:flick/services/notification_service.dart';
+import 'package:flick/services/floating_player_service.dart';
+import 'package:flick/services/android_audio_device_service.dart';
+import 'package:flick/services/bluetooth_service.dart';
+import 'package:flick/services/audio_engine_manager.dart';
+import 'package:flick/services/audio_session_manager.dart';
+import 'package:flick/services/song_engine_routing.dart';
+import 'package:flick/services/equalizer_service.dart';
+import 'package:flick/services/eq_engine_hint.dart';
+import 'package:flick/services/android_audio_processing_service.dart';
+import 'package:flick/services/last_played_service.dart';
+import 'package:flick/services/favorites_service.dart';
+import 'package:flick/services/replaygain_service.dart';
+import 'package:flick/data/repositories/recently_played_repository.dart';
+import 'package:flick/data/repositories/song_repository.dart';
+import 'package:flick/services/playlist_service.dart';
+import 'package:flick/services/replay_play_tracker.dart';
+import 'package:flick/services/milestone_service.dart';
+import 'package:flick/services/android_audio_engine.dart';
+import 'package:flick/services/rust_audio_engine.dart';
+import 'package:flick/services/rust_audio_service.dart';
+import 'package:flick/services/app_preferences_service.dart';
+import 'package:flick/services/lyrics_playback_prefetch.dart';
+import 'package:flick/services/uac2_preferences_service.dart';
+import 'package:flick/services/color_extraction_service.dart';
+import 'package:flick/services/album_color_mode_preference_service.dart';
+import 'package:flick/models/album_color_mode.dart';
+import 'package:flick/services/uac2_service.dart';
+import 'package:flick/services/alac_converter_service.dart';
+import 'package:flick/services/playback_cache_preferences_service.dart';
+import 'package:flick/services/remote_source_service.dart';
+import 'package:flick/services/wav_stream_audio_source.dart';
+import 'package:flick/services/casting/casting_service.dart';
+import 'package:flick/services/playback_output_transition.dart';
+import 'package:flick/services/external_playback_owner.dart';
+import 'package:flick/core/utils/app_log.dart';
+import 'package:flick/core/utils/dev_log.dart';
+
+/// Standard Previous-button behavior across the full and mini players.
+/// At ten seconds or later restart the active song; earlier presses select
+/// the previous queue entry. Artwork swipes always navigate between tracks.
+const Duration previousButtonRestartThreshold = Duration(seconds: 10);
+
+@visibleForTesting
+bool shouldRestartCurrentTrackOnPrevious(Duration position) =>
+    position >= previousButtonRestartThreshold;
+
+/// A failed libusb submit can be a transient host-controller error during
+/// a PCM format transition. It is not equivalent to a physically unplugged
+/// DAC. Attempt a bounded stop/drain/re-register before Android fallback.
+@visibleForTesting
+bool isRecoverableDirectUsbTransportError(String message) {
+  final normalized = message.toLowerCase();
+  return normalized.contains('libusb_submit_transfer failed with code -1') ||
+      normalized.contains('libusb_submit_transfer failed with code -6') ||
+      normalized.contains('isochronous transfer failed') ||
+      normalized.contains('libusb_handle_events failed');
+}
+
+/// An online placeholder is only a candidate, not a playable track.
+/// Keep the verified direct-USB source running until a real successor is
+/// resolved; otherwise an unavailable entry tears down the exclusive USB
+/// stream just to auto-skip immediately to another candidate.
+@visibleForTesting
+bool shouldKeepDirectUsbAliveDuringPendingLookup({
+  required AudioEngineType engine,
+  required bool hasAttachedEngine,
+  required bool hasLoadedSource,
+}) =>
+    engine == AudioEngineType.usbDacExperimental &&
+    hasAttachedEngine &&
+    hasLoadedSource;
+
+/// Defers engine stop for an unverified online candidate on direct USB.
+/// The successor will use the existing normal playTrack path once resolved.
+@visibleForTesting
+Future<void> stopSourceBeforePendingLookup({
+  required bool preserveCurrentSource,
+  required Future<void> Function() stopSource,
+}) async {
+  if (!preserveCurrentSource) {
+    await stopSource();
+  }
+}
+
+/// A manual restart must close the old audio engine before the USB interface
+/// is re-claimed, and only resume playback after the direct route is selected.
+/// Failed resets never report success merely because a device is still listed.
+@visibleForTesting
+Future<bool> restartDirectUsbSessionSequence({
+  required Future<void> Function() stopEngine,
+  required Future<bool> Function() resetTransport,
+  required Future<bool> Function() reselectDirectRoute,
+  required Future<void> Function() restorePlayback,
+}) async {
+  await stopEngine();
+  if (!await resetTransport()) return false;
+  if (!await reselectDirectRoute()) return false;
+  await restorePlayback();
+  return true;
+}
+
+/// Wait for UsbManager to enumerate a DAC again after LIBUSB_NO_DEVICE.
+/// Checking the native frozen session is insufficient: it can still contain
+/// a handle for a device which Android is temporarily not listing.
+@visibleForTesting
+Future<bool> awaitReattachedUsbDevice({
+  required Future<bool> Function() physicallyPresent,
+  required Future<void> Function() pauseBetweenChecks,
+  int maxChecks = 19,
+}) async {
+  for (var check = 0; check < maxChecks; check++) {
+    try {
+      if (await physicallyPresent()) return true;
+    } catch (_) {
+      // The device enumeration may itself fail during detach/re-enumeration.
+    }
+    if (check + 1 < maxChecks) await pauseBetweenChecks();
+  }
+  return false;
+}
+
+/// A restart is healthy only if the requested direct route has been
+/// verified and the USB consumer has actually progressed. Registration or
+/// selecting USB_DAC_EXPERIMENTAL alone is not proof that packets are flowing.
+@visibleForTesting
+bool isVerifiedUsbRestartPlayback({
+  required bool directRouteSelected,
+  required bool streamActive,
+  required bool streamStable,
+  required bool bitPerfectVerified,
+  required int consumerFrames,
+  required int? previousConsumerFrames,
+  required bool transportError,
+}) =>
+    directRouteSelected &&
+    streamActive &&
+    streamStable &&
+    bitPerfectVerified &&
+    !transportError &&
+    previousConsumerFrames != null &&
+    consumerFrames > previousConsumerFrames;
+
+/// A temporary Android route for one recording (unsupported PCM format,
+/// Atmos or signed HTTP add-on) must not disable the user's preferred direct
+/// USB route for future compatible recordings. Do not retry for the same
+/// recording, which would cause an engine-flapping loop.
+@visibleForTesting
+bool shouldRearmUsbAfterTrackScopedFallback({
+  required String? fallbackTrackKey,
+  required String requestedTrackKey,
+}) => fallbackTrackKey != null && fallbackTrackKey != requestedTrackKey;
+
+/// Never advertise bit-perfect if the selected USB alternate setting cannot
+/// carry the exact decoded format (including its PCM bit depth).
+@visibleForTesting
+bool exactDirectUsbFormatSupported(
+  Uac2AudioFormat requested,
+  Uac2AudioFormat? supported,
+) =>
+    supported != null &&
+    requested.sampleRate == supported.sampleRate &&
+    requested.bitDepth == supported.bitDepth &&
+    requested.channels == supported.channels &&
+    requested.isDop == supported.isDop &&
+    requested.isNativeDsd == supported.isNativeDsd;
+
+/// Coalesce progress updates without indefinitely postponing diagnostics.
+@visibleForTesting
+Timer coalescePlaybackDiagnosticsRefresh({
+  required Timer? pending,
+  required Duration interval,
+  required VoidCallback refresh,
+}) {
+  if (pending != null && pending.isActive) return pending;
+  return Timer(interval, refresh);
+}
+
+/// Volume Control State Machine:
+///
+/// Tier evaluation: [determineVolumeTier] — for the direct USB / DAP
+/// bit-perfect paths it trusts `Uac2DeviceStatus.volumeMode` (computed
+/// natively from `nativeHasRustDirectUsbHardwareVolume()`), the single
+/// authoritative source. [PlayerService] feeds it a lie-detector flag
+/// (`hwVolumeFailed`) when a DAC that claimed hardware volume rejects
+/// writes / fails the GET_CUR health check.
+///
+/// Reconciliation: [PlayerService._reconcileVolumeForTier]
+enum VolumeTier { hardware, software, system, unavailable }
+
+/// Pure tier decision for [PlayerService._determineCurrentTier].
+///
+/// - Outside the bit-perfect volume path: Rust → software, else system.
+/// - Wire DSD (DoP or USB native): only DAC hardware volume, or the opt-in
+///   PCM-decimation switch, can change level. Software gain corrupts the data.
+/// - Hardware mode trusted → hardware tier.
+/// - Otherwise engine gain only works on the DSP path; bit-perfect
+///   passthrough must never be scaled → unavailable.
+VolumeTier determineVolumeTier({
+  required bool isBitPerfectVolumePath,
+  required Uac2VolumeMode? volumeMode,
+  bool volumeControlWritable = true,
+  required bool hwVolumeFailed,
+  required bool isDoP,
+  required bool autoSwitchDsdForVolume,
+  required bool isPassthrough,
+  required bool usingRustBackend,
+}) {
+  final hwTrusted =
+      volumeMode == Uac2VolumeMode.hardware &&
+      volumeControlWritable &&
+      !hwVolumeFailed;
+  // Wire DSD is protected even when the user's PCM bit-perfect toggle is off.
+  // `isDoP` also covers USB native DSD: neither may enter the gain path.
+  if (isDoP) {
+    if (hwTrusted) return VolumeTier.hardware;
+    return autoSwitchDsdForVolume
+        ? VolumeTier.software
+        : VolumeTier.unavailable;
+  }
+  if (!isBitPerfectVolumePath) {
+    return usingRustBackend ? VolumeTier.software : VolumeTier.system;
+  }
+  if (hwTrusted) return VolumeTier.hardware;
+  return isPassthrough ? VolumeTier.unavailable : VolumeTier.software;
+}
+
+/// Loop mode for playback
+enum LoopMode {
+  off,
+  one,
+  all,
+  advanceAlbum,
+  advanceArtist,
+  advanceFolder,
+  advancePlaylist,
+  stopAfterCurrent;
+
+  bool get isAdvanceMode => switch (this) {
+    LoopMode.advanceAlbum ||
+    LoopMode.advanceArtist ||
+    LoopMode.advanceFolder ||
+    LoopMode.advancePlaylist => true,
+    _ => false,
+  };
+
+  String get label => switch (this) {
+    LoopMode.off => 'Off',
+    LoopMode.one => 'Repeat One',
+    LoopMode.all => 'Repeat All',
+    LoopMode.advanceAlbum => 'Advance Album',
+    LoopMode.advanceArtist => 'Advance Artist',
+    LoopMode.advanceFolder => 'Advance Folder',
+    LoopMode.advancePlaylist => 'Advance Playlist',
+    LoopMode.stopAfterCurrent => 'Stop After Current',
+  };
+
+  String get description => switch (this) {
+    LoopMode.off => 'Play list once, stop at end',
+    LoopMode.one => 'Repeat current track',
+    LoopMode.all => 'Repeat entire list',
+    LoopMode.advanceAlbum => 'Play next album when done',
+    LoopMode.advanceArtist => 'Play next artist when done',
+    LoopMode.advanceFolder => 'Play next folder when done',
+    LoopMode.advancePlaylist => 'Play next playlist when done',
+    LoopMode.stopAfterCurrent => 'Stop after current song finishes',
+  };
+}
+
+/// Ignore stale playback events while an online placeholder or its resolved
+/// version is being installed. In particular an old Media3 stop() event must
+/// never rewind the current song or its carousel position.
+@visibleForTesting
+bool shouldHoldPendingPresentation(
+  String? expectedTrackId,
+  Song? engineTrack,
+) =>
+    expectedTrackId != null &&
+    (engineTrack == null ||
+        engineTrack.id != expectedTrackId ||
+        engineTrack.isPending);
+
+@visibleForTesting
+bool shouldReplaceQueuedAudioSource(Song queued, Song selected) =>
+    queued.id == selected.id &&
+    (queued.filePath != selected.filePath ||
+        queued.atmosEncoded != selected.atmosEncoded ||
+        queued.fileType != selected.fileType);
+
+@visibleForTesting
+List<Song> buildShufflePlaybackOrder({
+  required List<Song> songs,
+  required Song? current,
+  math.Random? random,
+}) {
+  final reordered = List<Song>.from(songs);
+  if (reordered.length < 2) return reordered;
+
+  if (current == null) {
+    reordered.shuffle(random);
+    return reordered;
+  }
+
+  final currentIndex = reordered.indexWhere((song) => song.id == current.id);
+  if (currentIndex == -1) {
+    reordered.shuffle(random);
+    return reordered;
+  }
+
+  final currentSong = reordered.removeAt(currentIndex);
+  reordered.shuffle(random);
+  return <Song>[currentSong, ...reordered];
+}
+
+@visibleForTesting
+List<Song> restorePlaybackOrder({
+  required List<Song> originalPlaylist,
+  required Song? current,
+  required int insertionIndex,
+}) {
+  final restored = List<Song>.from(originalPlaylist);
+  if (current == null) {
+    return restored;
+  }
+
+  final alreadyPresent = restored.any((song) => song.id == current.id);
+  if (!alreadyPresent) {
+    restored.insert(insertionIndex.clamp(0, restored.length), current);
+  }
+  return restored;
+}
+
+/// Suppression policy for Apple Music motion art while bit-perfect output is
+/// active: a second output stream can preempt native DIRECT/ALSA streams, so
+/// motion art is only allowed when the user opts in or the engine is not
+/// bit-perfect.
+@visibleForTesting
+bool shouldSuppressMotionArt({
+  required bool bitPerfectEnabled,
+  required AudioEngineType engine,
+  required bool allowDuringBitPerfect,
+}) {
+  if (!bitPerfectEnabled || allowDuringBitPerfect) return false;
+  return engine == AudioEngineType.usbDacExperimental ||
+      engine == AudioEngineType.dapInternalHighRes ||
+      engine == AudioEngineType.rustOboe;
+}
+
+/// The Rust engine and its direct backends emit these markers when the output
+/// stream is no longer producing usable audio. Keep the list in sync with
+/// `audio_output_lost_message` in `engine.rs` and the direct-backend errors.
+@visibleForTesting
+bool isDeadRustEngineError(String message) {
+  final normalized = message.toLowerCase();
+  return normalized.contains('disconnected channel') ||
+      normalized.contains('audio engine thread crashed') ||
+      normalized.contains('audio engine output lost') ||
+      normalized.contains('managed output callback failure') ||
+      normalized.contains('output silenced');
+}
+
+const Duration deadRustEngineRecoveryWindow = Duration(minutes: 2);
+const int deadRustEngineRecoveryLimit = 2;
+
+/// True when [recoveryTimestamps] (including the current failure) holds
+/// [deadRustEngineRecoveryLimit] failures inside [deadRustEngineRecoveryWindow].
+/// Respawning cannot fix a deterministic HAL failure, so the caller should
+/// fall back to the plain Android engine instead of looping.
+@visibleForTesting
+bool shouldForceRustEngineFallback({
+  required List<DateTime> recoveryTimestamps,
+  required DateTime now,
+}) {
+  final cutoff = now.subtract(deadRustEngineRecoveryWindow);
+  final recent = recoveryTimestamps.where(
+    (timestamp) => timestamp.isAfter(cutoff),
+  );
+  return recent.length >= deadRustEngineRecoveryLimit;
+}
+
+/// just_audio routes any non-`file://` URI through its local HTTP proxy as
+/// soon as the headers map is non-null (even when empty), and that proxy can
+/// only speak HTTP — `content://` sources then fail with "Unsupported scheme
+/// 'content'". Passing null keeps ExoPlayer on its native content resolver.
+@visibleForTesting
+Map<String, String>? proxySafeHeaders(Map<String, String> headers) {
+  return headers.isEmpty ? null : headers;
+}
+
+@visibleForTesting
+String canonicalPlaybackFileType({required String fileType, String? filePath}) {
+  final pathExtension = extractPlaybackPathExtension(filePath);
+  final candidates = <String>[
+    if (pathExtension.isNotEmpty) pathExtension,
+    if (fileType.trim().isNotEmpty) fileType,
+  ];
+
+  for (final candidate in candidates) {
+    final normalized = _normalizePlaybackFileTypeCandidate(candidate);
+    if (normalized.isNotEmpty) {
+      return normalized;
+    }
+  }
+
+  return '';
+}
+
+@visibleForTesting
+String extractPlaybackPathExtension(String? path) {
+  if (path == null || path.isEmpty) return '';
+
+  final withoutQuery = path.split('?').first.split('#').first;
+  final dotIndex = withoutQuery.lastIndexOf('.');
+  if (dotIndex < 0 || dotIndex >= withoutQuery.length - 1) return '';
+  return withoutQuery.substring(dotIndex + 1).toLowerCase();
+}
+
+String _normalizePlaybackFileTypeCandidate(String rawValue) {
+  var token = rawValue.trim().toLowerCase();
+  if (token.isEmpty) return '';
+
+  final separatorIndex = token.indexOf(';');
+  if (separatorIndex >= 0) {
+    token = token.substring(0, separatorIndex);
+  }
+
+  final slashIndex = token.lastIndexOf('/');
+  if (slashIndex >= 0 && slashIndex < token.length - 1) {
+    token = token.substring(slashIndex + 1);
+  }
+
+  token = token.replaceFirst(RegExp(r'^\.+'), '');
+  token = token.trim();
+
+  switch (token) {
+    case 'aif':
+    case 'aiff':
+    case 'x-aiff':
+      return 'aiff';
+    case 'alac':
+    case 'm4a':
+    case 'mp4':
+    case 'x-m4a':
+      return 'm4a';
+    case 'ogg':
+    case 'oga':
+    case 'vorbis':
+      return 'ogg';
+    case 'ogx':
+      return 'ogx';
+    case 'opus':
+      return 'opus';
+    case 'wave':
+      return 'wav';
+    default:
+      return token;
+  }
+}
+
+@visibleForTesting
+bool shouldOptimisticallySyncSkipForLoopMode(LoopMode loopMode) {
+  return loopMode != LoopMode.one;
+}
+
+@visibleForTesting
+bool shouldHandleManualCompletion({
+  required bool usingRustBackend,
+  required LoopMode loopMode,
+  bool androidSingleTrackOnly = false,
+}) {
+  if (usingRustBackend) {
+    return true;
+  }
+
+  return loopMode == LoopMode.off ||
+      (loopMode == LoopMode.all && androidSingleTrackOnly) ||
+      loopMode.isAdvanceMode ||
+      loopMode == LoopMode.stopAfterCurrent;
+}
+
+const Duration _audioPathTransitionLogWindow = Duration(minutes: 1);
+const int _audioPathTransitionLogMaxPerWindow = 30;
+
+/// Identifies the active audio path for field diagnostics. Written to the
+/// shareable app log on every change, regardless of Developer Mode.
+@visibleForTesting
+Map<String, String> audioPathTransitionFields(
+  AudioOutputDiagnostics diagnostics,
+) {
+  return {
+    'engine':
+        (diagnostics.initializedMode ?? diagnostics.selectedMode).logLabel,
+    'path': diagnostics.pathManagement.name,
+    'strategy': diagnostics.outputStrategyLabel,
+    'bitPerfect': diagnostics.capabilityFlags.supportsVerifiedBitPerfect
+        ? 'on'
+        : 'off',
+    'resampler': diagnostics.resamplerActive ? 'on' : 'off',
+    'requested': diagnostics.requestedOutputSampleRate?.toString() ?? 'none',
+    'reported': diagnostics.reportedOutputSampleRate?.toString() ?? 'none',
+    'fallback': diagnostics.fallbackReason ?? 'none',
+    'verification': diagnostics.verificationReason ?? 'none',
+  };
+}
+
+@visibleForTesting
+List<String> audioPathTransitionChanges(
+  Map<String, String>? previous,
+  Map<String, String> current,
+) {
+  if (previous == null) return const [];
+  final changes = <String>[];
+  for (final entry in current.entries) {
+    final oldValue = previous[entry.key];
+    if (oldValue != entry.value) {
+      changes.add('${entry.key}: ${oldValue ?? 'none'} -> ${entry.value}');
+    }
+  }
+  return changes;
+}
+
+/// Rate limit so a flapping path cannot flush the log ring.
+@visibleForTesting
+bool shouldLogAudioPathTransition({
+  required int logsInWindow,
+  required Duration windowAge,
+}) {
+  return windowAge >= _audioPathTransitionLogWindow ||
+      logsInWindow < _audioPathTransitionLogMaxPerWindow;
+}
+
+@visibleForTesting
+bool shouldSyncNotificationForRepeatOneLoop({
+  required LoopMode loopMode,
+  required bool sameTrack,
+  required Duration previousPosition,
+  required Duration currentPosition,
+  required Duration trackDuration,
+}) {
+  if (loopMode != LoopMode.one ||
+      !sameTrack ||
+      trackDuration <= Duration.zero) {
+    return false;
+  }
+
+  return currentPosition < previousPosition &&
+      previousPosition >= trackDuration - const Duration(seconds: 3) &&
+      currentPosition <= const Duration(milliseconds: 1500);
+}
+
+@visibleForTesting
+bool shouldTrackReplayFromPlaybackState({
+  required bool usingRustBackend,
+  required Duration? previousPosition,
+  required Duration currentPosition,
+}) {
+  if (usingRustBackend) {
+    return false;
+  }
+
+  return previousPosition == null || previousPosition != currentPosition;
+}
+
+/// Puts [resolved] in place of every placeholder [pendingId] in [songs],
+/// keeping the order; returns the positions changed.
+/// Keep the cover already visible for a queued Search result when its stream
+/// resolves without artwork. A missing/empty URL must not erase the picture
+/// displayed throughout the preparation phase. A provider-supplied resolved
+/// cover still takes precedence.
+@visibleForTesting
+Song preservePendingArtwork(Song pending, Song resolved) {
+  if ((resolved.albumArt?.trim().isNotEmpty ?? false) ||
+      !(pending.albumArt?.trim().isNotEmpty ?? false)) {
+    return resolved;
+  }
+  return resolved.copyWith(albumArt: pending.albumArt);
+}
+
+@visibleForTesting
+List<int> replacePendingInPlace(
+  List<Song> songs,
+  String pendingId,
+  Song resolved,
+) {
+  final changed = <int>[];
+  for (var i = 0; i < songs.length; i++) {
+    if (songs[i].id == pendingId) {
+      songs[i] = preservePendingArtwork(songs[i], resolved);
+      changed.add(i);
+    }
+  }
+  return changed;
+}
+
+/// Select the same tracks displayed as Autoplay suggestions when playback
+/// reaches the end of the explicit queue. Never suggest the playing song or
+/// duplicate a result; no I/O or playback side effects.
+@visibleForTesting
+List<Song> selectAutoplayRecommendations({
+  required List<Song> library,
+  required Set<String> excludedIds,
+  int count = 4,
+  math.Random? random,
+}) {
+  if (count <= 0) return const [];
+  final seen = {...excludedIds};
+  final available = <Song>[
+    for (final song in library)
+      if (song.filePath?.isNotEmpty == true &&
+          !song.isPending &&
+          seen.add(song.id))
+        song,
+  ];
+  available.shuffle(random ?? math.Random());
+  return List.unmodifiable(available.take(count));
+}
+
+/// Only transient endpoint/transport failures benefit from repeated native
+/// reopen attempts. A recording whose PCM tuple has already been rejected
+/// cannot become supported by claiming the same interface three more times.
+@visibleForTesting
+bool shouldRetryDirectUsbManualRestart({
+  required Object error,
+  String? fallbackReason,
+}) {
+  final reason = '${error.toString()} ${fallbackReason ?? ''}'.toLowerCase();
+  return !RegExp(
+    r'no isochronous out endpoint|track format .*unsupported|'
+    r'no compatible direct usb output format',
+  ).hasMatch(reason);
+}
+
+class _IosPlaySelection {
+  _IosPlaySelection(
+    this.song,
+    this.playlist,
+    this.selection, {
+    this.requestedIndex,
+  });
+  final int? requestedIndex;
+  Song song;
+  List<Song>? playlist;
+  final int selection;
+  bool prepared = false;
+}
+
+/// Singleton service to manage global audio playback state.
+///
+/// Uses just_audio for playback with gapless playback support.
+class PlayerService {
+  static final PlayerService _instance = PlayerService._internal();
+
+  factory PlayerService() {
+    return _instance;
+  }
+
+  PlayerService._internal() {
+    _playbackManager = AudioEngineManager();
+    _sessionManager = AudioSessionManager(
+      onSwitchEngine: _handleEngineSwitch,
+      isPlaybackActive: () => isPlayingNotifier.value,
+    );
+    _bindPlaybackState();
+    if (Platform.isIOS) {
+      IosLocalAudioRequests.lifecycle.register(this, _retireIosPlayback);
+      IosLocalAudioRequests.restoreSession = _restoreIosAudioSession;
+      _rustAudioService.positionNotifier.addListener(
+        _persistPausedRustPosition,
+      );
+    }
+    // Prepare sidecar/embedded lyrics at playback time, independently of
+    // whether either full-player layout or Lyrics pane is visible.
+    currentSongNotifier.addListener(() {
+      final song = currentSongNotifier.value;
+      if (song != null) LyricsPlaybackPrefetch.instance.warm(song);
+    });
+    _init();
+  }
+
+  just_audio.AudioPlayer? _justAudioPlayer;
+  AndroidAudioEngine? _androidEngine;
+  // Cached crossfade curve index (0..3) for synchronous reads inside the
+  // just_audio engine's config provider; refreshed from prefs on load/change.
+  int _crossfadeCurveIndex = 0;
+
+  /// Rust path of the outgoing track whose end-of-track handoff was already
+  /// applied to the playlist UI when its crossfade started. The engine's later
+  /// TrackEnded event for the same path must not advance the index again; it
+  /// only queues the following successor.
+  String? _crossfadeUiHandoffFromPath;
+
+  final NotificationService _notificationService = NotificationService();
+  final FloatingPlayerService _floatingPlayerService = FloatingPlayerService();
+  bool _floatingPlayerActive = false;
+  bool _appInForeground = true;
+  final LastPlayedService _lastPlayedService = LastPlayedService();
+  final FavoritesService _favoritesService = FavoritesService();
+  final Uac2PreferencesService _preferencesService = Uac2PreferencesService();
+  final AppPreferencesService _appPreferencesService = AppPreferencesService();
+  final SongRepository _songRepository = SongRepository();
+  final PlaylistService _playlistService = PlaylistService();
+  final RustAudioService _rustAudioService = RustAudioService();
+  final Uac2Service _uac2Service = Uac2Service.instance;
+  final CastingService _castingService = CastingService.instance;
+  final ExternalPlaybackOwner _externalPlaybackOwner = ExternalPlaybackOwner();
+  int get playbackIntentRevision => _pendingPlaybackGeneration;
+  int _queueContextRevision = 0;
+  int get queueContextRevision => _queueContextRevision;
+  bool get isCasting => _castingService.isActive;
+  final ColorExtractionService _colorExtractionService =
+      ColorExtractionService();
+  final AlbumColorModePreferenceService _albumColorModePreferenceService =
+      AlbumColorModePreferenceService();
+  bool _priorityAnchorActive = false;
+  // Opt-in: an additional silent Android AudioTrack can increase battery use.
+  bool _priorityAnchorEnabled = false;
+  bool _motionArtDuringBitPerfect = false;
+  bool _midStreamUsbFallbackActive = false;
+  Future<bool>? _manualUsbRestartInFlight;
+  String? _usbTrackScopedFallbackKey;
+  bool _deadRustEngineRecoveryActive = false;
+  final List<DateTime> _deadRustEngineRecoveryTimestamps = <DateTime>[];
+  late final AudioSessionManager _sessionManager;
+  late final AudioEngineManager _playbackManager;
+  RustAudioEngine? _rustEngine;
+  StreamSubscription<PlaybackState>? _playbackStateSubscription;
+  PlaybackState? _lastPlaybackState;
+  Timer? _playbackDiagnosticsDebounceTimer;
+  static const Duration _playbackDiagnosticsDebounce = Duration(
+    milliseconds: 300,
+  );
+  Timer? _queueDebounceTimer;
+  static const Duration _queueDebounce = Duration(milliseconds: 150);
+  Timer? _autoplayPreviewTimer;
+  Future<List<Song>>? _autoplayOnlinePreviewJob;
+  int _autoplayPreviewGeneration = 0;
+  static const int _autoplayPreviewCount = 8;
+  final RecentlyPlayedRepository _recentlyPlayedRepository =
+      RecentlyPlayedRepository();
+  late final ReplayPlayTracker _replayPlayTracker = ReplayPlayTracker(
+    onCompleted: (event) {
+      unawaited(() async {
+        await _recentlyPlayedRepository.recordPlay(
+          event.songId,
+          eventId: event.eventId,
+          playedAt: event.playedAt,
+          listenedMs: event.msPlayed,
+        );
+        await LinkJournal.instance.recordPlay(
+          eventId: event.eventId,
+          songId: event.songId,
+          playedAt: event.playedAt.millisecondsSinceEpoch,
+          msPlayed: event.msPlayed,
+        );
+      }());
+    },
+  );
+  static const MethodChannel _storageChannel = MethodChannel(
+    'com.mossapps.flick/storage',
+  );
+  final Map<String, String> _stagedPlaybackPathCache = {};
+  final Map<String, String> _convertedPlaybackPathCache = {};
+  final Set<String> _unsupportedWavConversionSources = <String>{};
+  final ValueNotifier<bool> usingRustBackendNotifier = ValueNotifier(false);
+  final ValueNotifier<AudioOutputDiagnostics?> audioOutputDiagnosticsNotifier =
+      ValueNotifier(null);
+  int _audioOutputDiagnosticsGeneration = 0;
+  Map<String, String>? _lastAudioPathTransition;
+  DateTime? _audioPathTransitionWindowStart;
+  int _audioPathTransitionLogsInWindow = 0;
+  final ValueNotifier<bool> bitPerfectProcessingLockedNotifier = ValueNotifier(
+    false,
+  );
+
+  /// True while motion art must not start ExoPlayer: on direct/exclusive
+  /// bit-perfect paths a second audio client can preempt the native stream.
+  final ValueNotifier<bool> motionArtSuppressedNotifier = ValueNotifier(false);
+  final ValueNotifier<bool> gaplessPlaybackEnabledNotifier = ValueNotifier(
+    true,
+  );
+  final ValueNotifier<bool> duckOnInterruptionNotifier = ValueNotifier(true);
+  final ValueNotifier<MilestoneType?> pendingMilestoneNotifier = ValueNotifier(
+    null,
+  );
+  // Carries the day streak recorded on launch, or null when no popup is
+  // pending. MainShell listens and shows the StreakPopup. Cleared on show.
+  final ValueNotifier<int?> streakPopupNotifier = ValueNotifier(null);
+  final MilestoneService _milestoneService = MilestoneService();
+  bool get _usingRustBackend => usingRustBackendNotifier.value;
+  set _usingRustBackend(bool value) => usingRustBackendNotifier.value = value;
+  bool _rustBackendAvailable = false;
+  VoidCallback? _bitPerfectLockedListener;
+  bool _rustListenersAttached = false;
+  bool _audioSessionConfigured = false;
+  bool _wasPlayingBeforeAudioInterruption = false;
+  bool _isDucked = false;
+  VoidCallback? _rustStateListener;
+  VoidCallback? _rustPositionListener;
+  VoidCallback? _rustDurationListener;
+  StreamSubscription<AudioInterruptionEvent>? _audioFocusSubscription;
+  StreamSubscription<void>? _noisyAudioSubscription;
+  StreamSubscription<Map<Object?, Object?>>? _bluetoothDeviceEventSubscription;
+  StreamSubscription<void>? _usbDacDetachSubscription;
+  StreamSubscription<void>? _usbDacAttachSubscription;
+  DateTime? _bluetoothDisconnectedAt;
+  static const Duration _bluetoothReconnectWindow = Duration(seconds: 30);
+  bool _audioInitialized = false;
+  Future<void>? _audioInitInFlight;
+  Future<void>? _appLaunchPreparationInFlight;
+  Future<void> _playRequestQueue = Future<void>.value();
+  int _selectionGeneration = 0;
+  int _iosPauseRevision = 0;
+  _IosPlaySelection? _iosPlaySelection;
+  bool _iosLocalRetirement = false;
+  Future<bool>? _rustInitInFlight;
+  Future<void>? _rustCapabilityRefreshInFlight;
+  Future<void>? _rustEnginePreparationInFlight;
+  bool _suppressSequenceStateUpdates = false;
+  String? _autoSyncGuardSongId;
+  String? _restoredSongId;
+  Duration _restoredPosition = Duration.zero;
+  double _currentVolume = 1.0;
+
+  /// Default volume for bit-perfect mode (25 %, safety level).
+  /// Mapped to ~0.01 linear gain by Rust's volume_to_gain curve.
+  static const double _bitPerfectDefaultVolume = 0.25;
+
+  double get currentVolume => _currentVolume;
+
+  /// Extended-volume boost (up to 200 %) toggle. Only the software (Rust)
+  /// and system (ExoPlayer + LoudnessEnhancer) tiers may exceed 1.0.
+  bool _extendedVolumeEnabled = false;
+  int _currentBoostMb = 0;
+
+  /// Effective ReplayGain for the current track ('off' | 'track' | 'album').
+  /// Pushed to the Rust engine per-source; folded into the just_audio volume
+  /// on the system tier.
+  ReplayGainAppliedState _replayGainState = ReplayGainAppliedState.neutral;
+
+  final ValueNotifier<bool> extendedVolumeEnabledNotifier = ValueNotifier<bool>(
+    false,
+  );
+
+  /// Lie-detector: set when a DAC that claimed hardware volume rejects
+  /// writes or fails the GET_CUR health check.
+  bool _hwVolumeFailed = false;
+  int? _hardwareVolumeGeneration;
+  String? _activeUsbDsdMode;
+  String? _activeUsbDsdSongId;
+  bool _switchingDsdForVolume = false;
+  VolumeTier _activeTier = VolumeTier.system;
+
+  // Timer to periodically save position
+  Timer? _positionSaveTimer;
+  bool _iosPositionSavingPaused = false;
+
+  @visibleForTesting
+  bool get debugPositionSaveTimerActive => _positionSaveTimer?.isActive == true;
+
+  /// Read the actual just_audio sequence during explicit native acceptance.
+  /// This installs no observation or recurring work in production.
+  @visibleForTesting
+  int? get debugNativeSequenceLength =>
+      _usingRustBackend ? null : _justAudioPlayer?.sequence.length;
+
+  // Periodic health-check for hardware volume verification
+  Timer? _hwVolumeHealthTimer;
+
+  // State Notifiers
+  final ValueNotifier<Song?> currentSongNotifier = _MutableValueNotifier(null);
+  final ValueNotifier<bool> isPlayingNotifier = ValueNotifier(false);
+  final ValueNotifier<bool> isBufferingNotifier = ValueNotifier(false);
+  final ValueNotifier<Duration> positionNotifier = ValueNotifier(Duration.zero);
+  final ValueNotifier<Duration> durationNotifier = ValueNotifier(Duration.zero);
+  final ValueNotifier<Duration> bufferedPositionNotifier = ValueNotifier(
+    Duration.zero,
+  );
+
+  /// True while a network-sourced song is being resolved for playback (HTTP
+  /// stream attach or cache download). UI surfaces a loading indicator so the
+  /// user sees that their tap was registered during the network round-trip.
+  final ValueNotifier<bool> isNetworkLoadingNotifier = ValueNotifier(false);
+
+  /// Set synchronously when a new online track is selected, before the player
+  /// queue, native engine or provider can block on network setup.
+  final ValueNotifier<String?> onlinePreparationTitleNotifier = ValueNotifier(
+    null,
+  );
+
+  void _markOnlinePreparation(Song song) {
+    if (song.isPending ||
+        song.isNetworkSource ||
+        song.sourcePackage == 'konnekted.progressive' ||
+        song.sourcePackage == 'konnekted.morneye-live') {
+      onlinePreparationTitleNotifier.value = song.title;
+      isNetworkLoadingNotifier.value = true;
+    } else {
+      onlinePreparationTitleNotifier.value = null;
+    }
+  }
+
+  // ponytail: monotonically increasing token; only the most-recent network
+  // play request is allowed to clear the loading flag. Upgrade path: a per-
+  // song Set<int> if multiple concurrent network loads ever need tracking.
+  int _networkLoadingGen = 0;
+  final onlinePlaybackError = ValueNotifier<String?>(null);
+
+  // ponytail: guards the engine's position write during interactive seek
+  // (vinyl spin). Local drag writes to positionNotifier stick; engine ticks
+  // get re-enabled on endInteractiveSeek(). Upgrade path: per-source locks if
+  // multiple interactive sources ever contend.
+  bool _suppressPositionUpdatesFromEngine = false;
+  void beginInteractiveSeek() => _suppressPositionUpdatesFromEngine = true;
+  void endInteractiveSeek() => _suppressPositionUpdatesFromEngine = false;
+
+  // Playback Mode State
+  final ValueNotifier<ShuffleMode> shuffleModeNotifier = ValueNotifier(
+    ShuffleMode.off,
+  );
+  ValueNotifier<bool> get isShuffleNotifier => _isShuffleCompat;
+  late final ValueNotifier<bool> _isShuffleCompat = _ShuffleBoolNotifier(
+    shuffleModeNotifier,
+  );
+  final ValueNotifier<LoopMode> loopModeNotifier = ValueNotifier(LoopMode.all);
+
+  // A-B Repeat
+  final ValueNotifier<Duration?> abRepeatANotifier = ValueNotifier(null);
+  final ValueNotifier<Duration?> abRepeatBNotifier = ValueNotifier(null);
+
+  // Playback Context
+  PlaybackContext _playbackContext = PlaybackContext.unknown;
+  PlaybackContext get playbackContext => _playbackContext;
+  final ValueNotifier<PlaybackContext> playbackContextNotifier = ValueNotifier(
+    PlaybackContext.unknown,
+  );
+
+  // Advance List Order
+  AdvanceListOrder _advanceListOrder = AdvanceListOrder.alphabetical;
+  AdvanceListOrder get advanceListOrder => _advanceListOrder;
+
+  // Wrap-around navigation: Previous on the first item jumps to the last.\n  // Selection never rotates the source queue or discards earlier songs.
+  final ValueNotifier<bool> wrapAroundQueueNotifier = ValueNotifier(true);
+  bool get wrapAroundQueue => wrapAroundQueueNotifier.value;
+
+  final ValueNotifier<bool> autoplayOnQueueEndNotifier = ValueNotifier(true);
+
+  /// Future tracks proposed by Autoplay, not yet added to the explicit
+  /// playlist or manual queue. The visible first item is what queue-end plays.
+  final ValueNotifier<List<Song>> autoplayQueueNotifier =
+      ValueNotifier<List<Song>>(const []);
+
+  // Category shuffle tracking
+  final Set<String> _playedCategoryIds = {};
+
+  // Playback Speed
+  final ValueNotifier<double> playbackSpeedNotifier = ValueNotifier(1.0);
+  final ValueNotifier<double> pitchSemitonesNotifier = ValueNotifier(0.0);
+
+  // Queue State
+  final ValueNotifier<List<Song>> queueNotifier = ValueNotifier(const []);
+  final ValueNotifier<List<Song>> upNextNotifier = ValueNotifier(const []);
+  final ValueNotifier<int> currentIndexNotifier = ValueNotifier(-1);
+  int _nextQueueEntryId = 0;
+
+  // Sleep Timer
+  final ValueNotifier<Duration?> sleepTimerRemainingNotifier = ValueNotifier(
+    null,
+  );
+  Timer? _sleepTimer;
+  Timer? _sleepTimerCountdown;
+
+  // Playlist Management
+  final List<Song> _playlist = [];
+  final List<Song> _originalPlaylist = []; // For shuffle restore
+  final List<int?> _playlistQueueEntryIds = [];
+  final List<_QueueEntry> _queuedEntries = [];
+  int _currentIndex = -1;
+  bool _isRebuildingPlaylist =
+      false; // Flag to prevent unwanted updates during rebuild
+  // ignore: deprecated_member_use
+  just_audio.ConcatenatingAudioSource? _audioSourceSequence;
+
+  // Track previous position to detect repeat wrap-around for notification progress
+  Duration _lastPosition = Duration.zero;
+
+  // Track last notification update time to throttle updates
+  DateTime _lastNotificationUpdate = DateTime.now();
+
+  // Cache album color for notifications to avoid re-extracting on every update
+  String? _lastNotificationColorSongId;
+  int? _lastNotificationColor;
+
+  final ValueNotifier<int> favoriteNotificationToggleNotifier = ValueNotifier(
+    0,
+  );
+
+  final ValueNotifier<bool> playbackDesyncedNotifier = ValueNotifier(false);
+  Song? _engineCurrentTrack;
+  Timer? _desyncDetectionTimer;
+  static const Duration _desyncThreshold = Duration(seconds: 3);
+
+  List<Song> get queue =>
+      List.unmodifiable(_queuedEntries.map((entry) => entry.song));
+  int get currentIndex => _currentIndex;
+  bool get isUsingRustBackend => usingRustBackendNotifier.value;
+  List<Song> get upNext {
+    if (_playlist.isEmpty) return const [];
+    final startIndex = (_currentIndex + 1).clamp(0, _playlist.length);
+    return List.unmodifiable(_playlist.sublist(startIndex));
+  }
+
+  /// Every song in play order (shuffled when shuffle is on), the one playing
+  /// at [currentIndex].
+  List<Song> get playlist => List.unmodifiable(_playlist);
+
+  /// Finds and downloads a queued placeholder ([Song.isPending]) when
+  /// playback reaches it; null when it can't be found. Set by
+  /// QueuePreResolver.
+  /// Paired desktop tracks must not hold the automatic queue waiting for
+  /// the LAN when the PC is away/offline. Local cache remains playable.
+  Future<bool> Function(Song song)? linkedDesktopAvailable;
+  final Set<int> _offlineDesktopSkippedSlots = <int>{};
+  List<Song>? _offlineDesktopSkipQueue;
+
+  Future<Song?> Function(Song pending)? pendingSongResolver;
+  VoidCallback? cancelPendingSongResolution;
+  int _pendingPlaybackGeneration = 0;
+
+  /// UI preflight must not start an old selection after a newer play/pause.
+  int get playbackRequestRevision => _pendingPlaybackGeneration;
+
+  void _cancelPendingPlayback() {
+    _pendingPlaybackGeneration++;
+    if (_pendingPlaybackId == null) return;
+    // Cancelling an unresolved selection must also release the old engine
+    // presentation hold. A resolved-track handoff has no pending ID here.
+    if (_pendingPresentationTrackId == _pendingPlaybackId) {
+      _pendingPresentationTrackId = null;
+    }
+    _pendingPlaybackId = null;
+    cancelPendingSongResolution?.call();
+    isNetworkLoadingNotifier.value = false;
+  }
+
+  /// The placeholder being looked up to play now, if any.
+  String? _pendingPlaybackId;
+
+  /// The engine can emit the *previous* track while stopping its audio sink
+  /// or loading the next pending stream. Never let that old state overwrite
+  /// the selected pending song / queue index until the requested source loads.
+  String? _pendingPresentationTrackId;
+
+  /// Placeholders skipped in a row because they couldn't be found: stops a
+  /// queue of unplayable songs from going round forever.
+  int _pendingFailures = 0;
+
+  /// Puts [resolved] in place of the queued placeholder [pendingId] wherever
+  /// it sits, without interrupting what's playing.
+  void replacePendingSong(String pendingId, Song resolved) {
+    if (resolved.isPending || resolved.filePath == null) return;
+    final changed = replacePendingInPlace(_playlist, pendingId, resolved);
+    replacePendingInPlace(_originalPlaylist, pendingId, resolved);
+    var queueChanged = false;
+    for (var i = 0; i < _queuedEntries.length; i++) {
+      final entry = _queuedEntries[i];
+      if (entry.song.id == pendingId) {
+        _queuedEntries[i] = _QueueEntry(
+          id: entry.id,
+          song: preservePendingArtwork(entry.song, resolved),
+        );
+        queueChanged = true;
+      }
+    }
+    if (changed.isEmpty && !queueChanged) return;
+    if (queueChanged) _notifyQueueChanged();
+    _notifyUpNextChanged();
+    if (!_usingRustBackend &&
+        _audioSourceSequence != null &&
+        !requiresOnDemandAndroidSequence(_playlist) &&
+        _androidEngine?.isSingleTrackOnly != true) {
+      for (final index in changed) {
+        if (index == _currentIndex) continue;
+        _removeFromAudioSequence(index);
+        unawaited(_insertIntoAudioSequence(index, _playlist[index]));
+      }
+    }
+    // Now ready as the next song: hand it to the engine for a gapless start.
+    if (_playlist.isNotEmpty && _currentIndex >= 0) {
+      final isLast = _currentIndex >= _playlist.length - 1;
+      final next = isLast ? 0 : _currentIndex + 1;
+      if (changed.contains(next) &&
+          (!isLast || loopModeNotifier.value == LoopMode.all) &&
+          _shouldQueueNextTrack &&
+          currentSongNotifier.value?.filePath != null) {
+        unawaited(_queueNextTrackForGapless());
+      }
+    }
+  }
+
+  /// Playback reached a placeholder: look it up, then play it; skip to the
+  /// next song when it can't be found. Runs outside the playback request
+  /// queue so another tap isn't kept waiting for the download.
+  Future<void> _playPendingSong(Song pending) async {
+    // The requested online recording might not exist. On a live direct-USB
+    // session, stopping the currently verified stream before its lookup
+    // finishes closes the isochronous endpoint; a chain of missing tracks
+    // repeatedly tears down/re-opens the DAC and may lose bit-perfect.
+    final preserveDirectUsb = shouldKeepDirectUsbAliveDuringPendingLookup(
+      engine: currentEngineType,
+      hasAttachedEngine: _playbackManager.hasAttachedEngine,
+      hasLoadedSource: _rustAudioService.currentPath?.isNotEmpty == true,
+    );
+    if (preserveDirectUsb) {
+      AppLog.instance.add(
+        '[USB] Keeping verified direct-USB stream active '
+        'while resolving pending track ${pending.title}',
+      );
+    }
+    final generation = ++_pendingPlaybackGeneration;
+    _pendingPlaybackId = pending.id;
+    onlinePlaybackError.value = null;
+    _markOnlinePreparation(pending);
+    _pendingPresentationTrackId = pending.id;
+    isPlayingNotifier.value = false;
+    positionNotifier.value = Duration.zero;
+    bufferedPositionNotifier.value = Duration.zero;
+    durationNotifier.value = pending.duration;
+    currentSongNotifier.value = pending;
+    // This is only a UI placeholder. Do not replace the active Rust engine's
+    // loaded track while that earlier source is still audibly playing.
+    if (!preserveDirectUsb) {
+      _playbackManager.updateTrack(pending);
+    }
+    // Start the selected song's resolver *before* stopping the previous audio
+    // engine. That stop can take time on the first media handoff, and waiting
+    // for it used to leave the first provider request queued behind prefetch.
+    // Turn errors into a value immediately so an early failure cannot become
+    // an unhandled asynchronous error while the engine is stopping.
+    final resolver = pendingSongResolver;
+    Future<({Song? song, Object? failure})> resolveSelected() async {
+      try {
+        return (
+          song: resolver == null ? null : await resolver(pending),
+          failure: null,
+        );
+      } catch (error) {
+        return (song: null, failure: error);
+      }
+    }
+
+    final lookup = resolveSelected();
+    try {
+      if (_castingService.isActive) {
+        await _castingService.delegatePause();
+      } else {
+        await IosLocalAudioRequests.wait(
+          stopSourceBeforePendingLookup(
+            preserveCurrentSource: preserveDirectUsb,
+            stopSource: _playbackManager.stop,
+          ),
+        );
+      }
+    } catch (e) {
+      if (IosLocalAudioRequests.isRetired(e)) rethrow;
+      _debugLog('[Playback] stop while preparing ${pending.title}: $e');
+    }
+    if (generation != _pendingPlaybackGeneration ||
+        _pendingPlaybackId != pending.id)
+      return;
+    unawaited(() async {
+      final result = await lookup;
+      final resolved = result.song == null
+          ? null
+          : preservePendingArtwork(pending, result.song!);
+      final failure = result.failure;
+      if (failure != null) {
+        _debugLog('[Playback] lookup failed for ${pending.title}: $failure');
+      }
+      // Something else was asked for meanwhile: it owns playback now.
+      if (generation != _pendingPlaybackGeneration ||
+          _pendingPlaybackId != pending.id)
+        return;
+      _pendingPlaybackId = null;
+      if (resolved != null) {
+        // Lookup completion is not playback readiness. Keep the preparation
+        // toast visible while Media3 opens/buffers the resolved source.
+        onlinePreparationTitleNotifier.value = resolved.title;
+        isNetworkLoadingNotifier.value = true;
+        // Shield the resolved source from the previous decoder's stop event.
+        _pendingPresentationTrackId = resolved.id;
+        _pendingFailures = 0;
+        replacePendingSong(pending.id, resolved);
+        final song = resolved;
+        await _enqueuePlaybackRequest(() async {
+          if (_songAtCurrentIndex()?.id != song.id) return;
+          await _playInternal(song);
+        }, remoteOutput: _castingService.isActive);
+        return;
+      }
+      isNetworkLoadingNotifier.value = false;
+      onlinePreparationTitleNotifier.value = null;
+      onlinePlaybackError.value = failure is DiscoveryException
+          ? failure.message
+          : 'Couldn’t prepare this song for playback. Try another source or try again.';
+      if (shouldHoldPendingPlayback(failure)) {
+        // A provider failure can affect every result in this queue. Hold on
+        // the selected song for manual retry instead of rapidly requesting
+        // each successor until the service rate limits the listener.
+        _pendingFailures = 0;
+        if (_pendingPresentationTrackId == pending.id) {
+          _pendingPresentationTrackId = null;
+        }
+        _debugLog('[Playback] ${pending.title} waiting for manual retry');
+        return;
+      }
+      _debugLog(
+        '[Playback] ${pending.title} not found; skipping '
+        '(directUsbPreserved=$preserveDirectUsb)',
+      );
+      if (++_pendingFailures >= _playlist.length) {
+        _pendingFailures = 0;
+        if (_pendingPresentationTrackId == pending.id) {
+          _pendingPresentationTrackId = null;
+        }
+        return;
+      }
+      await _enqueuePlaybackRequest(() async {
+        if (_songAtCurrentIndex()?.id != pending.id) return;
+        await _nextInternal();
+      }, remoteOutput: _castingService.isActive);
+    }());
+  }
+
+  void _init() {
+    // Initialize notification service with callbacks
+    _notificationService.init(
+      onTogglePlayPause: togglePlayPause,
+      onPlay: resume,
+      onPause: pause,
+      onNext: next,
+      onPrevious: previous,
+      onStop: _stopPlayback,
+      onSeek: seek,
+      onToggleShuffle: toggleShuffle,
+      onToggleFavorite: _toggleFavoriteFromNotification,
+      onDisconnectCast: () => unawaited(_castingService.disconnect()),
+      onSetCastVolume: (volume) => unawaited(setVolume(volume)),
+    );
+    _castingService.remoteVolumeNotifier.addListener(_onRemoteVolumeChanged);
+    _sessionManager.selectedModeNotifier.addListener(() {
+      unawaited(
+        _refreshAudioOutputDiagnostics(
+          reason: 'selected playback mode changed',
+        ),
+      );
+    });
+    _sessionManager.initializedModeNotifier.addListener(() {
+      unawaited(
+        _refreshAudioOutputDiagnostics(
+          reason: 'initialized playback mode changed',
+        ),
+      );
+    });
+    AndroidAudioDeviceService.instance.deviceInfoNotifier.addListener(() {
+      unawaited(_refreshAudioOutputDiagnostics(reason: 'audio route changed'));
+    });
+    _uac2Service.bitPerfectEnabledNotifier.addListener(() {
+      unawaited(_handleBitPerfectPreferenceChanged());
+    });
+    _uac2Service.dapBitPerfectEnabledNotifier.addListener(() {
+      unawaited(_handleBitPerfectPreferenceChanged());
+    });
+    selectedPlaybackModeNotifier.addListener(_updateBitPerfectProcessingLocked);
+    Uac2PreferencesService.selectedAudioEngineNotifier.addListener(
+      _updateBitPerfectProcessingLocked,
+    );
+    initializedPlaybackModeNotifier.addListener(
+      _updateBitPerfectProcessingLocked,
+    );
+    _uac2Service.bitPerfectEnabledNotifier.addListener(
+      _updateBitPerfectProcessingLocked,
+    );
+    _uac2Service.dapBitPerfectEnabledNotifier.addListener(
+      _updateBitPerfectProcessingLocked,
+    );
+    Uac2PreferencesService.tuning432HzNotifier.addListener(
+      _on432HzTuningChanged,
+    );
+    _bitPerfectLockedListener = () {
+      unawaited(reapplyEqualizer());
+    };
+    bitPerfectProcessingLockedNotifier.addListener(_bitPerfectLockedListener!);
+    _updateBitPerfectProcessingLocked();
+    _uac2Service.addStatusListener(_mirrorUsbVolumeFromUac2Status);
+    // Some playback completion/failure paths change this notifier without
+    // explicitly calling _updatePriorityAnchor. Always release the extra
+    // AudioTrack when the transport is no longer playing.
+    isPlayingNotifier.addListener(_updatePriorityAnchor);
+    _notifyQueueChanged();
+    // Keep the preview in sync with user settings and source transitions.
+    currentSongNotifier.addListener(_scheduleAutoplayPreview);
+    autoplayOnQueueEndNotifier.addListener(_scheduleAutoplayPreview);
+    loopModeNotifier.addListener(_scheduleAutoplayPreview);
+    shuffleModeNotifier.addListener(_scheduleAutoplayPreview);
+    unawaited(_loadGaplessPlaybackPreference());
+    unawaited(_loadDuckOnInterruptionPreference());
+    unawaited(_loadCrossfadePreferences());
+    unawaited(_loadFloatingPlayerPreference());
+    unawaited(_loadPriorityAnchorPreference());
+    unawaited(_loadMotionArtPreference());
+    _initBluetoothReconnectHandling();
+    _initUsbDacDisconnectHandling();
+    _initUsbDacAttachHandling();
+    unawaited(_applyBluetoothCodecPrefs());
+  }
+
+  void _initBluetoothReconnectHandling() {
+    // iOS route/interruption events come from audio_session. This channel
+    // belongs to Android's A2DP/HEADSET integration.
+    if (!Platform.isAndroid) return;
+    _bluetoothDeviceEventSubscription = BluetoothService.instance.deviceEvents
+        .listen((event) {
+          final type = event['event'] as String?;
+          if (type == 'disconnected') {
+            if (isPlayingNotifier.value) {
+              _bluetoothDisconnectedAt = DateTime.now();
+            }
+          } else if (type == 'connected') {
+            unawaited(_applyBluetoothCodecPrefs());
+            unawaited(_maybePauseOnBluetoothConnect());
+          }
+        });
+  }
+
+  void _initUsbDacDisconnectHandling() {
+    _usbDacDetachSubscription = _uac2Service.deviceDetachedEvents.listen((
+      _,
+    ) async {
+      if (!isPlayingNotifier.value) return;
+      final enabled = await _appPreferencesService.getPauseOnUsbDacDisconnect();
+      if (enabled) pause();
+    });
+  }
+
+  void _initUsbDacAttachHandling() {
+    _usbDacAttachSubscription = _uac2Service.deviceAttachedEvents.listen((
+      _,
+    ) async {
+      if (!isPlayingNotifier.value) return;
+      final enabled = await _appPreferencesService.getPauseOnUsbDacConnect();
+      if (enabled) pause();
+    });
+  }
+
+  /// Push the user's codec preference to the active A2DP device when codec
+  /// control is enabled. Best-effort: the hidden API no-ops on apps not
+  /// signed with the platform key, so the post-set verify loop in
+  /// [BluetoothService.setCodecConfig] logs the real outcome.
+  Future<void> _applyBluetoothCodecPrefs() async {
+    final enabled = await _appPreferencesService.getBtEnableCodecControl();
+    if (!enabled) return;
+    final codecType = await _appPreferencesService.getBtPreferredCodec();
+    if (codecType < 0) return; // automatic; nothing to force
+    final devices = await BluetoothService.instance.getConnectedDevices();
+    final preferred = await _appPreferencesService
+        .getPreferredBluetoothDevice();
+    final target = devices.isEmpty
+        ? null
+        : (preferred.isNotEmpty
+                  ? devices.where((d) => d.address == preferred).firstOrNull
+                  : null) ??
+              devices.where((d) => d.isA2dp).firstOrNull ??
+              devices.first;
+    if (target == null) return;
+    final sampleRate = await _appPreferencesService.getBtSampleRate();
+    final bits = codecType == BluetoothCodecType.ldac
+        ? await _appPreferencesService.getBtLdacBitsPerSample()
+        : 0;
+    final ldacBitrate = codecType == BluetoothCodecType.ldac
+        ? BtLdacBitrate.fromName(
+            await _appPreferencesService.getBtLdacBitrate(),
+          ).kbps
+        : 0;
+    _debugLog(
+      '[Bluetooth] Applying codec ${BluetoothCodecType.label(codecType)} '
+      '(sr=$sampleRate bits=$bits ldacKbps=$ldacBitrate) to ${target.name}',
+    );
+    await BluetoothService.instance.setCodecConfig(
+      address: target.address,
+      codecType: codecType,
+      sampleRate: sampleRate,
+      bitsPerSample: bits,
+      ldacBitrate: ldacBitrate,
+    );
+  }
+
+  Future<void> _maybeResumeOnBluetoothReconnect() async {
+    final disconnectTime = _bluetoothDisconnectedAt;
+    if (disconnectTime == null) return;
+    _bluetoothDisconnectedAt = null;
+    final resumeEnabled = await _appPreferencesService
+        .getResumeOnBluetoothReconnect();
+    if (!resumeEnabled) return;
+    if (DateTime.now().difference(disconnectTime) > _bluetoothReconnectWindow) {
+      return;
+    }
+    if (currentSongNotifier.value == null || isPlayingNotifier.value) return;
+    _debugLog(
+      '[Bluetooth] Reconnected within ${_bluetoothReconnectWindow.inSeconds}s; '
+      'resuming playback',
+    );
+    unawaited(resume());
+  }
+
+  // On Bluetooth connect: pause if opted in (overrides resume-on-reconnect);
+  // otherwise fall back to the resume-on-reconnect behaviour.
+  Future<void> _maybePauseOnBluetoothConnect() async {
+    final pauseOnConnect = await _appPreferencesService
+        .getPauseOnBluetoothConnect();
+    if (pauseOnConnect && isPlayingNotifier.value) {
+      _bluetoothDisconnectedAt = null;
+      _debugLog('[Bluetooth] Connected; pausing due to pause-on-connect pref');
+      pause();
+      return;
+    }
+    _maybeResumeOnBluetoothReconnect();
+  }
+
+  Future<void> _loadCrossfadePreferences() async {
+    final enabled = await _appPreferencesService.getCrossfadeEnabled();
+    final duration = await _appPreferencesService.getCrossfadeDurationSecs();
+    _crossfadeCurveIndex = await _appPreferencesService
+        .getCrossfadeCurveIndex();
+    _rustAudioService.crossfadeEnabledNotifier.value = enabled;
+    _rustAudioService.crossfadeDurationNotifier.value = duration;
+  }
+
+  /// When the DAC/route reports a new volume level, keep [_currentVolume]
+  /// aligned and propagate to the Rust engine.
+  ///
+  /// - **Hardware mode** (bit-perfect + DAC knob): mirrors the DAC level so
+  ///   reconciliation keeps the engine pinned at 1.0.
+  /// - **Software mode** (no hardware volume on DAC): the UAC2 status volume
+  ///   comes from Android's STREAM_MUSIC level, which is unrelated to the
+  ///   isochronous USB path.  We must NOT overwrite [_currentVolume] from it.
+  ///   Instead, we only re-push the existing [_currentVolume] to the engine
+  ///   to keep it in sync after status refreshes.
+  void _mirrorUsbVolumeFromUac2Status(Uac2DeviceStatus? status) {
+    if (status == null) {
+      _hwVolumeFailed = false;
+      _hardwareVolumeGeneration = null;
+      _activeUsbDsdMode = null;
+      _activeUsbDsdSongId = null;
+      unawaited(
+        IosLocalAudioRequests.ignoreRetired(
+          _reconcileVolumeForTier(_determineCurrentTier()),
+        ),
+      );
+      return;
+    }
+    if (!Platform.isAndroid) return;
+    if (currentEngineType != AudioEngineType.usbDacExperimental) return;
+    if (!status.hasVolumeControl) return;
+
+    if (status.volumeMode == Uac2VolumeMode.hardware) {
+      if (!isHardwareVolumeAuthority) return;
+      final v = status.volume;
+      if (v == null || !v.isFinite) return;
+      if ((v - _currentVolume).abs() <= 0.000001) return;
+      _currentVolume = v.clamp(0.0, 1.0);
+      unawaited(
+        IosLocalAudioRequests.ignoreRetired(
+          _reconcileVolumeForTier(_determineCurrentTier()),
+        ),
+      );
+    } else {
+      unawaited(
+        IosLocalAudioRequests.ignoreRetired(
+          _reconcileVolumeForTier(_determineCurrentTier()),
+        ),
+      );
+    }
+  }
+
+  Future<void> _handleBitPerfectPreferenceChanged() async {
+    // When USB DAC bit-perfect is turned off, also turn off DAP bit-perfect
+    // so the DAC receives non-bit-perfect data.
+    if (!_uac2Service.isBitPerfectEnabledSync &&
+        _uac2Service.isDapBitPerfectEnabledSync) {
+      await setDapBitPerfectEnabled(false);
+      return; // setDapBitPerfectEnabled will re-trigger this listener
+    }
+
+    // When both bit-perfect options are off on a DAP, force the engine
+    // to Rust via Oboe so volume and DSP work correctly on the shared path.
+    if (Platform.isAndroid &&
+        audioOutputDiagnosticsNotifier.value?.detectedDap == true &&
+        !_uac2Service.isBitPerfectEnabledSync &&
+        !_uac2Service.isDapBitPerfectEnabledSync) {
+      final pref = await _preferencesService.getAudioEnginePreference();
+      if (pref == AudioEnginePreference.exoPlayer) {
+        await _preferencesService.setAudioEnginePreference(
+          AudioEnginePreference.rustOboe,
+        );
+      }
+    }
+
+    if (_usingRustBackend && _rustAudioService.isInitialized) {
+      await _applyRustPlaybackProcessingPolicy(currentEngineType);
+    } else {
+      final player = _justAudioPlayer;
+      if (player != null) {
+        await player.setVolume(_currentVolume);
+        await player.setSpeed(playbackSpeedNotifier.value);
+      }
+    }
+
+    await syncAudioRouteSelection(reason: 'bit-perfect preference changed');
+    await reapplyEqualizer();
+    await _refreshAudioOutputDiagnostics(
+      reason: 'bit-perfect preference changed',
+    );
+  }
+
+  Future<void> _loadGaplessPlaybackPreference() async {
+    final enabled = await _preferencesService.getGaplessPlaybackEnabled();
+    gaplessPlaybackEnabledNotifier.value = enabled;
+  }
+
+  Future<void> _loadDuckOnInterruptionPreference() async {
+    final enabled = await _preferencesService.getDuckOnInterruption();
+    duckOnInterruptionNotifier.value = enabled;
+  }
+
+  Future<void> setGaplessPlaybackEnabled(bool enabled) async {
+    final wasEnabled = gaplessPlaybackEnabledNotifier.value;
+    gaplessPlaybackEnabledNotifier.value = enabled;
+    await _preferencesService.setGaplessPlaybackEnabled(enabled);
+    if (!enabled && wasEnabled && !_usingRustBackend) {
+      await _androidEngine?.invalidateOnDemandGaplessSuccessor();
+    }
+    if (enabled && !wasEnabled && !_usingRustBackend) {
+      _androidEngine?.prepareGaplessAfterToggle();
+    }
+    // A mid-song toggle must prepare the successor now, not wait for the
+    // following track to start. Avoid replacing an already-prepared crossfade.
+    if (enabled &&
+        !wasEnabled &&
+        !_isCrossfadeActive &&
+        _shouldQueueNextTrack &&
+        _playlist.length > 1 &&
+        isPlayingNotifier.value) {
+      unawaited(
+        _queueNextTrackForGapless().catchError((Object error) {
+          _debugLog('[gapless] Could not prepare successor on enable: $error');
+        }),
+      );
+    }
+  }
+
+  Future<void> setDuckOnInterruption(bool enabled) async {
+    duckOnInterruptionNotifier.value = enabled;
+    await _preferencesService.setDuckOnInterruption(enabled);
+    if ((Platform.isAndroid || Platform.isIOS) && _audioSessionConfigured) {
+      await _applySystemAudioSessionConfig();
+    }
+  }
+
+  /// Push the current crossfade preferences to the Rust engine.
+  ///
+  /// Called by the settings UI after persisting the new values. The actual
+  /// engine command is routed through [_applyRustPlaybackProcessingPolicy],
+  /// which suppresses crossfade in bit-perfect mode and under 432 Hz tuning.
+  Future<void> applyCrossfadeSettings({
+    required bool enabled,
+    required double durationSecs,
+  }) async {
+    final wasEnabled = _rustAudioService.crossfadeEnabledNotifier.value;
+    _rustAudioService.crossfadeEnabledNotifier.value = enabled;
+    _rustAudioService.crossfadeDurationNotifier.value = durationSecs;
+    _crossfadeCurveIndex = await _appPreferencesService
+        .getCrossfadeCurveIndex();
+
+    if (_usingRustBackend) {
+      await _applyRustPlaybackProcessingPolicy(currentEngineType);
+      // Only (re)queue the next track when crossfade transitions to on.
+      // Re-queueing on every duration-slider drag spawns redundant decoders
+      // and can race the engine's source provider.
+      if (!wasEnabled &&
+          enabled &&
+          _isCrossfadeActive &&
+          currentSongNotifier.value != null &&
+          isPlayingNotifier.value) {
+        try {
+          await _queueNextTrackForGapless();
+        } catch (e) {
+          _debugLog('[crossfade] re-queue on enable failed: $e');
+        }
+      }
+      return;
+    }
+
+    // A Rust output failure can select the Standard engine for the rest of the
+    // session. Turning crossfade off is an explicit opportunity to retry the
+    // preferred Rust/Oboe route, without retrying unrelated USB/BT fallbacks.
+    if (wasEnabled &&
+        !enabled &&
+        _sessionManager.fallbackRequestedMode == AudioEngineType.rustOboe) {
+      await _restoreRustOboeAfterCrossfadeDisabled();
+      return;
+    }
+
+    // just_audio (standard) engine: crossfade runs in-engine, but a track loaded
+    // while crossfade was off used a ConcatenatingAudioSource (hard cut). On the
+    // on-transition, reload the current track as a single source at the same
+    // position so the engine can intercept the tail and crossfade.
+    if ((currentEngineType == AudioEngineType.normalAndroid ||
+            currentEngineType == AudioEngineType.iosSystem) &&
+        !wasEnabled &&
+        enabled &&
+        currentSongNotifier.value != null &&
+        isPlayingNotifier.value) {
+      final song = currentSongNotifier.value!;
+      final position = positionNotifier.value;
+      try {
+        await _runWithSuppressedSequenceStateUpdates(() async {
+          await _playbackManager.load(song);
+          if (position > Duration.zero) {
+            await _playbackManager.seek(position);
+          }
+          await _playbackManager.play();
+        });
+      } catch (e) {
+        _debugLog('[crossfade] reload on enable failed: $e');
+      }
+    }
+  }
+
+  Future<void> _restoreRustOboeAfterCrossfadeDisabled() {
+    return _enqueuePlaybackRequest(() async {
+      if (_usingRustBackend ||
+          _sessionManager.fallbackRequestedMode != AudioEngineType.rustOboe ||
+          _sessionManager.selectedMode != AudioEngineType.normalAndroid) {
+        return;
+      }
+
+      // Re-resolve the actual route: Bluetooth without the Rust output mode,
+      // bit-perfect, or a user selection of Standard must not be overridden.
+      final preferred = await _sessionManager.resolvePreferredMode(
+        refresh: true,
+      );
+      if (preferred != AudioEngineType.rustOboe) return;
+      await _sessionManager.syncRouteSelection(
+        reason: 'crossfade disabled after Rust engine fallback',
+      );
+      if (_sessionManager.selectedMode != AudioEngineType.rustOboe) return;
+
+      final song = currentSongNotifier.value;
+      if (song == null || !isPlayingNotifier.value) return;
+      final position = positionNotifier.value;
+      _debugLog(
+        '[Engine] Retrying preferred Rust/Oboe engine after crossfade disabled',
+      );
+      try {
+        await _resumeInternal();
+        _deadRustEngineRecoveryTimestamps.clear();
+      } catch (e) {
+        _debugLog('[Engine] Rust/Oboe restore failed: $e');
+        await _sessionManager.recordFallback(
+          requestedMode: AudioEngineType.rustOboe,
+          fallbackMode: AudioEngineType.normalAndroid,
+          reason: 'Rust/Oboe retry after crossfade disabled failed: $e',
+        );
+        await _sessionManager.switchMode(
+          AudioEngineType.normalAndroid,
+          initializeNewEngine: true,
+          reason: 'Rust/Oboe retry failed',
+        );
+        await _prepareImmediatePlaybackAsset(song);
+        await _runWithSuppressedSequenceStateUpdates(() async {
+          await _playbackManager.playTrack(song, initialPosition: position);
+        });
+        await _refreshAudioOutputDiagnostics(
+          reason: 'Rust/Oboe restore failed; Standard engine resumed',
+          activeSong: song,
+        );
+      }
+    });
+  }
+
+  /// Push the current crossfeed preference to the Rust engine.
+  ///
+  /// BS2B crossfeed is purely a Rust-engine DSP effect — just_audio has no
+  /// equivalent. The preference is persisted first by the settings UI; the
+  /// engine command is routed through [_applyRustPlaybackProcessingPolicy],
+  /// which suppresses it in bit-perfect mode and under 432 Hz tuning.
+  Future<void> applyCrossfeedSettings() async {
+    if (Platform.isIOS) {
+      EqEngineHint.iosCrossfeedActive =
+          await _appPreferencesService.getCrossfeedLevel() > 0;
+      await syncIosProcessingRoute();
+    }
+    if (_usingRustBackend) {
+      await _applyRustPlaybackProcessingPolicy(currentEngineType);
+    }
+  }
+
+  Future<void> syncIosProcessingRoute() async {
+    if (!Platform.isIOS) return;
+    await _sessionManager.syncRouteSelection(
+      reason: 'iOS processing preference changed',
+    );
+    if (!isPlayingNotifier.value || !_playbackManager.hasAttachedEngine) return;
+    await _enqueuePlaybackRequest(() async {
+      final song = currentSongNotifier.value;
+      if (song == null || !isPlayingNotifier.value) return;
+      final desired = await _sessionManager.resolvePreferredMode();
+      final prepared = await _prepareRequestedEngineForSong(
+        desired,
+        song: song,
+        reason: 'iOS processing',
+      );
+      if (prepared == currentEngineType) return;
+      final position = positionNotifier.value;
+      await _ensureEngineReady(prepared, song: song, reason: 'iOS processing');
+      if (_usingRustBackend) {
+        await _refreshReplayGainForSong(song, pushSpawnDefault: true);
+      }
+      await _playbackManager.playTrack(song, initialPosition: position);
+      if (!_usingRustBackend) await _applyReplayGainForSystemTier(song);
+    });
+  }
+
+  Future<void> _loadFloatingPlayerPreference() async {
+    final enabled = await _appPreferencesService.getFloatingPlayerEnabled();
+    if (enabled) {
+      await _activateFloatingPlayer();
+    }
+  }
+
+  /// Activates the floating overlay. Returns `true` if the overlay could be
+  /// shown (Android + overlay permission granted), `false` if permission is
+  /// still required — in which case [requestFloatingPlayerPermission] should
+  /// be called first.
+  Future<bool> setFloatingPlayerEnabled(bool enabled) async {
+    if (enabled) {
+      return _activateFloatingPlayer();
+    }
+    await _deactivateFloatingPlayer();
+    return true;
+  }
+
+  Future<bool> requestFloatingPlayerPermission() async {
+    return _floatingPlayerService.requestPermission();
+  }
+
+  Future<bool> canShowFloatingPlayer() async {
+    if (!Platform.isAndroid) return false;
+    return _floatingPlayerService.canDrawOverlays();
+  }
+
+  Future<bool> _activateFloatingPlayer() async {
+    if (!Platform.isAndroid) return false;
+    final canDraw = await _floatingPlayerService.canDrawOverlays();
+    if (!canDraw) return false;
+    _floatingPlayerActive = true;
+    await _showFloatingPlayerOverlay();
+    return true;
+  }
+
+  Future<void> _deactivateFloatingPlayer() async {
+    _floatingPlayerActive = false;
+    await _floatingPlayerService.hide();
+  }
+
+  Future<void> _showFloatingPlayerOverlay() async {
+    if (!Platform.isAndroid) return;
+    if (!_floatingPlayerActive) return;
+    if (_appInForeground) return;
+    final song = currentSongNotifier.value;
+    if (song == null) return;
+    await _floatingPlayerService.show(
+      song: song,
+      isPlaying: isPlayingNotifier.value,
+      duration: durationNotifier.value,
+      position: positionNotifier.value,
+    );
+  }
+
+  Future<void> onAppPaused() async {
+    _appInForeground = false;
+    // Background music continues; only hidden UI/FFI refreshes slow down.
+    _rustAudioService.setAppForeground(false);
+    if (!Platform.isAndroid) return;
+    final enabled = await _appPreferencesService.getFloatingPlayerEnabled();
+    if (!enabled) return;
+    await _activateFloatingPlayer();
+  }
+
+  Future<void> onAppResumed() async {
+    _appInForeground = true;
+    _rustAudioService.setAppForeground(true);
+    if (_floatingPlayerActive) {
+      await _deactivateFloatingPlayer();
+    }
+    unawaited(_restoreBitPerfectEngineAfterForeground());
+  }
+
+  Future<void> onAppDetached() async {
+    // Preserve the established Android overlay/route cleanup. An iPhone with
+    // no attached UI keeps the background observation budget.
+    if (!Platform.isIOS) return onAppResumed();
+    _appInForeground = false;
+    _rustAudioService.setAppForeground(false);
+  }
+
+  /// One UI suspends userspace USB transfers while the app is backgrounded,
+  /// which makes direct USB fake-fail ("USB DAC disconnected") and fall back
+  /// to ExoPlayer. Re-attach the bit-perfect engine once we're back.
+  Future<void> _restoreBitPerfectEngineAfterForeground() async {
+    if (!Platform.isAndroid ||
+        !isPlayingNotifier.value ||
+        currentEngineType != AudioEngineType.normalAndroid) {
+      return;
+    }
+    try {
+      await _sessionManager.syncRouteSelection(reason: 'app resumed');
+      if (_sessionManager.selectedMode != AudioEngineType.usbDacExperimental ||
+          currentEngineType == AudioEngineType.usbDacExperimental) {
+        return;
+      }
+      if (currentSongNotifier.value == null) return;
+      _debugLog(
+        '[Engine] Foreground: restoring ${AudioEngineType.usbDacExperimental.logLabel}',
+      );
+      await _enqueuePlaybackRequest(() async {
+        try {
+          await _resumeInternal();
+        } catch (e) {
+          final recovered = await _handleDirectUsbStartupRefusal(
+            e,
+            song: currentSongNotifier.value,
+            initialPosition: positionNotifier.value,
+          );
+          if (!recovered) rethrow;
+        }
+      });
+    } catch (e) {
+      _debugLog('[Engine] Foreground bit-perfect restore failed: $e');
+    }
+  }
+
+  bool get _isGaplessActive =>
+      _usingRustBackend &&
+      gaplessPlaybackEnabledNotifier.value &&
+      !isBitPerfectModeEnabled &&
+      loopModeNotifier.value != LoopMode.one;
+
+  bool get _isCrossfadeActive =>
+      _usingRustBackend &&
+      _rustAudioService.crossfadeEnabledNotifier.value &&
+      !isBitPerfectProcessingLocked &&
+      loopModeNotifier.value != LoopMode.one;
+
+  bool get _shouldQueueNextTrack =>
+      _usingRustBackend &&
+      !isBitPerfectModeEnabled &&
+      (_isGaplessActive || _isCrossfadeActive);
+
+  void _notifyQueueChanged() {
+    queueNotifier.value = List.unmodifiable(
+      _queuedEntries.map((entry) => entry.song),
+    );
+  }
+
+  void _notifyUpNextChanged() {
+    upNextNotifier.value = upNext;
+    _scheduleAutoplayPreview();
+  }
+
+  bool get _canPreviewAutoplay =>
+      autoplayOnQueueEndNotifier.value &&
+      loopModeNotifier.value == LoopMode.off &&
+      shuffleModeNotifier.value != ShuffleMode.random &&
+      shuffleModeNotifier.value != ShuffleMode.categories &&
+      shuffleModeNotifier.value != ShuffleMode.songsAndCategories &&
+      _currentIndex >= 0 &&
+      _currentIndex < _playlist.length &&
+      _playlist.length - _currentIndex - 1 <= 1;
+
+  void _scheduleAutoplayPreview() {
+    final generation = ++_autoplayPreviewGeneration;
+    _autoplayOnlinePreviewJob = null;
+    _autoplayPreviewTimer?.cancel();
+    // Invalidate the previous source's candidates immediately. A rapid skip
+    // must never play a preview computed for an earlier playlist position.
+    if (autoplayQueueNotifier.value.isNotEmpty) {
+      autoplayQueueNotifier.value = const [];
+    }
+    if (!_canPreviewAutoplay) return;
+    // Avoid reading the whole library during rapid queue mutations/seek taps.
+    _autoplayPreviewTimer = Timer(const Duration(milliseconds: 180), () {
+      unawaited(_prepareAutoplayPreview(generation));
+    });
+  }
+
+  Future<void> _prepareAutoplayPreview(int generation) async {
+    try {
+      final seed = _playlist.last;
+      final job = const OnlineRadioRecommendations().recommend(
+        seed,
+        count: _autoplayPreviewCount,
+        existing: _playlist,
+      );
+      _autoplayOnlinePreviewJob = job;
+      final online = await job;
+      if (identical(_autoplayOnlinePreviewJob, job)) {
+        _autoplayOnlinePreviewJob = null;
+      }
+      if (generation != _autoplayPreviewGeneration || !_canPreviewAutoplay) {
+        return;
+      }
+      if (online.isNotEmpty) {
+        autoplayQueueNotifier.value = online;
+        return;
+      }
+      // Offline, no public radio, or unavailable source credentials:
+      // keep ordinary local playback viable without advertising it as radio.
+      final library = await _songRepository.getAllSongs();
+      if (generation != _autoplayPreviewGeneration || !_canPreviewAutoplay)
+        return;
+      autoplayQueueNotifier.value = selectAutoplayRecommendations(
+        library: library,
+        excludedIds: {..._playlist.map((song) => song.id)},
+        count: _autoplayPreviewCount,
+      );
+    } catch (e) {
+      if (generation == _autoplayPreviewGeneration) {
+        autoplayQueueNotifier.value = const [];
+        _debugLog('[Autoplay] Could not load preview: $e');
+      }
+    }
+  }
+
+  void _debounceQueueChanged() {
+    _queueDebounceTimer?.cancel();
+    _queueDebounceTimer = Timer(_queueDebounce, () {
+      _notifyQueueChanged();
+      // Native sequence rebuilds cannot include unresolved Discovery
+      // placeholders; they have no audio URL. Leave the playing decoder
+      // alone and let QueuePreResolver replace those entries in the logical
+      // queue until they are actually ready.
+      if (_playlist.isNotEmpty &&
+          !_usingRustBackend &&
+          !requiresOnDemandAndroidSequence(_playlist)) {
+        unawaited(_rebuildPlaylist());
+      } else if (!_usingRustBackend &&
+          _androidEngine?.isSingleTrackOnly == true) {
+        // Reordering/removing the next logical track invalidates the native
+        // preloaded child. Otherwise Media3 may advance to a deleted entry.
+        unawaited(_androidEngine!.invalidateOnDemandGaplessSuccessor());
+      }
+    });
+  }
+
+  void _setCurrentIndex(int newIndex) {
+    if (_currentIndex == newIndex) return;
+    _currentIndex = newIndex;
+    currentIndexNotifier.value = newIndex;
+    _prefetchedNextSongId = null;
+    _notifyUpNextChanged();
+  }
+
+  void _replacePlaybackContext(List<Song> songs) {
+    _queueContextRevision++;
+    _audioSourceSequence = null;
+    _playlist
+      ..clear()
+      ..addAll(songs);
+    _originalPlaylist
+      ..clear()
+      ..addAll(songs);
+    _playlistQueueEntryIds
+      ..clear()
+      ..addAll(List<int?>.filled(songs.length, null));
+    _queuedEntries.clear();
+    _notifyQueueChanged();
+    _notifyUpNextChanged();
+  }
+
+  List<String> _playlistNonQueueIds() {
+    final ids = <String>[];
+    for (var i = 0; i < _playlist.length; i++) {
+      if (_playlistQueueEntryIds[i] == null) {
+        ids.add(_playlist[i].id);
+      }
+    }
+    return ids;
+  }
+
+  /// Preserve queued identities when an explicit library organization moves a file.
+  void syncSongFileLocation({
+    required String oldPath,
+    required String newPath,
+    required String folderUri,
+    required String relativeFolderPath,
+  }) {
+    Song update(Song song) => song.filePath == oldPath
+        ? song.copyWith(
+            filePath: newPath,
+            folderUri: folderUri,
+            relativeFolderPath: relativeFolderPath,
+          )
+        : song;
+    for (var i = 0; i < _playlist.length; i++) {
+      _playlist[i] = update(_playlist[i]);
+    }
+    for (var i = 0; i < _originalPlaylist.length; i++) {
+      _originalPlaylist[i] = update(_originalPlaylist[i]);
+    }
+    for (var i = 0; i < _queuedEntries.length; i++) {
+      final entry = _queuedEntries[i];
+      _queuedEntries[i] = _QueueEntry(id: entry.id, song: update(entry.song));
+    }
+    final current = currentSongNotifier.value;
+    if (current != null && current.filePath == oldPath)
+      currentSongNotifier.value = update(current);
+    _notifyQueueChanged();
+    _notifyUpNextChanged();
+  }
+
+  /// Promote a successfully decoded online fallback to the active track,
+  /// its queue entries and the Android notification. Ignore late image
+  /// responses for a different song or artwork that has since changed.
+  void recoverCurrentOnlineArtwork({
+    required String songId,
+    required String? originalArtwork,
+    required String recoveredArtwork,
+  }) {
+    // A decoded library match is as valid as a decoded HTTPS catalogue
+    // image. Never accept an unverified/expired local path as artwork.
+    if (!recoveredArtwork.startsWith('https://') &&
+        !File(recoveredArtwork).existsSync())
+      return;
+    final current = currentSongNotifier.value;
+    if (current == null ||
+        current.id != songId ||
+        current.albumArt != originalArtwork ||
+        current.albumArt == recoveredArtwork)
+      return;
+
+    Song update(Song song) =>
+        song.id == songId && song.albumArt == originalArtwork
+        ? song.copyWith(albumArt: recoveredArtwork)
+        : song;
+    for (var i = 0; i < _playlist.length; i++) {
+      _playlist[i] = update(_playlist[i]);
+    }
+    for (var i = 0; i < _originalPlaylist.length; i++) {
+      _originalPlaylist[i] = update(_originalPlaylist[i]);
+    }
+    for (var i = 0; i < _queuedEntries.length; i++) {
+      final entry = _queuedEntries[i];
+      _queuedEntries[i] = _QueueEntry(id: entry.id, song: update(entry.song));
+    }
+    currentSongNotifier.value = update(current);
+    _notifyQueueChanged();
+    _notifyUpNextChanged();
+    _updateNotificationState();
+  }
+
+  void syncAlbumArtPaths({
+    required Iterable<String> filePaths,
+    required String? albumArtPath,
+  }) {
+    final targetPaths = filePaths.where((path) => path.isNotEmpty).toSet();
+    if (targetPaths.isEmpty) {
+      return;
+    }
+
+    Song syncSong(Song song) {
+      final path = song.filePath;
+      if (path == null || !targetPaths.contains(path)) {
+        return song;
+      }
+      if (song.albumArt == albumArtPath) {
+        return song;
+      }
+      return _copySongWithAlbumArt(song, albumArtPath);
+    }
+
+    var queueChanged = false;
+
+    for (var i = 0; i < _playlist.length; i++) {
+      final updated = syncSong(_playlist[i]);
+      if (!identical(updated, _playlist[i])) {
+        _playlist[i] = updated;
+      }
+    }
+
+    for (var i = 0; i < _originalPlaylist.length; i++) {
+      final updated = syncSong(_originalPlaylist[i]);
+      if (!identical(updated, _originalPlaylist[i])) {
+        _originalPlaylist[i] = updated;
+      }
+    }
+
+    for (var i = 0; i < _queuedEntries.length; i++) {
+      final entry = _queuedEntries[i];
+      final updatedSong = syncSong(entry.song);
+      if (!identical(updatedSong, entry.song)) {
+        _queuedEntries[i] = _QueueEntry(id: entry.id, song: updatedSong);
+        queueChanged = true;
+      }
+    }
+
+    var currentSongUpdated = false;
+    final currentSong = currentSongNotifier.value;
+    if (currentSong != null) {
+      final updatedCurrentSong = syncSong(currentSong);
+      if (!identical(updatedCurrentSong, currentSong)) {
+        currentSongNotifier.value = updatedCurrentSong;
+        currentSongUpdated = true;
+      }
+    }
+
+    if (queueChanged) {
+      _notifyQueueChanged();
+    }
+
+    if (currentSongUpdated) {
+      _updateNotificationState();
+    }
+  }
+
+  Song _copySongWithAlbumArt(Song song, String? albumArtPath) {
+    return Song(
+      id: song.id,
+      title: song.title,
+      artist: song.artist,
+      albumArt: albumArtPath,
+      duration: song.duration,
+      fileType: song.fileType,
+      resolution: song.resolution,
+      sampleRate: song.sampleRate,
+      bitDepth: song.bitDepth,
+      replaygainTrackGain: song.replaygainTrackGain,
+      replaygainTrackPeak: song.replaygainTrackPeak,
+      replaygainAlbumGain: song.replaygainAlbumGain,
+      replaygainAlbumPeak: song.replaygainAlbumPeak,
+      startOffsetMs: song.startOffsetMs,
+      endOffsetMs: song.endOffsetMs,
+      ripper: song.ripper,
+      readMode: song.readMode,
+      accurateRip: song.accurateRip,
+      testCrc: song.testCrc,
+      copyCrc: song.copyCrc,
+      album: song.album,
+      albumArtist: song.albumArtist,
+      trackNumber: song.trackNumber,
+      discNumber: song.discNumber,
+      year: song.year,
+      genre: song.genre,
+      filePath: song.filePath,
+      folderUri: song.folderUri,
+      relativeFolderPath: song.relativeFolderPath,
+      dateAdded: song.dateAdded,
+      isExternal: song.isExternal,
+      sourcePackage: song.sourcePackage,
+      sourceType: song.sourceType,
+      remoteId: song.remoteId,
+      remoteServerId: song.remoteServerId,
+    );
+  }
+
+  /// Immediately reflects edited metadata in the in-memory playback state so
+  /// the UI (mini/full player, notification, queue) updates without waiting
+  /// for a DB watch tick or a track change.
+  ///
+  /// Fields with `null` mean “unchanged” (mirrors `SongRepository.updateSongMetadata`
+  /// and `MetadataEditorService` semantics). Only `filePath`-matched songs are patched.
+  void syncSongMetadata({
+    required String filePath,
+    String? title,
+    String? artist,
+    String? album,
+    String? albumArtist,
+    String? genre,
+    int? year,
+    int? trackNumber,
+    int? discNumber,
+  }) {
+    if (filePath.isEmpty) return;
+    final hasChange =
+        title != null ||
+        artist != null ||
+        album != null ||
+        albumArtist != null ||
+        genre != null ||
+        year != null ||
+        trackNumber != null ||
+        discNumber != null;
+    if (!hasChange) return;
+
+    Song syncSong(Song song) {
+      if (song.filePath != filePath) return song;
+      // Detect if anything would actually change.
+      final nextTitle = title ?? song.title;
+      final nextArtist = artist ?? song.artist;
+      final nextAlbum = album ?? song.album;
+      final nextAlbumArtist = albumArtist ?? song.albumArtist;
+      final nextGenre = genre ?? song.genre;
+      final nextYear = year ?? song.year;
+      final nextTrack = trackNumber ?? song.trackNumber;
+      final nextDisc = discNumber ?? song.discNumber;
+      if (nextTitle == song.title &&
+          nextArtist == song.artist &&
+          nextAlbum == song.album &&
+          nextAlbumArtist == song.albumArtist &&
+          nextGenre == song.genre &&
+          nextYear == song.year &&
+          nextTrack == song.trackNumber &&
+          nextDisc == song.discNumber) {
+        return song;
+      }
+      return Song(
+        id: song.id,
+        title: nextTitle,
+        artist: nextArtist,
+        albumArt: song.albumArt,
+        duration: song.duration,
+        fileType: song.fileType,
+        resolution: song.resolution,
+        sampleRate: song.sampleRate,
+        bitDepth: song.bitDepth,
+        replaygainTrackGain: song.replaygainTrackGain,
+        replaygainTrackPeak: song.replaygainTrackPeak,
+        replaygainAlbumGain: song.replaygainAlbumGain,
+        replaygainAlbumPeak: song.replaygainAlbumPeak,
+        startOffsetMs: song.startOffsetMs,
+        endOffsetMs: song.endOffsetMs,
+        ripper: song.ripper,
+        readMode: song.readMode,
+        accurateRip: song.accurateRip,
+        testCrc: song.testCrc,
+        copyCrc: song.copyCrc,
+        album: nextAlbum,
+        albumArtist: nextAlbumArtist,
+        trackNumber: nextTrack,
+        discNumber: nextDisc,
+        year: nextYear,
+        genre: nextGenre,
+        filePath: song.filePath,
+        folderUri: song.folderUri,
+        relativeFolderPath: song.relativeFolderPath,
+        dateAdded: song.dateAdded,
+        isExternal: song.isExternal,
+        sourcePackage: song.sourcePackage,
+        sourceType: song.sourceType,
+        remoteId: song.remoteId,
+        remoteServerId: song.remoteServerId,
+      );
+    }
+
+    var queueChanged = false;
+
+    for (var i = 0; i < _playlist.length; i++) {
+      final updated = syncSong(_playlist[i]);
+      if (!identical(updated, _playlist[i])) {
+        _playlist[i] = updated;
+      }
+    }
+
+    for (var i = 0; i < _originalPlaylist.length; i++) {
+      final updated = syncSong(_originalPlaylist[i]);
+      if (!identical(updated, _originalPlaylist[i])) {
+        _originalPlaylist[i] = updated;
+      }
+    }
+
+    for (var i = 0; i < _queuedEntries.length; i++) {
+      final entry = _queuedEntries[i];
+      final updatedSong = syncSong(entry.song);
+      if (!identical(updatedSong, entry.song)) {
+        _queuedEntries[i] = _QueueEntry(id: entry.id, song: updatedSong);
+        queueChanged = true;
+      }
+    }
+
+    var currentSongUpdated = false;
+    final currentSong = currentSongNotifier.value;
+    if (currentSong != null) {
+      final updatedCurrentSong = syncSong(currentSong);
+      if (!identical(updatedCurrentSong, currentSong)) {
+        currentSongNotifier.value = updatedCurrentSong;
+        currentSongUpdated = true;
+      }
+    }
+
+    if (queueChanged) {
+      _notifyQueueChanged();
+    }
+    _notifyUpNextChanged();
+
+    if (currentSongUpdated) {
+      _updateNotificationState();
+    }
+  }
+
+  void _insertQueuedEntriesAfterCurrent() {
+    if (_queuedEntries.isEmpty || _playlist.isEmpty) return;
+    final insertIndex = (_currentIndex + 1).clamp(0, _playlist.length);
+    for (var i = 0; i < _queuedEntries.length; i++) {
+      final entry = _queuedEntries[i];
+      _playlist.insert(insertIndex + i, entry.song);
+      _playlistQueueEntryIds.insert(insertIndex + i, entry.id);
+    }
+    _notifyUpNextChanged();
+  }
+
+  void _consumeQueueEntryAt(int playlistIndex) {
+    if (playlistIndex < 0 || playlistIndex >= _playlistQueueEntryIds.length) {
+      return;
+    }
+    final queueEntryId = _playlistQueueEntryIds[playlistIndex];
+    if (queueEntryId == null) return;
+    _playlistQueueEntryIds[playlistIndex] = null;
+    _queuedEntries.removeWhere((entry) => entry.id == queueEntryId);
+    _notifyQueueChanged();
+    _notifyUpNextChanged();
+  }
+
+  int _findPlaylistIndexForQueueEntry(int queueEntryId) {
+    return _playlistQueueEntryIds.indexOf(queueEntryId);
+  }
+
+  Future<void> _removeQueueEntryById(int queueEntryId) async {
+    final playlistIndex = _findPlaylistIndexForQueueEntry(queueEntryId);
+    _queuedEntries.removeWhere((entry) => entry.id == queueEntryId);
+    if (playlistIndex != -1) {
+      _playlist.removeAt(playlistIndex);
+      _playlistQueueEntryIds.removeAt(playlistIndex);
+      if (playlistIndex < _currentIndex) {
+        _setCurrentIndex(_currentIndex - 1);
+      }
+      _removeFromAudioSequence(playlistIndex);
+    }
+    _notifyQueueChanged();
+    _notifyUpNextChanged();
+    if (_usingRustBackend || _audioSourceSequence == null) {
+      _debounceQueueChanged();
+    }
+  }
+
+  /// Android: current audio session ID from just_audio (for Equalizer attachment).
+  /// Null when not set or on non-Android platforms.
+  int? get androidAudioSessionId => _justAudioPlayer?.androidAudioSessionId;
+  Stream<PlaybackState> get playbackStateStream =>
+      _playbackManager.playbackState;
+  PlaybackState? get latestPlaybackState => _playbackManager.latestState;
+  ValueNotifier<AudioEngineType> get selectedPlaybackModeNotifier =>
+      _sessionManager.selectedModeNotifier;
+  ValueNotifier<AudioEngineType?> get initializedPlaybackModeNotifier =>
+      _sessionManager.initializedModeNotifier;
+  AudioEngineType get currentEngineType =>
+      _sessionManager.initializedMode ?? _sessionManager.selectedMode;
+  bool get isBitPerfectModeEnabled =>
+      (currentEngineType == AudioEngineType.usbDacExperimental &&
+          _uac2Service.isBitPerfectEnabledSync) ||
+      (currentEngineType == AudioEngineType.rustOboe &&
+          Uac2PreferencesService.isAndroidMixerUsbSelectedSync &&
+          _uac2Service.isBitPerfectEnabledSync) ||
+      (currentEngineType == AudioEngineType.dapInternalHighRes &&
+          _uac2Service.isDapBitPerfectEnabledSync);
+  bool get isBitPerfectProcessingLocked =>
+      bitPerfectProcessingLockedNotifier.value;
+  bool get isCurrentTrackDoP =>
+      Platform.isAndroid &&
+      (Uac2PreferencesService.dsdOutputModeSync == DsdOutputMode.forceDop ||
+          Uac2PreferencesService.dsdOutputModeSync == DsdOutputMode.native ||
+          Uac2PreferencesService.dsdOutputModeSync == DsdOutputMode.auto) &&
+      currentSongNotifier.value?.isDsd == true;
+
+  void _updateBitPerfectProcessingLocked() {
+    final locked =
+        switch (currentEngineType) {
+          AudioEngineType.usbDacExperimental => true,
+          AudioEngineType.rustOboe =>
+            Uac2PreferencesService.isAndroidMixerUsbSelectedSync &&
+                _uac2Service.isBitPerfectEnabledSync,
+          AudioEngineType.dapInternalHighRes =>
+            _uac2Service.isDapBitPerfectEnabledSync,
+          _ => false,
+        } ||
+        Uac2PreferencesService.is432HzTuningEnabledSync;
+    if (bitPerfectProcessingLockedNotifier.value != locked) {
+      bitPerfectProcessingLockedNotifier.value = locked;
+    }
+    _updateMotionArtSuppression();
+  }
+
+  /// Motion art opens a second ExoPlayer/output stream. On direct bit-perfect
+  /// paths (native DIRECT AudioTrack / ALSA direct) that can preempt the
+  /// native stream, so suppress it unless the user explicitly opted in.
+  void _updateMotionArtSuppression() {
+    final suppressed = shouldSuppressMotionArt(
+      bitPerfectEnabled: isBitPerfectModeEnabled,
+      engine: currentEngineType,
+      allowDuringBitPerfect: _motionArtDuringBitPerfect,
+    );
+    if (motionArtSuppressedNotifier.value != suppressed) {
+      motionArtSuppressedNotifier.value = suppressed;
+    }
+  }
+
+  /// Listener for 432 Hz tuning changes. Crossfade is suppressed under tuning
+  /// (the mix bypasses speed resampling), so re-applying the processing policy
+  /// pushes the new crossfade state to the Rust engine immediately.
+  void _on432HzTuningChanged() {
+    _updateBitPerfectProcessingLocked();
+    if (_usingRustBackend) {
+      unawaited(_applyRustPlaybackProcessingPolicy(currentEngineType));
+    }
+  }
+
+  void _debugLog(String message) {
+    devLog(message);
+  }
+
+  /// Initialize the audio engine.
+  /// Sets up just_audio with gapless playback support.
+  Future<void> initAudio() async {
+    if (_audioInitialized) return;
+    final inFlight = _audioInitInFlight;
+    if (inFlight != null) {
+      await inFlight;
+      return;
+    }
+
+    final future = _initializeAudio();
+    _audioInitInFlight = future;
+    await future;
+  }
+
+  Future<void> prepareForAppLaunch() async {
+    final inFlight = _appLaunchPreparationInFlight;
+    if (inFlight != null) {
+      await inFlight;
+      return;
+    }
+
+    final future = _prepareForAppLaunchInternal();
+
+    _appLaunchPreparationInFlight = future;
+    try {
+      await future;
+    } finally {
+      _appLaunchPreparationInFlight = null;
+    }
+  }
+
+  Future<void> _prepareForAppLaunchInternal() async {
+    await initAudio();
+    if ((Platform.isAndroid || Platform.isIOS) &&
+        !_sessionManager.selectedMode.usesRustBackend) {
+      await _ensureAndroidPlayer();
+    }
+    await reapplyEqualizer();
+    if (Platform.isIOS) await applyCrossfeedSettings();
+  }
+
+  Future<void> setHiFiModeEnabled(bool enabled) async {
+    await initAudio();
+    await _sessionManager.setHiFiModeEnabled(enabled);
+  }
+
+  Future<void> setDapBitPerfectEnabled(bool enabled) async {
+    await _preferencesService.setDapBitPerfectEnabled(enabled);
+    _uac2Service.dapBitPerfectEnabledNotifier.value = enabled;
+    rust_audio.audioSetDapBitPerfectEnabled(enabled: enabled);
+    await _sessionManager.syncRouteSelection(
+      reason: enabled
+          ? 'Bit-perfect (DAP Internal) enabled'
+          : 'Bit-perfect (DAP Internal) disabled',
+    );
+  }
+
+  Future<void> setAudioEnginePreference(
+    AudioEnginePreference preference,
+  ) async {
+    await _preferencesService.setAudioEnginePreference(preference);
+    await initAudio();
+    await _sessionManager.syncRouteSelection(
+      reason: 'audio engine preference changed',
+    );
+  }
+
+  /// Re-resolves the desired engine/route. The newly selected engine attaches
+  /// on the next playback request.
+  Future<void> syncAudioRouteSelection({required String reason}) {
+    return _sessionManager.syncRouteSelection(reason: reason);
+  }
+
+  /// Re-arms the direct USB engine after a startup fallback and, when a track
+  /// is playing, re-attaches playback to the exclusive path.
+  Future<bool> retryDirectUsbForCurrentDevice() async {
+    if (!Platform.isAndroid) return false;
+    await _sessionManager.retryExperimentalUsbForCurrentDevice();
+    if (_sessionManager.selectedMode != AudioEngineType.usbDacExperimental) {
+      return false;
+    }
+    final song = currentSongNotifier.value;
+    if (song == null || !isPlayingNotifier.value) {
+      await initAudio();
+      return true;
+    }
+    await _enqueuePlaybackRequest(() async {
+      try {
+        await _resumeInternal();
+      } catch (e) {
+        await _handleDirectUsbStartupRefusal(
+          e,
+          song: song,
+          initialPosition: positionNotifier.value,
+        );
+      }
+    });
+    return _sessionManager.selectedMode == AudioEngineType.usbDacExperimental;
+  }
+
+  /// Explicit recovery for a stuck USB engine. The existing retry method
+  /// only changes route selection; it does not necessarily close a still-live
+  /// Rust engine or reopen the native endpoint. This force restart works even
+  /// after Android fallback and does not require a physical USB replug.
+  ///
+  /// It runs inside the playback request queue so taps/auto-skip cannot
+  /// reconfigure USB while a new source is being resolved. Keep the playlist
+  /// but always restart the selected track from 0:00 and verify live output.
+  Future<bool> forceRestartUsbAudioEngine() {
+    final pending = _manualUsbRestartInFlight;
+    if (pending != null) return pending;
+
+    final completion = Completer<bool>();
+    _manualUsbRestartInFlight = completion.future;
+    unawaited(
+      _enqueuePlaybackRequest(() async {
+        try {
+          completion.complete(await _forceRestartUsbAudioEngineInternal());
+        } catch (error) {
+          AppLog.instance.add('[USB] Manual engine restart failed: $error');
+          completion.complete(false);
+        } finally {
+          _manualUsbRestartInFlight = null;
+        }
+      }),
+    );
+    return completion.future;
+  }
+
+  Future<bool> _forceRestartUsbAudioEngineInternal() async {
+    if (!Platform.isAndroid) return false;
+    final preference = await _preferencesService.getAudioEnginePreference();
+    if (preference != AudioEnginePreference.isochronousUsb) {
+      AppLog.instance.add(
+        '[USB] Manual restart refused: direct USB '
+        'is not the selected playback engine',
+      );
+      return false;
+    }
+
+    await initAudio();
+    final song = currentSongNotifier.value ?? _songAtCurrentIndex();
+    final playableSong =
+        song != null && !song.isPending && (song.filePath?.isNotEmpty ?? false)
+        ? song
+        : null;
+    if (playableSong == null) {
+      AppLog.instance.add(
+        '[USB] Manual restart requires a resolved '
+        'playable track to verify the exclusive USB stream',
+      );
+      return false;
+    }
+    // A recovery is not a seek. Start at the beginning to avoid exercising
+    // stale decoder/seek state while the USB device is being re-claimed.
+    const position = Duration.zero;
+    final wasPlaying = isPlayingNotifier.value;
+    // Do not guess a playable track's bit depth from a previous recording:
+    // the normal engine-preparation path probes missing metadata itself.
+    final format = _deriveUac2FormatFromSong(playableSong);
+
+    AppLog.instance.add(
+      '[USB] Manual engine restart requested '
+      '(playing=$wasPlaying, track=${song?.title ?? 'none'}, '
+      'positionMs=${position.inMilliseconds})',
+    );
+
+    try {
+      // A newly selected USB route is not necessarily usable: libusb can
+      // acknowledge opening a stale handle and fail on the very next URB.
+      // Retry the entire stop/reset/reopen cycle within ONE button press.
+      for (var attempt = 1; attempt <= 3; attempt++) {
+        AppLog.instance.add('[USB] Manual restart attempt $attempt/3');
+        try {
+          final success = await restartDirectUsbSessionSequence(
+            stopEngine: () async {
+              // Dispose the old Rust callback and engine before releasing
+              // the native interface, including when the last handle died.
+              await _sessionManager.switchMode(
+                AudioEngineType.normalAndroid,
+                reason: 'force restart direct USB - detach old engine',
+              );
+              if (_rustAudioService.isInitialized) {
+                await _disposeUsbEngine();
+              }
+              await _releaseAndroidManagedAudioResources(
+                reason: 'force restart direct USB',
+              );
+            },
+            resetTransport: () async {
+              // A failed host handle can temporarily remove the device from
+              // UsbManager. Wait for actual enumeration, never frozen state.
+              final present = await awaitReattachedUsbDevice(
+                physicallyPresent: () async => (await _uac2Service.listDevices(
+                  verifyPhysicalAttachment: true,
+                )).isNotEmpty,
+                pauseBetweenChecks: () =>
+                    Future<void>.delayed(const Duration(milliseconds: 250)),
+              );
+              if (!present) {
+                throw StateError(
+                  'DAC did not reappear in Android USB inventory',
+                );
+              }
+              return _uac2Service.resetAndroidDirectUsbPath(format: format);
+            },
+            reselectDirectRoute: () =>
+                _sessionManager.retryExperimentalUsbForCurrentDevice(),
+            restorePlayback: () async {
+              await _prepareImmediatePlaybackAsset(playableSong);
+              final engine = await _ensureEngineReady(
+                AudioEngineType.usbDacExperimental,
+                song: playableSong,
+                reason: 'manual direct USB engine restart',
+              );
+              if (engine != AudioEngineType.usbDacExperimental) {
+                throw StateError(
+                  'Track cannot be restored over direct USB '
+                  '(resolved engine: ${engine.logLabel})',
+                );
+              }
+              await _runWithSuppressedSequenceStateUpdates(() async {
+                await _playbackManager.playTrack(
+                  playableSong,
+                  initialPosition: Duration.zero,
+                  autoPlay: true,
+                );
+              });
+              _ensurePositionSaveTimer();
+            },
+          );
+          if (!success) {
+            throw StateError(
+              'Native DAC reset or direct route selection failed',
+            );
+          }
+          if (!await _verifyManualUsbRestartPlayback()) {
+            throw StateError('USB stream did not sustain verified audio');
+          }
+          _sessionManager.clearFallbackReason();
+          await _refreshAudioOutputDiagnostics(
+            reason: 'manual USB engine restart verified',
+            activeSong: playableSong,
+          );
+          AppLog.instance.add(
+            '[USB] Manual engine restart verified '
+            '(attempt=$attempt, fromBeginning=true, directRoute=true)',
+          );
+          return true;
+        } catch (attemptError) {
+          AppLog.instance.add(
+            '[USB] Manual restart attempt $attempt/3 '
+            'failed: $attemptError',
+          );
+          // A format rejection is deterministic for this recording. Repeated
+          // close/claim/open cycles cannot change its advertised bit depth
+          // or sample rate, and thrash the DAC and Android audio session.
+          if (attempt == 3 ||
+              !shouldRetryDirectUsbManualRestart(
+                error: attemptError,
+                fallbackReason: _sessionManager.fallbackReason,
+              ))
+            rethrow;
+          // Drain callbacks from the failed endpoint before trying a new
+          // native registration, not just another play() on the same handle.
+          await Future<void>.delayed(Duration(milliseconds: attempt * 350));
+        }
+      }
+      return false;
+    } catch (error) {
+      AppLog.instance.add(
+        '[USB] Manual restart could not restore direct '
+        'USB output: $error',
+      );
+      // Do not leave a half-initialized USB engine selected or pretend
+      // bit-perfect is active. Restore Android-managed playback if possible.
+      try {
+        await _sessionManager.switchMode(
+          AudioEngineType.normalAndroid,
+          reason: 'manual restart final failure - retire Rust engine',
+        );
+        if (_rustAudioService.isInitialized) {
+          await _disposeUsbEngine();
+        }
+        // Do not release the native handle while a failed Rust pump may
+        // still be submitting URBs against it.
+        await _uac2Service.releaseAndroidDirectUsbRuntime();
+        await _sessionManager.recordFallback(
+          requestedMode: AudioEngineType.usbDacExperimental,
+          fallbackMode: AudioEngineType.normalAndroid,
+          reason: 'manual USB restart failed: $error',
+        );
+        await _sessionManager.switchMode(
+          AudioEngineType.normalAndroid,
+          initializeNewEngine: true,
+          reason: 'manual USB restart unsuccessful',
+        );
+        if (playableSong != null) {
+          await _prepareImmediatePlaybackAsset(playableSong);
+          await _runWithSuppressedSequenceStateUpdates(() async {
+            await _playbackManager.playTrack(
+              playableSong,
+              initialPosition: position,
+              autoPlay: true,
+            );
+          });
+        }
+      } catch (fallbackError) {
+        AppLog.instance.add(
+          '[USB] Manual restart Android fallback failed: '
+          '$fallbackError',
+        );
+      }
+      await _refreshAudioOutputDiagnostics(reason: 'manual USB restart failed');
+      return false;
+    }
+  }
+
+  Future<bool> _verifyManualUsbRestartPlayback() async {
+    int? previousFrames;
+    var healthySamples = 0;
+    // The native bit-perfect flag is only asserted once real audio has
+    // reached the USB endpoint. Observe it over time; a stale handle can
+    // disappear milliseconds after the Rust play() call has returned.
+    for (var sample = 0; sample < 12; sample++) {
+      await Future<void>.delayed(const Duration(milliseconds: 250));
+      if (currentEngineType != AudioEngineType.usbDacExperimental ||
+          _sessionManager.selectedMode != AudioEngineType.usbDacExperimental) {
+        return false;
+      }
+      final debug = await _uac2Service.getAndroidPlaybackDebugState();
+      final rust = _mapValue(debug?['rustAudioState']);
+      final usb = _mapValue(rust?['direct_usb']);
+      final consumerFrames = _intValue(
+        usb?['consumer_frames'] ?? usb?['consumerFrames'],
+      );
+      final error = _stringValue(usb?['last_error'] ?? usb?['lastError']);
+      final hasError =
+          error != null && error.isNotEmpty && error.toLowerCase() != 'none';
+      if (hasError ||
+          usb?['registered'] != true && debug?['directUsbRegistered'] != true) {
+        return false;
+      }
+      final healthy = isVerifiedUsbRestartPlayback(
+        directRouteSelected: true,
+        streamActive:
+            usb?['stream_active'] == true || usb?['streamActive'] == true,
+        streamStable:
+            usb?['usb_stream_stable'] == true ||
+            usb?['usbStreamStable'] == true,
+        bitPerfectVerified:
+            usb?['bit_perfect_verified'] == true ||
+            usb?['bitPerfectVerified'] == true,
+        consumerFrames: consumerFrames ?? 0,
+        previousConsumerFrames: previousFrames,
+        transportError: hasError,
+      );
+      if (healthy) {
+        healthySamples++;
+      } else {
+        healthySamples = 0;
+      }
+      previousFrames = consumerFrames;
+      // Require an observation window, not a single momentary successful
+      // status sample immediately followed by LIBUSB_NO_DEVICE.
+      if (sample >= 7 && healthySamples >= 3) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  Future<bool> isHiFiModeEnabled() async {
+    await initAudio();
+    return _sessionManager.isHiFiModeEnabled();
+  }
+
+  Future<bool> isDapBitPerfectEnabled() async {
+    return _preferencesService.getDapBitPerfectEnabled();
+  }
+
+  Future<void> _initializeAudio() => IosLocalAudioRequests.run(() async {
+    _debugLog('[Engine] Initializing audio manager');
+    final initEpoch = Platform.isIOS
+        ? IosLocalAudioRequests.lifecycle.epoch
+        : null;
+
+    try {
+      await Future.wait<void>([
+        _preferencesService.initializeDeveloperModeCache(),
+        _preferencesService.initializeKillIsochronousUsbOnQuitCache(),
+        _preferencesService.initialize432HzTuningCache(),
+        _preferencesService.initializeBtFlagsCache(),
+        _preferencesService.getDsdOutputMode(),
+        _sessionManager.initialize(),
+        _uac2Service.isBitPerfectEnabled(),
+      ]);
+      final dapBitPerfect = await _preferencesService.getDapBitPerfectEnabled();
+      _uac2Service.dapBitPerfectEnabledNotifier.value = dapBitPerfect;
+      rust_audio.audioSetDapBitPerfectEnabled(enabled: dapBitPerfect);
+      rust_audio.audioSet432HzTuningEnabled(
+        enabled: Uac2PreferencesService.is432HzTuningEnabledSync,
+      );
+
+      _extendedVolumeEnabled = await _appPreferencesService
+          .getExtendedVolumeEnabled();
+      extendedVolumeEnabledNotifier.value = _extendedVolumeEnabled;
+
+      IosLocalAudioRequests.check();
+      final engineType = _sessionManager.selectedMode;
+      if (engineType == AudioEngineType.usbDacExperimental ||
+          engineType == AudioEngineType.dapInternalHighRes) {
+        final savedVolume = await _preferencesService.getUsbSoftwareVolume();
+        final hasSavedVolume = await _preferencesService.hasUsbSoftwareVolume();
+        final bitPerfectOn =
+            _uac2Service.isBitPerfectEnabledSync ||
+            _uac2Service.isDapBitPerfectEnabledSync;
+        if (bitPerfectOn && !hasSavedVolume) {
+          // Bit-perfect safety default: 25 % when the user has never set
+          // a USB software volume, so the DAC doesn't receive a 100 % signal.
+          _currentVolume = _bitPerfectDefaultVolume;
+        } else if (savedVolume != 1.0) {
+          _currentVolume = savedVolume;
+        }
+      }
+
+      IosLocalAudioRequests.check();
+      _playbackManager.publishIdleState(_sessionManager.selectedMode);
+      _audioInitialized = true;
+      await _refreshAudioOutputDiagnostics(reason: 'audio initialized');
+    } finally {
+      if (!Platform.isIOS ||
+          initEpoch == IosLocalAudioRequests.lifecycle.epoch) {
+        _audioInitInFlight = null;
+      }
+    }
+  });
+
+  Future<void> _retireIosPlayback() {
+    final lifecycle = IosLocalAudioRequests.lifecycle;
+    final epoch = lifecycle.epoch;
+    final remote = _castingService.isActive;
+    _iosLocalRetirement = true;
+    _wasPlayingBeforeAudioInterruption = false;
+    _isDucked = false;
+    _audioSessionConfigured = false;
+    _audioInitInFlight = null;
+    _sessionManager.retireLocalOutput();
+    _usingRustBackend = false;
+    _rustBackendAvailable = false;
+    _rustInitInFlight = null;
+    _rustEnginePreparationInFlight = null;
+    _rustCapabilityRefreshInFlight = null;
+    _rustAudioService.retireLocalOutput();
+    if (!remote) {
+      final requested = _iosPlaySelection;
+      if (requested != null &&
+          requested.selection == _selectionGeneration &&
+          !requested.prepared) {
+        _selectPlaybackSong(
+          requested.song,
+          playlist: requested.playlist,
+          indexHint: requested.requestedIndex,
+        );
+        requested.prepared = true;
+      }
+      final queued = _songAtCurrentIndex();
+      final current = currentSongNotifier.value;
+      final selected = queued ?? current;
+      final sameSource =
+          selected != null &&
+          current != null &&
+          androidAudioSourceIdentity(selected) ==
+              androidAudioSourceIdentity(current);
+      final retainedPosition = sameSource
+          ? positionNotifier.value
+          : Duration.zero;
+      _cancelPendingPlayback();
+      _networkLoadingGen++;
+      _positionSaveTimer?.cancel();
+      _positionSaveTimer = null;
+      _iosPositionSavingPaused = true;
+      isNetworkLoadingNotifier.value = false;
+      onlinePreparationTitleNotifier.value = null;
+      isPlayingNotifier.value = false;
+      if (selected != null) {
+        _pendingPresentationTrackId = selected.id;
+        _publishRestoredPlaybackState(selected, position: retainedPosition);
+      }
+    }
+    final manager = _playbackManager.retireLocalOutputs();
+    final external = _externalPlaybackOwner.retireForMediaReset();
+    // Disposal is deliberately outside the playback operation queue. The
+    // Rust disposer skips scoped Stop while this cleanup owns the barrier.
+    return Future.wait<void>([manager, external, _disposeAndroidEngine()])
+        .then<void>((_) {
+          if (epoch == lifecycle.epoch) _iosLocalRetirement = false;
+        });
+  }
+
+  Future<void> _restoreIosAudioSession() async {
+    await _applySystemAudioSessionConfig();
+    _audioSessionConfigured = true;
+    await _updateNotificationState();
+  }
+
+  Future<void> _deactivateAndroidAudioSession() async {
+    if (!Platform.isAndroid || !_audioSessionConfigured) {
+      return;
+    }
+
+    // Any in-flight interruption state is irrelevant once we release focus.
+    _wasPlayingBeforeAudioInterruption = false;
+    _isDucked = false;
+
+    try {
+      final session = await AudioSession.instance;
+      await session.setActive(false);
+    } catch (e) {
+      _debugLog('[AudioFocus] Failed to deactivate Android audio session: $e');
+    }
+  }
+
+  Future<void> _activateAudioSessionForRustEngine({
+    bool requireGranted = false,
+  }) => IosLocalAudioRequests.run(() async {
+    if (!Platform.isAndroid && !Platform.isIOS) return;
+    await IosLocalAudioRequests.wait(_configureSystemAudioSession());
+    try {
+      final session = await IosLocalAudioRequests.wait(AudioSession.instance);
+      final granted = await IosLocalAudioRequests.wait(session.setActive(true));
+      _debugLog('[AudioFocus] Rust engine focus request granted=$granted');
+      if (requireGranted && !granted) {
+        throw StateError(
+          'Audio session activation was denied. Try Play again when audio is available.',
+        );
+      }
+    } catch (e) {
+      _debugLog(
+        '[AudioFocus] Failed to activate audio session for Rust engine: $e',
+      );
+      if (requireGranted) rethrow;
+    }
+  });
+
+  Future<void> _releaseAndroidManagedAudioResources({
+    required String reason,
+  }) async {
+    if (!Platform.isAndroid) {
+      return;
+    }
+
+    _debugLog('[Engine] Releasing Android-managed audio resources ($reason)');
+    await _disposeAndroidEngine();
+    await _deactivateAndroidAudioSession();
+  }
+
+  Future<void> _configureSystemAudioSession() => IosLocalAudioRequests.run(
+    () async {
+      if ((!Platform.isAndroid && !Platform.isIOS) || _audioSessionConfigured) {
+        return;
+      }
+
+      try {
+        final session = await IosLocalAudioRequests.wait(AudioSession.instance);
+        await IosLocalAudioRequests.wait(_applySystemAudioSessionConfig());
+        IosLocalAudioRequests.registerPersistentObserver(() {
+          _audioFocusSubscription ??= session.interruptionEventStream.listen((
+            event,
+          ) {
+            _onAudioInterruptionEvent(event);
+          });
+          if (Platform.isIOS) {
+            _noisyAudioSubscription ??= session.becomingNoisyEventStream.listen(
+              (_) {
+                _wasPlayingBeforeAudioInterruption = false;
+                if (_castingService.isActive) return;
+                unawaited(pause());
+              },
+            );
+          }
+        });
+        _audioSessionConfigured = true;
+      } catch (e) {
+        _debugLog('[AudioFocus] Failed to configure Android audio session: $e');
+      }
+    },
+  );
+
+  Future<void> _applySystemAudioSessionConfig() async {
+    final session = await AudioSession.instance;
+    // When ducking is enabled we keep the stream alive at reduced gain for
+    // transient losses (notifications) instead of pausing. Users who prefer
+    // a hard pause get androidWillPauseWhenDucked: true.
+    await session.configure(
+      const AudioSessionConfiguration.music().copyWith(
+        androidWillPauseWhenDucked: !duckOnInterruptionNotifier.value,
+      ),
+    );
+  }
+
+  void _onAudioInterruptionEvent(AudioInterruptionEvent event) {
+    if (Platform.isIOS &&
+        (_castingService.isActive ||
+            IosLocalAudioRequests.lifecycle.phase.value ==
+                LocalAudioPhase.lost ||
+            IosLocalAudioRequests.lifecycle.phase.value ==
+                LocalAudioPhase.recovering ||
+            IosLocalAudioRequests.lifecycle.phase.value ==
+                LocalAudioPhase.blocked)) {
+      _wasPlayingBeforeAudioInterruption = false;
+      _isDucked = false;
+      return;
+    }
+    _debugLog(
+      '[AudioFocus] Interruption event: begin=${event.begin}, '
+      'type=${event.type}, wasPlaying=$_wasPlayingBeforeAudioInterruption, '
+      'playing=${isPlayingNotifier.value}',
+    );
+
+    if (event.begin) {
+      if (event.type == AudioInterruptionType.duck &&
+          duckOnInterruptionNotifier.value) {
+        // Transient loss (notification sound): dip volume, keep playing.
+        if (isPlayingNotifier.value) {
+          unawaited(IosLocalAudioRequests.ignoreRetired(_setDucked(true)));
+        }
+        return;
+      }
+      if (isPlayingNotifier.value) {
+        _wasPlayingBeforeAudioInterruption = true;
+        unawaited(IosLocalAudioRequests.ignoreRetired(_pauseInternal()));
+      }
+      return;
+    }
+
+    // Interruption ended. Only resume if we were actually playing when it
+    // started; otherwise a manual pause during the interruption would cause
+    // an unwanted auto-resume.
+    if (event.type == AudioInterruptionType.duck && _isDucked) {
+      unawaited(IosLocalAudioRequests.ignoreRetired(_setDucked(false)));
+      return;
+    }
+    if (!_wasPlayingBeforeAudioInterruption) {
+      return;
+    }
+    _wasPlayingBeforeAudioInterruption = false;
+
+    switch (event.type) {
+      case AudioInterruptionType.pause:
+      case AudioInterruptionType.duck:
+        unawaited(
+          IosLocalAudioRequests.ignoreRetired(_resumeAfterAudioInterruption()),
+        );
+      case AudioInterruptionType.unknown:
+        // Permanent focus loss (e.g. another app started long-form playback).
+        // Stay paused and let the user explicitly resume.
+        break;
+    }
+  }
+
+  /// Duck gain relative to the user's volume. 0.2 ≈ -14 dB, enough for
+  /// notification sounds to sit on top without killing the music.
+  static const double _duckVolumeScale = 0.2;
+
+  Future<void> _setDucked(bool ducked) => IosLocalAudioRequests.run(() async {
+    if (_isDucked == ducked) return;
+    _isDucked = ducked;
+    // DoP over direct USB: software gain corrupts DoP markers, and the
+    // exclusive device is not mixed with system sounds anyway. Leave as-is.
+    if (isCurrentTrackDoP && _isDirectUsbPath) return;
+    final volume = ducked ? _currentVolume * _duckVolumeScale : _currentVolume;
+    try {
+      if (_usingRustBackend && _rustAudioService.isInitialized) {
+        await IosLocalAudioRequests.wait(_rustAudioService.setVolume(volume));
+      } else {
+        await IosLocalAudioRequests.wait(
+          _justAudioPlayer?.setVolume(volume) ?? Future<void>.value(),
+        );
+      }
+    } catch (e) {
+      _debugLog('[AudioFocus] Failed to ${ducked ? 'apply' : 'lift'} duck: $e');
+    }
+  });
+
+  Future<void> _resumeAfterAudioInterruption() =>
+      IosLocalAudioRequests.run(() async {
+        // The audio session may have been deactivated while we were paused
+        // (e.g. by a route change or by the system). Re-activate it before
+        // attempting to resume the Rust engine.
+        await IosLocalAudioRequests.wait(_activateAudioSessionForRustEngine());
+        try {
+          await IosLocalAudioRequests.wait(_resumeInternal());
+        } catch (e, stackTrace) {
+          if (_pendingPresentationTrackId == currentSongNotifier.value?.id) {
+            _pendingPresentationTrackId = null;
+          }
+          final recovered = await IosLocalAudioRequests.wait(
+            _handleDirectUsbStartupRefusal(
+              e,
+              song: currentSongNotifier.value,
+              initialPosition: positionNotifier.value,
+            ),
+          );
+          if (recovered) {
+            return;
+          }
+          _debugLog('[AudioFocus] Auto-resume after interruption failed: $e');
+          debugPrintStack(stackTrace: stackTrace);
+        }
+      });
+
+  Future<just_audio.AudioPlayer> _ensureAndroidPlayer() =>
+      IosLocalAudioRequests.run(() async {
+        final existing = _justAudioPlayer;
+        if (existing != null) {
+          return existing;
+        }
+
+        await IosLocalAudioRequests.wait(_configureSystemAudioSession());
+        // Android supports request headers natively. Avoid the Dart loopback
+        // proxy: a sleeping/unreachable desktop can leave its sockets pending.
+        final player = IosLocalAudioPlayers.create(
+          useProxyForRequestHeaders: false,
+          handleInterruptions: !Platform.isIOS,
+        );
+        _justAudioPlayer = player;
+        int? lastEqSessionId;
+        player.androidAudioSessionIdStream.listen((sessionId) {
+          if (sessionId == null || sessionId == lastEqSessionId) return;
+          if (!identical(_justAudioPlayer, player)) return;
+          lastEqSessionId = sessionId;
+          unawaited(reapplyEqualizer());
+        });
+        await IosLocalAudioRequests.wait(player.setVolume(_currentVolume));
+        await IosLocalAudioRequests.wait(
+          player.setSpeed(playbackSpeedNotifier.value),
+        );
+        await IosLocalAudioRequests.wait(_updateLoopMode());
+        return player;
+      });
+
+  Future<void> _configureAndroidPlayer(
+    just_audio.AudioPlayer player,
+  ) => IosLocalAudioRequests.run(() async {
+    if (_justAudioPlayer != player) {
+      _justAudioPlayer = player;
+    }
+
+    if ((Platform.isAndroid || Platform.isIOS) && _audioSessionConfigured) {
+      try {
+        final session = await IosLocalAudioRequests.wait(AudioSession.instance);
+        await IosLocalAudioRequests.wait(session.setActive(true));
+      } catch (e) {
+        _debugLog('[AudioFocus] Failed to activate Android audio session: $e');
+      }
+    }
+
+    await IosLocalAudioRequests.wait(player.setVolume(_currentVolume));
+    await IosLocalAudioRequests.wait(
+      player.setSpeed(playbackSpeedNotifier.value),
+    );
+    await IosLocalAudioRequests.wait(_updateLoopMode());
+  });
+
+  AndroidAudioEngine _createAndroidEngine() {
+    IosLocalAudioRequests.check();
+    final engine = AndroidAudioEngine(
+      guardRetirement: Platform.isIOS,
+      engineType: Platform.isIOS
+          ? AudioEngineType.iosSystem
+          : AudioEngineType.normalAndroid,
+      secondaryPlayerProvider: Platform.isIOS
+          ? () => IosLocalAudioRequests.run(
+              () async => IosLocalAudioPlayers.create(
+                useProxyForRequestHeaders: false,
+                handleInterruptions: false,
+              ),
+            )
+          : null,
+      playerProvider: _ensureAndroidPlayer,
+      sourcesBuilder: _buildAudioSources,
+      sourceBuilder: _buildAudioSourceForSong,
+      playlistProvider: () => List<Song>.unmodifiable(_playlist),
+      selectedPlaylistIndexProvider: () => _currentIndex,
+      onNativePlaylistIndex: (index) {
+        // A delayed old sequence must not undo the staged iPhone selection.
+        if (Platform.isIOS && _pendingPresentationTrackId != null) return;
+        if (index >= 0 && index < _playlist.length) _setCurrentIndex(index);
+      },
+      configurePlayer: _configureAndroidPlayer,
+      disposeEngine: _disposeAndroidEngine,
+      retireStalledPlayer: _retireStalledAndroidPlayer,
+      invalidatePlayerCache: (player) {
+        if (identical(_justAudioPlayer, player)) {
+          _justAudioPlayer = null;
+          _audioSourceSequence = null;
+        }
+      },
+      shouldSuppressTrackSync: () =>
+          _suppressSequenceStateUpdates || _isRebuildingPlaylist,
+      shouldIgnoreTrack: (track) => track.filePath == null,
+      shouldFastStartCurrentTrackOnly: () =>
+          loopModeNotifier.value != LoopMode.all,
+      crossfadeConfigProvider: () {
+        final curves = AndroidCrossfadeCurve.values;
+        final curve = curves[_crossfadeCurveIndex.clamp(0, curves.length - 1)];
+        return AndroidCrossfadeConfig(
+          enabled:
+              _rustAudioService.crossfadeEnabledNotifier.value &&
+              !isBitPerfectProcessingLocked,
+          durationSecs: _rustAudioService.crossfadeDurationNotifier.value,
+          curve: curve,
+        );
+      },
+      automixProfileLookup: AutoMixAnalysisCache.instance.read,
+      stemClipLookup: AutoMixStemClipCache.instance.read,
+      stemVolumeProvider: () => _currentVolume,
+      onNextSong: _resolveAndroidCrossfadeNext,
+      gaplessEnabledProvider: () => gaplessPlaybackEnabledNotifier.value,
+      onTrackAdvanced: _onAndroidTrackAdvanced,
+      onTrackError: _onAndroidTrackError,
+    );
+    _androidEngine = engine;
+    engine.onTrackEnded = () {
+      if (_usingRustBackend) return;
+      unawaited(_onSongFinished());
+    };
+    return engine;
+  }
+
+  Future<bool> _ensureRustBackendAvailable() =>
+      IosLocalAudioRequests.run(() async {
+        if (_rustBackendAvailable && _rustAudioService.isInitialized) {
+          return true;
+        }
+        if (_rustBackendAvailable && !_rustAudioService.isInitialized) {
+          _debugLog(
+            '[Engine] Rust backend flag was stale; reinitializing Rust audio manager',
+          );
+          _rustBackendAvailable = false;
+        }
+        if (_rustInitInFlight != null) {
+          return _rustInitInFlight!;
+        }
+
+        final completer = Completer<bool>();
+        _rustInitInFlight = completer.future;
+
+        try {
+          _rustBackendAvailable = await IosLocalAudioRequests.wait(
+            _rustAudioService.init(),
+          );
+          return _rustBackendAvailable;
+        } catch (e) {
+          _rustBackendAvailable = false;
+          _debugLog('Rust audio backend unavailable: $e');
+          return false;
+        } finally {
+          completer.complete(_rustBackendAvailable);
+          _rustInitInFlight = null;
+        }
+      });
+
+  Future<void> _refreshRustCapabilityInfo() async {
+    if (!Platform.isAndroid) return;
+
+    final inFlight = _rustCapabilityRefreshInFlight;
+    if (inFlight != null) {
+      await inFlight;
+      return;
+    }
+
+    final future = () async {
+      final rustAvailable = await _ensureRustBackendAvailable();
+      if (!rustAvailable) return;
+
+      final capabilityInfo = await _uac2Service.getAndroidAudioCapabilityInfo();
+      await _applyRustCapabilityInfo(capabilityInfo);
+    }();
+
+    _rustCapabilityRefreshInFlight = future;
+    try {
+      await future;
+    } finally {
+      if (identical(_rustCapabilityRefreshInFlight, future)) {
+        _rustCapabilityRefreshInFlight = null;
+      }
+    }
+  }
+
+  Future<void> _applyRustCapabilityInfo(
+    rust_audio.AudioCapabilityInfo capabilityInfo, {
+    int? prewarmSampleRate,
+  }) async {
+    await _rustAudioService.setCapabilityInfo(
+      rust_audio.AudioCapabilityInfo(
+        capabilities: capabilityInfo.capabilities,
+        routeType: capabilityInfo.routeType,
+        routeLabel: capabilityInfo.routeLabel,
+        maxSampleRate: prewarmSampleRate,
+      ),
+    );
+  }
+
+  /// Do not infer 16-bit audio from a sample rate alone. A 24-bit FLAC
+  /// labelled only as 96 kHz previously started as 96k/16, causing an
+  /// avoidable 'No isochronous OUT endpoint' refusal on some USB DACs.
+  /// Returning null asks the caller to probe the actual file first.
+  @visibleForTesting
+  static Uac2AudioFormat? derivePcmDirectUsbFormat({
+    int? sampleRate,
+    int? bitDepth,
+    String? resolution,
+  }) {
+    final label = resolution ?? '';
+    final labelBits = int.tryParse(
+      RegExp(
+            r'(\d+)\s*[- ]?bit',
+            caseSensitive: false,
+          ).firstMatch(label)?.group(1) ??
+          '',
+    );
+    final labelKhz = double.tryParse(
+      RegExp(
+            r'(\d+(?:\.\d+)?)\s*kHz',
+            caseSensitive: false,
+          ).firstMatch(label)?.group(1) ??
+          '',
+    );
+    final labelRate = labelKhz == null ? null : (labelKhz * 1000).round();
+    // Conflicting structured and display metadata are not reliable enough
+    // for direct USB: probe the actual file rather than choosing arbitrarily.
+    if (bitDepth != null && labelBits != null && bitDepth != labelBits) {
+      return null;
+    }
+    if (sampleRate != null && labelRate != null && sampleRate != labelRate) {
+      return null;
+    }
+    final rate = sampleRate ?? labelRate;
+    final bits = bitDepth ?? labelBits;
+    if (rate == null ||
+        rate <= 0 ||
+        bits == null ||
+        !const {16, 24, 32}.contains(bits))
+      return null;
+    return Uac2AudioFormat(sampleRate: rate, bitDepth: bits, channels: 2);
+  }
+
+  Uac2AudioFormat? _deriveUac2FormatFromSong(Song? song) {
+    if (song == null) return null;
+
+    if (song.isDsd) {
+      final dsdMode = Uac2PreferencesService.dsdOutputModeSync;
+      if (dsdMode == DsdOutputMode.native || dsdMode == DsdOutputMode.auto) {
+        final rawRate = song.sampleRate ?? 2822400;
+        final byteRate = rawRate ~/ 8;
+        return Uac2AudioFormat(
+          sampleRate: byteRate,
+          bitDepth: 8,
+          channels: 2,
+          isDop: false,
+          isNativeDsd: true,
+        );
+      }
+      if (dsdMode == DsdOutputMode.forceDop) {
+        final dopRate = Song.dsdToDopRate(song.sampleRate) ?? 176400;
+        final dopBitDepth = (song.sampleRate ?? 0) >= 22579200 ? 32 : 24;
+        return Uac2AudioFormat(
+          sampleRate: dopRate,
+          bitDepth: dopBitDepth,
+          channels: 2,
+          isDop: true,
+        );
+      } else {
+        final pcmRate = Song.dsdToPcmRate(song.sampleRate) ?? 88200;
+        final bitDepth = (song.sampleRate ?? 0) >= 22579200 ? 32 : 24;
+        return Uac2AudioFormat(
+          sampleRate: pcmRate,
+          bitDepth: bitDepth,
+          channels: 2,
+        );
+      }
+    }
+
+    return derivePcmDirectUsbFormat(
+      sampleRate: song.sampleRate,
+      bitDepth: song.bitDepth,
+      resolution: song.resolution,
+    );
+  }
+
+  bool _sameUac2Format(Uac2AudioFormat? a, Uac2AudioFormat? b) {
+    if (a == null || b == null) {
+      return false;
+    }
+
+    return a.sampleRate == b.sampleRate &&
+        a.bitDepth == b.bitDepth &&
+        a.channels == b.channels &&
+        a.isDop == b.isDop &&
+        a.isNativeDsd == b.isNativeDsd;
+  }
+
+  bool get _isDirectUsbPath =>
+      Platform.isAndroid &&
+      currentEngineType == AudioEngineType.usbDacExperimental;
+
+  // ponytail: any Rust/bit-perfect path can be system-invisible to OEM
+  // battery AI (Xiaomi/Tecno/Infinix), not just direct USB. Reuses the
+  // existing usesRustBackend helper which excludes normalAndroid.
+  // Excluded on DAP_INTERNAL_HIGH_RES: the anchor's Java AudioTrack gets
+  // HiBy-forced onto the sole DIRECT slot, killing our native stream.
+  bool get _isAnchorEligiblePath =>
+      Platform.isAndroid &&
+      currentEngineType.usesRustBackend &&
+      currentEngineType != AudioEngineType.dapInternalHighRes &&
+      !(Uac2PreferencesService.isAndroidMixerUsbSelectedSync &&
+          _uac2Service.isBitPerfectEnabledSync);
+
+  void _updatePriorityAnchor() {
+    final shouldAnchor =
+        _isAnchorEligiblePath &&
+        _priorityAnchorEnabled &&
+        isPlayingNotifier.value;
+    if (shouldAnchor && !_priorityAnchorActive) {
+      _priorityAnchorActive = true;
+      AppLog.instance.add(
+        '[PriorityAnchor] start requested; enabled=true '
+        'engine=${currentEngineType.name}',
+      );
+      unawaited(_uac2Service.startPriorityAnchor());
+    } else if (!shouldAnchor && _priorityAnchorActive) {
+      _priorityAnchorActive = false;
+      AppLog.instance.add(
+        '[PriorityAnchor] stop requested; enabled=$_priorityAnchorEnabled '
+        'playing=${isPlayingNotifier.value} engine=${currentEngineType.name}',
+      );
+      unawaited(_uac2Service.stopPriorityAnchor());
+    }
+  }
+
+  Future<void> _loadPriorityAnchorPreference() async {
+    _priorityAnchorEnabled = await _appPreferencesService
+        .getPriorityAnchorEnabled();
+    AppLog.instance.add(
+      '[PriorityAnchor] preference loaded; enabled=$_priorityAnchorEnabled '
+      'engine=${currentEngineType.name}',
+    );
+    _updatePriorityAnchor();
+  }
+
+  Future<void> setPriorityAnchorEnabled(bool value) async {
+    if (_priorityAnchorEnabled == value) return;
+    _priorityAnchorEnabled = value;
+    AppLog.instance.add(
+      '[PriorityAnchor] user setting changed; enabled=$value',
+    );
+    _updatePriorityAnchor();
+  }
+
+  Future<void> _loadMotionArtPreference() async {
+    _motionArtDuringBitPerfect = await _appPreferencesService
+        .getMotionArtDuringBitPerfect();
+    _updateMotionArtSuppression();
+  }
+
+  Future<void> setMotionArtDuringBitPerfect(bool value) async {
+    _motionArtDuringBitPerfect = value;
+    _updateMotionArtSuppression();
+  }
+
+  void _onHwVolumeResult(bool success) {
+    _hwVolumeFailed = !success;
+    unawaited(
+      IosLocalAudioRequests.ignoreRetired(
+        _reconcileVolumeForTier(_determineCurrentTier()),
+      ),
+    );
+  }
+
+  /// True when the Rust pipeline runs its pure passthrough callback, which
+  /// ignores engine volume entirely (bit-perfect guarantee). EQ/tuning,
+  /// crossfade and pitch force the DSP path, where engine gain works.
+  bool get _isPassthroughActive {
+    if (_usbDsdWireActive) return true;
+    final passthrough =
+        audioOutputDiagnosticsNotifier.value?.passthroughAllowed ?? false;
+    if (!passthrough) return false;
+    if (Uac2PreferencesService.is432HzTuningEnabledSync) return false;
+    if ((playbackSpeedNotifier.value - 1.0).abs() > 0.001) return false;
+    return true;
+  }
+
+  bool get _isAndroidMixerBitPerfectPath =>
+      currentEngineType == AudioEngineType.rustOboe &&
+      Uac2PreferencesService.isAndroidMixerUsbSelectedSync &&
+      _uac2Service.isBitPerfectEnabledSync;
+
+  /// True while the selected active engine intends a hardware-protected route.
+  /// On the framework mixer the Android volume slider cannot control the
+  /// output; unlike libusb there is no UAC2 Feature Unit volume ownership.
+  bool get _isBitPerfectVolumePath =>
+      isBitPerfectModeEnabled &&
+      (currentEngineType == AudioEngineType.usbDacExperimental ||
+          currentEngineType == AudioEngineType.dapInternalHighRes ||
+          _isAndroidMixerBitPerfectPath);
+
+  String? get _currentUsbDsdMode =>
+      _activeUsbDsdSongId == currentSongNotifier.value?.id
+      ? _activeUsbDsdMode
+      : null;
+
+  bool get _usbDsdWireActive =>
+      _isDirectUsbPath &&
+      (_currentUsbDsdMode == 'dop' ||
+          _currentUsbDsdMode == 'native' ||
+          (_currentUsbDsdMode == null &&
+              currentSongNotifier.value?.isDsd == true &&
+              Uac2PreferencesService.dsdOutputModeSync !=
+                  DsdOutputMode.forcePcm));
+
+  /// Whether the user can change volume right now. False in bit-perfect
+  /// passthrough when the DAC has no hardware (UAC2 Feature Unit) volume —
+  /// engine gain would corrupt the stream, so the slider must disable.
+  bool get isVolumeAvailable =>
+      _determineCurrentTier() != VolumeTier.unavailable;
+
+  /// True when the DAC hardware (Feature Unit) volume is the active volume
+  /// authority; the UI should display the DAC level only then. Otherwise the
+  /// bar shows [currentVolume], which is what [setVolume] actually writes.
+  bool get isHardwareVolumeAuthority =>
+      _determineCurrentTier() == VolumeTier.hardware;
+
+  /// Maximum volume the user may select right now. Extended boost (2.0) is
+  /// only available on the software and system tiers when the toggle is on;
+  /// hardware, passthrough, DoP and casting paths stay clamped at 1.0.
+  double get maxVolume {
+    if (Platform.isIOS && !_usingRustBackend) return 1.0;
+    if (!_extendedVolumeEnabled || _castingService.isActive) return 1.0;
+    final tier = _determineCurrentTier();
+    return (tier == VolumeTier.software || tier == VolumeTier.system)
+        ? 2.0
+        : 1.0;
+  }
+
+  /// Toggle extended volume at runtime. Disabling clamps the current volume
+  /// back to 1.0 and releases any active LoudnessEnhancer boost.
+  Future<void> setExtendedVolumeEnabled(bool enabled) async {
+    if (_extendedVolumeEnabled == enabled) return;
+    _extendedVolumeEnabled = enabled;
+    extendedVolumeEnabledNotifier.value = enabled;
+    if (!enabled && _currentVolume > 1.0) {
+      await setVolume(1.0);
+    } else {
+      await _reconcileSystemVolumeBoost(
+        _determineCurrentTier() == VolumeTier.system
+            ? math.min(_currentVolume, 1.0) * _replayGainState.linear
+            : 0.0,
+      );
+    }
+  }
+
+  /// Apply or release the LoudnessEnhancer boost on the just_audio session.
+  /// [effectiveVolume] is the volume to realise on the system tier (already
+  /// folded with the ReplayGain factor); pass 0.0 to release (e.g. when on
+  /// another tier or casting). Boost is used whenever the effective volume
+  /// exceeds 1.0 — from the extended-volume toggle or from ReplayGain gain.
+  Future<void> _reconcileSystemVolumeBoost(double effectiveVolume) async {
+    if (!Platform.isAndroid) {
+      if (_currentBoostMb != 0) _currentBoostMb = 0;
+      return;
+    }
+    final desiredMb = effectiveVolume > 1.0
+        ? AndroidJustAudioProcessingService.volumeToBoostMb(effectiveVolume)
+        : 0;
+    if (desiredMb == _currentBoostMb) return;
+    _currentBoostMb = desiredMb;
+    try {
+      await androidJustAudioProcessingService.setVolumeBoost(
+        gainMb: desiredMb,
+        audioSessionId: androidAudioSessionId,
+      );
+    } catch (e) {
+      _debugLog('[VolFlow] LoudnessEnhancer boost failed: $e');
+    }
+  }
+
+  VolumeTier _determineCurrentTier() => determineVolumeTier(
+    isBitPerfectVolumePath: _isBitPerfectVolumePath,
+    // Android's bit-perfect USB mixer does not expose hardware Feature
+    // Unit control through our libusb driver. Never promise app-side volume
+    // adjustment based on USB descriptors from a different transport.
+    volumeMode: _isAndroidMixerBitPerfectPath
+        ? null
+        : _uac2Service.currentDeviceStatus?.volumeMode,
+    volumeControlWritable:
+        !_isAndroidMixerBitPerfectPath &&
+        (_uac2Service.currentDeviceStatus?.volumeControlWritable ?? false),
+    hwVolumeFailed: _hwVolumeFailed,
+    isDoP: _usbDsdWireActive,
+    autoSwitchDsdForVolume: Uac2PreferencesService.autoSwitchDsdForVolumeSync,
+    // Direct PCM still bypasses the mixer in bit-perfect mode: a stale
+    // diagnostics snapshot must never allow ineffective software gain.
+    isPassthrough:
+        _isPassthroughActive || (_isDirectUsbPath && isBitPerfectModeEnabled),
+    usingRustBackend: _usingRustBackend,
+  );
+
+  Future<void> _reconcileVolumeForTier(VolumeTier tier) =>
+      IosLocalAudioRequests.run(() async {
+        _activeTier = tier;
+        if (tier == VolumeTier.hardware) {
+          _startHwVolumeHealthTimer();
+        } else {
+          _stopHwVolumeHealthTimer();
+        }
+        if (!_rustAudioService.isInitialized) return;
+        if (_switchingDsdForVolume) return;
+        if (_usbDsdWireActive) {
+          // The software tier here means opt-in conversion is available, not
+          // permission to scale the still-active DSD stream.
+          await _rustAudioService.setVolume(1.0);
+          return;
+        }
+        switch (tier) {
+          case VolumeTier.hardware:
+            // DAC Feature Unit is the only volume authority — engine at unity.
+            await _rustAudioService.setVolume(1.0);
+            break;
+          case VolumeTier.software:
+            await _rustAudioService.setVolume(_currentVolume);
+            break;
+          case VolumeTier.system:
+            await _rustAudioService.setVolume(_currentVolume);
+            break;
+          case VolumeTier.unavailable:
+            await _rustAudioService.setVolume(1.0);
+            break;
+        }
+      });
+
+  /// Prefer [primary], then the current-song notifier, then the last engine
+  /// playback snapshot so USB focus stays latched when Rust is ahead of or
+  /// behind the notifier during gapless / crossfade / buffering.
+  Song? _songForUac2Sync(Song? primary) =>
+      primary ??
+      currentSongNotifier.value ??
+      _playbackManager.latestState?.currentTrack;
+
+  Future<void> _syncUac2PlaybackStatus(
+    Song? song, {
+    required bool isPlaying,
+  }) async {
+    final resolved = _songForUac2Sync(song);
+    // Rust state can flicker (idle between gapless segments, short internal
+    // restarts) while the UI session is still "playing". Releasing direct USB
+    // audio focus in that window races libusb teardown and surfaces as EIO.
+    final directUsb = currentEngineType == AudioEngineType.usbDacExperimental;
+    final effectiveIsPlaying =
+        isPlaying || (directUsb && isPlayingNotifier.value && resolved != null);
+    await _uac2Service.syncPlaybackStatus(
+      song: resolved,
+      isPlaying: effectiveIsPlaying,
+      formatOverride: _deriveUac2FormatFromSong(resolved),
+      playbackMode: currentEngineType,
+    );
+    await _refreshAudioOutputDiagnostics(
+      reason: 'UAC2 status sync',
+      activeSong: resolved,
+    );
+  }
+
+  Future<void> _refreshAudioOutputDiagnostics({
+    required String reason,
+    Song? activeSong,
+  }) async {
+    final generation = ++_audioOutputDiagnosticsGeneration;
+    final mode = currentEngineType;
+    final activeEngineType = _playbackManager.activeEngineType ?? mode;
+    final usesRustDiagnostics = activeEngineType.usesRustBackend;
+    Map<String, dynamic>? iosRoute;
+    if (Platform.isIOS) {
+      try {
+        iosRoute = await const MethodChannel('lokal/ios')
+            .invokeMapMethod<String, dynamic>('audioRoute');
+      } on PlatformException {
+        // Do not invent a negotiated output rate when Apple cannot report it.
+      } on MissingPluginException {
+        // The integration smoke test separately verifies native registration.
+      }
+    }
+    final iosOutputs = (iosRoute?['outputs'] as List?)
+        ?.whereType<Map>()
+        .toList();
+    final iosOutput = iosOutputs?.isNotEmpty == true ? iosOutputs!.first : null;
+    final iosSampleRate = (iosRoute?['sampleRate'] as num?)?.round();
+    final song = activeSong ?? currentSongNotifier.value;
+    final trackFormat = _deriveUac2FormatFromSong(song);
+    final deviceInfo = Platform.isAndroid
+        ? AndroidAudioDeviceService.instance.deviceInfoNotifier.value
+        : AndroidPlaybackDeviceInfo.unknown;
+    final debugState = Platform.isAndroid
+        ? await _uac2Service.getAndroidPlaybackDebugState()
+        : null;
+    final rustAudioState = _mapValue(debugState?['rustAudioState']);
+    final engineState = _mapValue(rustAudioState?['engine']);
+    final directUsbState = _mapValue(rustAudioState?['direct_usb']);
+    final dsdCallbackState = _mapValue(rustAudioState?['dsd_callback']);
+    final deviceProfile = _mapValue(rustAudioState?['device_profile']);
+    final detectedDap = _isDetectedDapProfile(deviceProfile);
+    final detectedDapBrand = _detectedDapBrand(deviceProfile);
+
+    final outputSignature = _stringValue(
+      engineState?['output_signature'] ?? engineState?['outputSignature'],
+    );
+    final engineConfiguredSampleRate = _intValue(
+      engineState?['sample_rate'] ?? engineState?['sampleRate'],
+    );
+    final outputStrategy =
+        _stringValue(
+          engineState?['output_strategy'] ?? engineState?['outputStrategy'],
+        ) ??
+        (outputSignature?.startsWith('android-uac2:') == true
+            ? 'usb_direct'
+            : outputSignature?.startsWith('android-shared:usb-dsd-native:') ==
+                  true
+            ? 'usb_dsd_native'
+            : 'resampled_fallback');
+    final engineRequestedSampleRate = _intValue(
+      engineState?['requested_sample_rate'] ??
+          engineState?['requestedSampleRate'],
+    );
+    final engineActualSampleRate = _intValue(
+      engineState?['actual_sample_rate'] ?? engineState?['actualSampleRate'],
+    );
+    final engineResamplerActive =
+        engineState?['resampler_active'] == true ||
+        engineState?['resamplerActive'] == true;
+    final enginePassthroughAllowed =
+        engineState?['passthrough_allowed'] == true ||
+        engineState?['passthroughAllowed'] == true;
+    final directUsbActive =
+        usesRustDiagnostics &&
+        (engineState?['direct_usb_active'] == true ||
+            engineState?['directUsbActive'] == true);
+    final dsdEffectiveMode = _stringValue(
+      engineState?['dsd_effective_mode'] ?? engineState?['dsdEffectiveMode'],
+    );
+    final dsdTransport = _stringValue(
+      engineState?['dsd_transport'] ?? engineState?['dsdTransport'],
+    );
+    final engineVerificationReason = _stringValue(
+      engineState?['verification_reason'] ?? engineState?['verificationReason'],
+    );
+    final directUsbConfiguredSampleRate = _intValue(
+      directUsbState?['playback_format_sample_rate'] ??
+          directUsbState?['playbackFormatSampleRate'],
+    );
+    final directUsbClockReportedSampleRate = _intValue(
+      directUsbState?['clock_reported_sample_rate'] ??
+          directUsbState?['clockReportedSampleRate'],
+    );
+    final directUsbClockControlSucceeded =
+        directUsbState?['clock_control_succeeded'] == true ||
+        directUsbState?['clockControlSucceeded'] == true;
+    final directUsbClockVerificationPassed =
+        directUsbState?['clock_verification_passed'] == true ||
+        directUsbState?['clockVerificationPassed'] == true;
+    final directUsbDacClockPolicy = _stringValue(
+      directUsbState?['dac_clock_policy'] ?? directUsbState?['dacClockPolicy'],
+    );
+    final directUsbBitPerfectVerified =
+        directUsbState?['bit_perfect_verified'] == true ||
+        directUsbState?['bitPerfectVerified'] == true;
+    final directUsbEngineStateReason = _stringValue(
+      directUsbState?['engine_state_reason'] ??
+          directUsbState?['engineStateReason'],
+    );
+    final directUsbRefusalReason = _stringValue(
+      directUsbState?['direct_mode_refusal_reason'] ??
+          directUsbState?['directModeRefusalReason'],
+    );
+    final directUsbLastError = _stringValue(
+      directUsbState?['last_error'] ?? directUsbState?['lastError'],
+    );
+    final directUsbRegistered =
+        debugState?['directUsbRegistered'] == true ||
+        directUsbState?['registered'] == true;
+    final usbInterfaceClaimed =
+        directUsbState?['idle_lock_held'] == true ||
+        directUsbState?['stream_active'] == true;
+    final usbStreamStable =
+        directUsbState?['usb_stream_stable'] == true ||
+        directUsbState?['usbStreamStable'] == true;
+    final audioFocusHeld = debugState?['audioFocusHeld'] == true;
+
+    final androidManagedUsbRoute =
+        deviceInfo.hasUsbDac ||
+        deviceInfo.hasAttachedUac2Device ||
+        deviceInfo.looksLikeUsbAudioRoute;
+
+    final pathManagement = Platform.isIOS
+        ? AudioPathManagement.iosSystemManaged
+        : !Platform.isAndroid
+        ? AudioPathManagement.androidManagedShared
+        : !usesRustDiagnostics
+        ? AudioPathManagement.androidManagedShared
+        : directUsbActive
+        ? AudioPathManagement.directUsbExperimental
+        : outputSignature?.startsWith('android-mixer-bit-perfect:') == true
+        ? AudioPathManagement.androidMixerBitPerfect
+        : outputSignature?.startsWith('android-alsa:') == true
+        ? AudioPathManagement.alsaDirectDap
+        : outputSignature?.startsWith('android-direct:') == true
+        ? AudioPathManagement.managedDirectExclusive
+        : AudioPathManagement.androidManagedLowLatency;
+
+    final isMixerManaged =
+        pathManagement != AudioPathManagement.directUsbExperimental &&
+        pathManagement != AudioPathManagement.androidMixerBitPerfect &&
+        pathManagement != AudioPathManagement.alsaDirectDap &&
+        pathManagement != AudioPathManagement.managedDirectExclusive;
+    final requestedOutputSampleRate = Platform.isIOS
+        ? engineRequestedSampleRate
+        : (!usesRustDiagnostics ? trackFormat?.sampleRate : null) ??
+              engineRequestedSampleRate ??
+              (pathManagement == AudioPathManagement.directUsbExperimental
+                  ? directUsbConfiguredSampleRate
+                  : engineConfiguredSampleRate ?? trackFormat?.sampleRate);
+    final reportedOutputSampleRate = Platform.isIOS
+        ? (iosSampleRate != null && iosSampleRate > 0 ? iosSampleRate : null)
+        : !usesRustDiagnostics
+        ? null
+        : directUsbActive
+        ? directUsbClockReportedSampleRate
+        : engineActualSampleRate ?? engineConfiguredSampleRate;
+    final resamplerActive =
+        (Platform.isIOS &&
+            trackFormat?.sampleRate != null &&
+            reportedOutputSampleRate != null &&
+            trackFormat!.sampleRate != reportedOutputSampleRate) ||
+        (usesRustDiagnostics && engineResamplerActive) ||
+        (requestedOutputSampleRate != null &&
+            usesRustDiagnostics &&
+            reportedOutputSampleRate != null &&
+            requestedOutputSampleRate != reportedOutputSampleRate);
+    final passthroughAllowed =
+        !Platform.isIOS && usesRustDiagnostics && enginePassthroughAllowed;
+    // These checks describe the active configuration, clock and framing.
+    // They are not an independent byte-for-byte comparison against the source.
+    final effectiveBitPerfect = directUsbActive
+        ? (directUsbBitPerfectVerified &&
+              passthroughAllowed &&
+              directUsbClockVerificationPassed &&
+              usbStreamStable &&
+              !resamplerActive)
+        : (usesRustDiagnostics && passthroughAllowed && !resamplerActive);
+    final verificationReason =
+        (!usesRustDiagnostics ? null : engineVerificationReason) ??
+        (pathManagement == AudioPathManagement.directUsbExperimental
+            ? directUsbRefusalReason ??
+                  directUsbLastError ??
+                  directUsbEngineStateReason ??
+                  (!directUsbClockVerificationPassed
+                      ? 'Direct USB verification failed'
+                      : null)
+            : null);
+    final outputStrategyLabel = Platform.isIOS
+        ? 'iOS system-managed'
+        : !usesRustDiagnostics
+        ? 'Android shared'
+        : switch (outputStrategy) {
+            'dap_native' => 'DAP native',
+            'dsd_native' => 'DSD native',
+            'dsd_dop' => 'DSD DoP',
+            'mixer_bit_perfect' => 'Mixer bit-perfect',
+            'mixer_matched' => 'Mixer matched',
+            'usb_direct' => 'USB direct',
+            'usb_dsd_native' => 'USB DSD native',
+            'resampled_fallback' => 'Resampled fallback',
+            _ => 'Adaptive',
+          };
+    final backendDescription = Platform.isIOS
+        ? (usesRustDiagnostics
+              ? 'Rust decoders / Core Audio'
+              : 'just_audio / AVPlayer')
+        : !usesRustDiagnostics
+        ? 'just_audio / ExoPlayer'
+        : switch (outputStrategy) {
+            'usb_dsd_native' => 'Rust engine via USB direct native DSD',
+            'usb_direct' => 'Rust engine via libusb direct USB',
+            'dsd_native' when passthroughAllowed =>
+              'Rust engine via ENCODING_DSD AudioTrack (native DSD)',
+            'dsd_native' => 'Rust engine via ENCODING_DSD AudioTrack',
+            'dsd_dop' when directUsbActive =>
+              'Rust engine via libusb direct USB DoP',
+            'dsd_dop' when passthroughAllowed =>
+              'Rust engine via DoP over PCM carrier (verified)',
+            'dsd_dop' => 'Rust engine via DoP over PCM carrier',
+            'dap_native' when passthroughAllowed =>
+              outputSignature?.startsWith('android-direct:') == true
+                  ? 'Rust engine via AudioTrack DIRECT PCM (mixer bypass, verified)'
+                  : outputSignature?.startsWith('android-alsa:') == true
+                  ? 'Rust engine via ALSA direct DAP path (verified)'
+                  : 'Rust engine via native DAP HAL path (verified)',
+            'dap_native' =>
+              outputSignature?.startsWith('android-direct:') == true
+                  ? 'Rust engine via AudioTrack DIRECT PCM (mixer bypass)'
+                  : outputSignature?.startsWith('android-alsa:') == true
+                  ? 'Rust engine via ALSA direct DAP path'
+                  : 'Rust engine via native DAP HAL path',
+            'mixer_bit_perfect' =>
+              'Rust engine via Android mixer bit-perfect path',
+            'mixer_matched' =>
+              'Rust engine via Oboe/AAudio (matched-rate Android-managed)',
+            'resampled_fallback' =>
+              'Rust engine via Oboe/AAudio with adaptive resampler fallback',
+            _ => 'Rust adaptive playback engine',
+          };
+
+    final capabilityStateLabel = Platform.isIOS
+        ? 'System audio · bit-perfect output not verified'
+        : !usesRustDiagnostics
+        ? (androidManagedUsbRoute
+              ? 'Android shared (USB route)'
+              : 'Android shared')
+        : switch (outputStrategy) {
+            'usb_dsd_native' when effectiveBitPerfect =>
+              'USB DSD native (clock/framing checked)',
+            'usb_dsd_native' => 'USB DSD native',
+            'usb_direct' when effectiveBitPerfect =>
+              'USB direct (clock/payload checked)',
+            'usb_direct' => 'USB direct',
+            'dsd_native' when passthroughAllowed => 'Verified DSD native',
+            'dsd_native' => 'DSD native',
+            'dsd_dop' when directUsbActive && effectiveBitPerfect =>
+              'USB DoP (clock/framing checked)',
+            'dsd_dop' when directUsbActive => 'USB DoP (checks pending)',
+            'dsd_dop' when passthroughAllowed => 'Verified DSD DoP',
+            'dsd_dop' => 'DSD DoP',
+            'dap_native' when passthroughAllowed => 'Verified DAP native',
+            'dap_native' => 'DAP native',
+            'mixer_bit_perfect' when passthroughAllowed => 'Mixer bit-perfect',
+            'mixer_matched' => 'Android matched',
+            'resampled_fallback' when androidManagedUsbRoute =>
+              'Android (resampled)',
+            'resampled_fallback' => 'Android adaptive',
+            _ => 'Adaptive output',
+          };
+
+    final effectiveDirectUsbDacClockPolicy =
+        pathManagement == AudioPathManagement.directUsbExperimental
+        ? directUsbDacClockPolicy
+        : null;
+    final effectiveClockOk =
+        pathManagement == AudioPathManagement.directUsbExperimental
+        ? directUsbClockControlSucceeded
+        : usesRustDiagnostics && engineActualSampleRate != null;
+    final effectiveRateVerified =
+        pathManagement == AudioPathManagement.directUsbExperimental
+        ? directUsbClockVerificationPassed
+        : usesRustDiagnostics &&
+              engineRequestedSampleRate != null &&
+              engineRequestedSampleRate == engineActualSampleRate &&
+              !resamplerActive;
+
+    final capabilityFlags = AudioCapabilityFlags(
+      supportsExclusiveUsbOwnership:
+          usesRustDiagnostics &&
+          pathManagement == AudioPathManagement.directUsbExperimental &&
+          directUsbRegistered &&
+          usbInterfaceClaimed,
+      supportsDirectSampleRateSwitching:
+          usesRustDiagnostics &&
+          pathManagement == AudioPathManagement.directUsbExperimental &&
+          directUsbClockVerificationPassed,
+      supportsVerifiedBitPerfect:
+          usesRustDiagnostics &&
+          effectiveBitPerfect &&
+          (pathManagement == AudioPathManagement.directUsbExperimental ||
+              outputStrategy == 'mixer_bit_perfect' ||
+              outputStrategy == 'dap_native' ||
+              outputStrategy == 'dsd_native' ||
+              outputStrategy == 'dsd_dop' ||
+              outputStrategy == 'usb_dsd_native'),
+      supportsAndroidManagedHighResOnly:
+          activeEngineType == AudioEngineType.dapInternalHighRes,
+      supportsInternalDapPathOnly:
+          activeEngineType == AudioEngineType.dapInternalHighRes &&
+          !deviceInfo.hasUsbDac,
+    );
+
+    final activeAltSetting = _intValue(
+      directUsbState?['active_alt_setting'] ??
+          directUsbState?['activeAltSetting'],
+    );
+    final activeEndpointAddress = _intValue(
+      directUsbState?['active_endpoint_address'] ??
+          directUsbState?['activeEndpointAddress'],
+    );
+    final transportFormat = _stringValue(
+      directUsbState?['transport_format'] ?? directUsbState?['transportFormat'],
+    );
+    final transportSubslot = _intValue(
+      directUsbState?['transport_subslot_size'] ??
+          directUsbState?['transportSubslotSize'],
+    );
+    final transportBitResolution = _intValue(
+      directUsbState?['transport_bit_resolution'] ??
+          directUsbState?['transportBitResolution'],
+    );
+    final activeSyncType = _stringValue(
+      directUsbState?['active_sync_type'] ?? directUsbState?['activeSyncType'],
+    );
+    final activeUsageType = _stringValue(
+      directUsbState?['active_usage_type'] ??
+          directUsbState?['activeUsageType'],
+    );
+    final activeRefresh = _intValue(
+      directUsbState?['active_refresh'] ?? directUsbState?['activeRefresh'],
+    );
+    final activeServiceIntervalUs = _intValue(
+      directUsbState?['active_service_interval_us'] ??
+          directUsbState?['activeServiceIntervalUs'],
+    );
+    final activeMaxPacketBytes = _intValue(
+      directUsbState?['active_max_packet_bytes'] ??
+          directUsbState?['activeMaxPacketBytes'],
+    );
+    final bufferFillMs = _intValue(
+      directUsbState?['buffer_fill_ms'] ?? directUsbState?['bufferFillMs'],
+    );
+    final bufferCapacityMs = _intValue(
+      directUsbState?['buffer_capacity_ms'] ??
+          directUsbState?['bufferCapacityMs'],
+    );
+    final bufferTargetMs = _intValue(
+      directUsbState?['buffer_target_ms'] ?? directUsbState?['bufferTargetMs'],
+    );
+    final framesPerPacket = _intValue(
+      directUsbState?['frames_per_packet'] ??
+          directUsbState?['framesPerPacket'],
+    );
+    final underrunCount = _intValue(
+      directUsbState?['underrun_count'] ?? directUsbState?['underrunCount'],
+    );
+    final producerFrames = _intValue(
+      directUsbState?['producer_frames'] ?? directUsbState?['producerFrames'],
+    );
+    final consumerFrames = _intValue(
+      directUsbState?['consumer_frames'] ?? directUsbState?['consumerFrames'],
+    );
+    final driftMsFromTarget = _intValue(
+      directUsbState?['drift_ms_from_target'] ??
+          directUsbState?['driftMsFromTarget'],
+    );
+    final urbTransport =
+        usesRustDiagnostics &&
+            pathManagement == AudioPathManagement.directUsbExperimental
+        ? UrbTransportInfo(
+            activeAltSetting: activeAltSetting,
+            activeEndpointAddress: activeEndpointAddress,
+            activeSyncType: activeSyncType,
+            activeUsageType: activeUsageType,
+            activeRefresh: activeRefresh,
+            activeServiceIntervalUs: activeServiceIntervalUs,
+            activeMaxPacketBytes: activeMaxPacketBytes,
+            transportFormat: transportFormat,
+            transportSubslot: transportSubslot,
+            transportBitResolution: transportBitResolution,
+            bufferFillMs: bufferFillMs,
+            bufferCapacityMs: bufferCapacityMs,
+            bufferTargetMs: bufferTargetMs,
+            framesPerPacket: framesPerPacket,
+            underrunCount: underrunCount,
+            producerFrames: producerFrames,
+            consumerFrames: consumerFrames,
+            driftMsFromTarget: driftMsFromTarget,
+          )
+        : null;
+
+    if (generation != _audioOutputDiagnosticsGeneration) {
+      return;
+    }
+
+    _activeUsbDsdMode = directUsbActive ? dsdEffectiveMode : null;
+    _activeUsbDsdSongId = directUsbActive ? song?.id : null;
+    final hardwareGeneration = _intValue(
+      directUsbState?['hardware_volume_generation'],
+    );
+    if (hardwareGeneration != _hardwareVolumeGeneration) {
+      _hardwareVolumeGeneration = hardwareGeneration;
+      _hwVolumeFailed = false;
+    }
+
+    audioOutputDiagnosticsNotifier.value = AudioOutputDiagnostics(
+      selectedMode: _sessionManager.selectedMode,
+      initializedMode: _sessionManager.initializedMode,
+      detectedDap: detectedDap,
+      detectedDapBrand: detectedDapBrand,
+      pathManagement: pathManagement,
+      outputStrategyLabel: outputStrategyLabel,
+      capabilityStateLabel: capabilityStateLabel,
+      backendDescription: backendDescription,
+      routeType:
+          iosOutput?['type'] as String? ?? deviceInfo.routeType ?? 'unknown',
+      routeLabel: iosOutput?['name'] as String? ?? deviceInfo.routeSummary,
+      outputDeviceLabel:
+          iosOutput?['name'] as String? ??
+          _stringValue(
+            directUsbState?['product_name'] ?? directUsbState?['productName'],
+          ) ??
+          _uac2Service.currentDeviceStatus?.device.productName ??
+          deviceInfo.routeSummary,
+      isMixerManaged: isMixerManaged,
+      audioFocusHeld: audioFocusHeld,
+      directUsbRegistered: usesRustDiagnostics && directUsbRegistered,
+      usbInterfaceClaimed: usesRustDiagnostics && usbInterfaceClaimed,
+      usbStreamStable: usesRustDiagnostics && usbStreamStable,
+      trackSampleRate: trackFormat?.sampleRate,
+      requestedOutputSampleRate: requestedOutputSampleRate,
+      reportedOutputSampleRate: reportedOutputSampleRate,
+      resamplerActive: resamplerActive,
+      passthroughAllowed: passthroughAllowed,
+      activeOutputSignature: usesRustDiagnostics ? outputSignature : null,
+      verificationReason: verificationReason,
+      fallbackReason: _sessionManager.fallbackReason,
+      capabilityFlags: capabilityFlags,
+      urbTransport: urbTransport,
+      dsdEffectiveMode: dsdEffectiveMode,
+      dsdTransport: dsdTransport,
+    );
+    unawaited(
+      IosLocalAudioRequests.ignoreRetired(
+        _reconcileVolumeForTier(_determineCurrentTier()),
+      ),
+    );
+
+    _debugLog(
+      '[Diagnostics] $reason: mode=${mode.logLabel}, '
+      'selected=${_sessionManager.selectedMode.logLabel}, '
+      'path=$pathManagement, strategy=$outputStrategyLabel, '
+      'route=${deviceInfo.routeSummary}, '
+      'backend="$backendDescription", requested=$requestedOutputSampleRate, '
+      'reported=$reportedOutputSampleRate, focus=$audioFocusHeld, '
+      'usbRegistered=$directUsbRegistered, usbClaimed=$usbInterfaceClaimed, '
+      'usbStreamStable=$usbStreamStable, '
+      'mixerManaged=$isMixerManaged, signature=${outputSignature ?? 'none'}, '
+      'alt=${activeAltSetting ?? -1}, endpoint=${activeEndpointAddress ?? -1}, '
+      'sync=${activeSyncType ?? 'none'}, usage=${activeUsageType ?? 'none'}, '
+      'refresh=${activeRefresh ?? -1}, '
+      'clockOk=$effectiveClockOk, rateVerified=$effectiveRateVerified, '
+      'dacPolicy=${effectiveDirectUsbDacClockPolicy ?? 'none'}, '
+      'bitPerfectConfigured=$effectiveBitPerfect, byteIdentityVerified=false, '
+      'serviceUs=${activeServiceIntervalUs ?? -1}, maxPacket=${activeMaxPacketBytes ?? -1}, '
+      'bufferMs=${bufferFillMs ?? -1}/${bufferTargetMs ?? -1}/${bufferCapacityMs ?? -1}, '
+      'framesPerPacket=${framesPerPacket ?? -1}, underruns=${underrunCount ?? -1}, '
+      'dsdStarvedSamples=${_intValue(dsdCallbackState?['starved_samples']) ?? -1}, '
+      'dsdLockMisses=${_intValue(dsdCallbackState?['lock_misses']) ?? -1}, '
+      'producerFrames=${producerFrames ?? -1}, consumerFrames=${consumerFrames ?? -1}, '
+      'driftMs=${driftMsFromTarget ?? -999}, '
+      'resampler=$resamplerActive, passthrough=$passthroughAllowed, '
+      'transport=${transportFormat ?? 'none'}/${transportBitResolution ?? -1}/'
+      '${transportSubslot ?? -1}, refusal=${directUsbRefusalReason ?? 'none'}, '
+      'verifyReason=${verificationReason ?? 'none'}, '
+      'lastError=${directUsbLastError ?? 'none'}, '
+      'fallback=${_sessionManager.fallbackReason ?? 'none'}, '
+      'dsdMode=${dsdEffectiveMode ?? 'none'}, '
+      'dsdTransport=${dsdTransport ?? 'none'}, '
+      'volumeMode=${_uac2Service.currentDeviceStatus?.volumeMode.name ?? 'unknown'}, '
+      'hardwareVolume=${directUsbState?['hardware_volume_normalized'] ?? 'unknown'}, '
+      'volumeError=${directUsbState?['hardware_volume_error'] ?? 'none'}',
+    );
+
+    _logAudioPathTransition(reason);
+  }
+
+  void _logAudioPathTransition(String trigger) {
+    final diagnostics = audioOutputDiagnosticsNotifier.value;
+    if (diagnostics == null) return;
+
+    final current = audioPathTransitionFields(diagnostics);
+    final changes = audioPathTransitionChanges(
+      _lastAudioPathTransition,
+      current,
+    );
+    _lastAudioPathTransition = current;
+    if (changes.isEmpty) return;
+
+    final now = DateTime.now();
+    final windowStart = _audioPathTransitionWindowStart;
+    final windowAge = windowStart == null
+        ? const Duration(days: 1)
+        : now.difference(windowStart);
+    if (!shouldLogAudioPathTransition(
+      logsInWindow: _audioPathTransitionLogsInWindow,
+      windowAge: windowAge,
+    )) {
+      return;
+    }
+    if (windowAge >= _audioPathTransitionLogWindow) {
+      _audioPathTransitionWindowStart = now;
+      _audioPathTransitionLogsInWindow = 0;
+    }
+    _audioPathTransitionLogsInWindow++;
+    AppLog.instance.add('[AudioPath] $trigger: ${changes.join('; ')}');
+  }
+
+  Map<String, dynamic>? _mapValue(dynamic value) {
+    if (value is Map<String, dynamic>) {
+      return value;
+    }
+    if (value is Map) {
+      return value.map((key, value) => MapEntry(key.toString(), value));
+    }
+    return null;
+  }
+
+  String? _stringValue(dynamic value) {
+    return value is String && value.isNotEmpty ? value : null;
+  }
+
+  int? _intValue(dynamic value) {
+    return value is num ? value.toInt() : null;
+  }
+
+  bool _isDetectedDapProfile(Map<String, dynamic>? profile) {
+    final kind = _mapValue(profile?['kind']);
+    return kind?['Dap'] is String;
+  }
+
+  String? _detectedDapBrand(Map<String, dynamic>? profile) {
+    final kind = _mapValue(profile?['kind']);
+    return _stringValue(kind?['Dap']);
+  }
+
+  void _startReplayTracking(
+    Song song, {
+    Duration initialPosition = Duration.zero,
+  }) {
+    _replayPlayTracker.startTrack(song.id, initialPosition: initialPosition);
+  }
+
+  bool _shouldPersistSong(Song? song) {
+    return song != null && !song.isExternal;
+  }
+
+  bool _allowsFavoriteActions(Song? song) {
+    // Online recordings are legitimate Liked entries even though we must not
+    // import their temporary streams as local library files.
+    return song != null;
+  }
+
+  void _clearReplayTracking() {
+    _replayPlayTracker.clear();
+  }
+
+  Future<void> _trackMilestones(Song song) async {
+    await _milestoneService.addListenSeconds(song.duration.inSeconds);
+    final milestone = await _milestoneService.checkMilestones();
+    if (milestone != null) {
+      await _milestoneService.markMilestoneShown(milestone);
+      pendingMilestoneNotifier.value = milestone;
+    }
+  }
+
+  /// Records that the user was active today (advancing the day-streak) and
+  /// checks for any milestone unlocked purely by opening the app — e.g. a
+  /// streak tier. Called once at startup after the milestone notifier is
+  /// wired so the celebration dialog can still fire.
+  Future<void> recordActivityDayAndCheckMilestones() async {
+    if (!await _appPreferencesService.getStreaksEnabled()) return;
+    final streak = await _milestoneService.recordActivityDay();
+    final milestone = await _milestoneService.checkMilestones();
+    if (milestone != null) {
+      await _milestoneService.markMilestoneShown(milestone);
+      pendingMilestoneNotifier.value = milestone;
+    }
+    // Defer the streak popup when a milestone unlocks so the celebration
+    // dialog owns the moment; it will fire on the next launch.
+    final snoozed = await _milestoneService.isStreakPopupSnoozed();
+    if (milestone == null &&
+        !snoozed &&
+        streak >= 1 &&
+        streakPopupNotifier.value == null) {
+      streakPopupNotifier.value = streak;
+    }
+  }
+
+  void _trackReplayProgress(Duration position) {
+    final song = currentSongNotifier.value;
+    if (song == null) {
+      _clearReplayTracking();
+      return;
+    }
+
+    if (!isPlayingNotifier.value) {
+      _replayPlayTracker.syncPosition(songId: song.id, position: position);
+      return;
+    }
+
+    final counted = _replayPlayTracker.onPositionChanged(
+      songId: song.id,
+      position: position,
+    );
+    if (counted && _shouldPersistSong(song)) {
+      unawaited(
+        _recentlyPlayedRepository.recordPlay(
+          song.id,
+          eventId: _replayPlayTracker.eventId,
+          playedAt: _replayPlayTracker.startedAt,
+          listenedMs: _replayPlayTracker.listenedMs,
+        ),
+      );
+      unawaited(_trackMilestones(song));
+    }
+  }
+
+  void _setupRustAudioListeners() {
+    if (_rustListenersAttached) return;
+    _rustListenersAttached = true;
+
+    _rustStateListener = () {
+      if (!_usingRustBackend) return;
+
+      final rustState = _rustAudioService.stateNotifier.value;
+      // Treat buffering like playback for Android direct USB: releasing audio
+      // focus while the Rust isochronous pump is still starting starves the
+      // stream and surfaces as libusb I/O errors.
+      final pipelineActive =
+          rustState == RustPlaybackState.playing ||
+          rustState == RustPlaybackState.crossfading ||
+          rustState == RustPlaybackState.buffering;
+
+      unawaited(
+        _syncUac2PlaybackStatus(
+          currentSongNotifier.value,
+          isPlaying: pipelineActive,
+        ),
+      );
+    };
+    _rustAudioService.stateNotifier.addListener(_rustStateListener!);
+
+    _rustPositionListener = () {
+      if (!_usingRustBackend) return;
+
+      final pos = _rustAudioService.positionNotifier.value;
+      _trackReplayProgress(pos);
+
+      final now = DateTime.now();
+      if (currentSongNotifier.value != null &&
+          isPlayingNotifier.value &&
+          now.difference(_lastNotificationUpdate).inSeconds >= 2) {
+        _lastNotificationUpdate = now;
+        _updateNotificationState();
+      }
+    };
+    _rustAudioService.positionNotifier.addListener(_rustPositionListener!);
+
+    _rustDurationListener = () {
+      if (!_usingRustBackend) return;
+    };
+    _rustAudioService.durationNotifier.addListener(_rustDurationListener!);
+
+    _rustAudioService.onTrackEnded = (endedPath) {
+      if (!_usingRustBackend) return;
+      unawaited(_onSongFinished(endedPath: endedPath));
+    };
+    _rustAudioService.onCrossfadeStarted = (fromPath, toPath) {
+      _debugLog('[crossfade] ENGINE TRIGGERED: $fromPath -> $toPath');
+      if (!_usingRustBackend) return;
+      unawaited(
+        _enqueuePlaybackRequest(() => _onCrossfadeStarted(fromPath, toPath)),
+      );
+    };
+    _rustAudioService.onError = (message) {
+      _debugLog('[PlayerService] Rust backend error: $message');
+      if (_manualUsbRestartInFlight != null &&
+          _isDirectUsbStartupRefusal(message)) {
+        // Manual restart validates native consumption and retries the entire
+        // session. Do not enqueue a competing asynchronous USB fallback.
+        AppLog.instance.add(
+          '[USB] Transport error during manual restart '
+          'will be handled by the active recovery attempt',
+        );
+        return;
+      }
+      if (Platform.isAndroid &&
+          !_midStreamUsbFallbackActive &&
+          currentEngineType == AudioEngineType.usbDacExperimental &&
+          _isDirectUsbStartupRefusal(message)) {
+        _midStreamUsbFallbackActive = true;
+        final song = currentSongNotifier.value;
+        final position = _lastPlaybackState?.position ?? Duration.zero;
+        // Serialize recovery with user-requested track changes. The native
+        // stream must never be reset while a new track is being prepared.
+        unawaited(
+          _enqueuePlaybackRequest(() async {
+            try {
+              if (song == null ||
+                  currentSongNotifier.value?.id != song.id ||
+                  currentEngineType != AudioEngineType.usbDacExperimental) {
+                return; // The failure belongs to a superseded stream.
+              }
+              // Mid-stream USB error = DAC lost while playing. Respect the
+              // pause-on-disconnect pref instead of resuming on the fallback.
+              final pauseOnDisconnect = await _appPreferencesService
+                  .getPauseOnUsbDacDisconnect();
+              var autoResumeAfterFallback = !pauseOnDisconnect;
+              if (pauseOnDisconnect) {
+                // A libusb I/O failure is not proof of a physical unplug.
+                // Query UsbManager without releasing the runtime prematurely:
+                // recovery needs the old session to stop in a controlled order.
+                final stillAttached = (await _uac2Service.listDevices(
+                  verifyPhysicalAttachment: true,
+                )).isNotEmpty;
+                if (stillAttached) {
+                  _debugLog(
+                    '[Engine] Direct USB failed but DAC still attached; '
+                    'treating as transient USB suspension, auto-resuming on '
+                    'fallback',
+                  );
+                  autoResumeAfterFallback = true;
+                }
+              }
+              final fellBack = await _handleDirectUsbStartupRefusal(
+                message,
+                song: song,
+                initialPosition: position,
+                autoResumeAfterFallback: autoResumeAfterFallback,
+              );
+              if (!fellBack) {
+                await _refreshAudioOutputDiagnostics(
+                  reason: 'Rust backend error',
+                );
+              }
+            } finally {
+              _midStreamUsbFallbackActive = false;
+            }
+          }),
+        );
+        return;
+      }
+      if (isDeadRustEngineError(message)) {
+        final song = currentSongNotifier.value;
+        final position = _lastPlaybackState?.position ?? Duration.zero;
+        unawaited(() async {
+          final revived = await _handleDeadRustEngineFailure(
+            StateError(message),
+            song: song,
+            initialPosition: position,
+          );
+          if (!revived) {
+            await _refreshAudioOutputDiagnostics(
+              reason: 'Rust engine thread crash',
+            );
+          }
+        }());
+        return;
+      }
+      unawaited(_refreshAudioOutputDiagnostics(reason: 'Rust backend error'));
+    };
+  }
+
+  void _bindPlaybackState() {
+    _playbackDiagnosticsDebounceTimer?.cancel();
+    _playbackDiagnosticsDebounceTimer = null;
+    _playbackStateSubscription?.cancel();
+    _playbackStateSubscription = _playbackManager.playbackState.listen((state) {
+      if (Platform.isIOS &&
+          (_castingService.isActive ||
+              _iosLocalRetirement ||
+              IosLocalAudioRequests.lifecycle.phase.value ==
+                  LocalAudioPhase.recovering ||
+              IosLocalAudioRequests.lifecycle.phase.value ==
+                  LocalAudioPhase.lost ||
+              IosLocalAudioRequests.lifecycle.phase.value ==
+                  LocalAudioPhase.blocked))
+        return;
+      if (state.isPlaying && Platform.isIOS) {
+        IosLocalAudioRequests.lifecycle.confirmLocalPlaybackStarted();
+        final selected = _iosPlaySelection?.song;
+        final playing = state.currentTrack;
+        if (selected != null &&
+            playing != null &&
+            androidAudioSourceIdentity(selected) ==
+                androidAudioSourceIdentity(playing)) {
+          _iosPlaySelection = null;
+        }
+      }
+      final presentedId = _pendingPresentationTrackId;
+      if (shouldHoldPendingPresentation(presentedId, state.currentTrack)) {
+        // A previous song's paused/idle state can arrive asynchronously after
+        // tapping Next. It must not undo the pending track selection or send
+        // the carousel/mini-player backwards while downloading.
+        if (isPlayingNotifier.value) isPlayingNotifier.value = false;
+        return;
+      }
+      if (presentedId != null &&
+          state.currentTrack?.id == presentedId &&
+          state.currentTrack?.isPending != true) {
+        _pendingPresentationTrackId = null;
+      }
+      final previous = _lastPlaybackState;
+      _lastPlaybackState = state;
+
+      // When the engine attaches or reinitialises it briefly emits a null-track
+      // transitional state before the real track loads. If the playlist is still
+      // populated (songs are queued) we preserve the last known song in the
+      // notifier so the mini-player and ambient background never flash to black.
+      // We only truly clear the song notifier when the playlist itself is empty
+      // (i.e. the user explicitly stopped all playback).
+      final incomingTrack =
+          state.currentTrack ??
+          (_playlist.isNotEmpty ? currentSongNotifier.value : null);
+      if (currentSongNotifier.value != incomingTrack) {
+        currentSongNotifier.value = incomingTrack;
+      }
+      if (isBufferingNotifier.value != state.isBuffering) {
+        isBufferingNotifier.value = state.isBuffering;
+      }
+      if (isPlayingNotifier.value != state.isPlaying) {
+        isPlayingNotifier.value = state.isPlaying;
+      }
+      if (!_suppressPositionUpdatesFromEngine &&
+          positionNotifier.value != state.position) {
+        positionNotifier.value = state.position;
+        if (isAbRepeatActive) {
+          checkAbRepeatBoundary(state.position);
+        }
+      }
+      if (bufferedPositionNotifier.value != state.bufferedPosition) {
+        bufferedPositionNotifier.value = state.bufferedPosition;
+      }
+      if (durationNotifier.value != state.duration) {
+        durationNotifier.value = state.duration;
+      }
+
+      final shouldUseRust = state.engine.usesRustBackend;
+      if (_usingRustBackend != shouldUseRust) {
+        _usingRustBackend = shouldUseRust;
+      }
+      if (previous?.engine != state.engine) {
+        _updatePriorityAnchor();
+      }
+      if (Platform.isIOS &&
+          _iosPositionSavingPaused &&
+          !shouldUseRust &&
+          !state.isPlaying &&
+          !state.isBuffering &&
+          state.currentTrack != null &&
+          previous?.currentTrack?.id == state.currentTrack?.id &&
+          previous?.position != state.position) {
+        unawaited(
+          _savePosition(
+            song: state.currentTrack,
+            position: state.position,
+            wasPlaying: false,
+          ),
+        );
+      }
+      final shouldTrackReplayFromState = shouldTrackReplayFromPlaybackState(
+        usingRustBackend: shouldUseRust,
+        previousPosition: previous?.position,
+        currentPosition: state.position,
+      );
+
+      final previousTrackId = previous?.currentTrack?.id;
+      final currentTrackId = state.currentTrack?.id;
+      final shouldSyncLoopedNotification =
+          shouldSyncNotificationForRepeatOneLoop(
+            loopMode: loopModeNotifier.value,
+            sameTrack:
+                previousTrackId != null && previousTrackId == currentTrackId,
+            previousPosition: _lastPosition,
+            currentPosition: state.position,
+            trackDuration: state.duration,
+          );
+      if (previousTrackId != currentTrackId) {
+        if (currentTrackId != null && currentTrackId == _restoredSongId) {
+          _clearRestoredPlaybackContext(songId: currentTrackId);
+        }
+        if (_autoSyncGuardSongId != null &&
+            _autoSyncGuardSongId == currentTrackId) {
+          _clearAutoSyncGuard();
+        }
+        if (state.currentTrack != null) {
+          _debugLog('[Playback] Track changed: ${state.currentTrack!.title}');
+        } else {
+          _debugLog('[Playback] Track cleared');
+        }
+        if (state.currentTrack != null) {
+          _syncCurrentIndexToTrack(state.currentTrack!);
+          _startReplayTracking(
+            state.currentTrack!,
+            initialPosition: state.position,
+          );
+          // just_audio keeps its own volume per player: fold the new track's
+          // ReplayGain in whenever playback advances (auto-advance incl.).
+          if (!_usingRustBackend) {
+            unawaited(
+              IosLocalAudioRequests.ignoreRetired(
+                _applyReplayGainForSystemTier(state.currentTrack!),
+              ),
+            );
+          }
+          unawaited(
+            _syncUac2PlaybackStatus(
+              state.currentTrack,
+              isPlaying: state.isPlaying,
+            ),
+          );
+          unawaited(_updateNotificationState());
+          unawaited(
+            _savePosition(song: state.currentTrack, position: state.position),
+          );
+          _maybeRerouteTrackToRustDecoder(
+            state.currentTrack!,
+            position: state.position,
+          );
+        } else {
+          _clearReplayTracking();
+        }
+      } else if (previous?.isPlaying != state.isPlaying &&
+          state.currentTrack != null) {
+        unawaited(_updateNotificationState());
+      }
+
+      if (shouldSyncLoopedNotification && state.currentTrack != null) {
+        _lastNotificationUpdate = DateTime.now();
+        unawaited(_updateNotificationState());
+      }
+
+      if (shouldTrackReplayFromState) {
+        _trackReplayProgress(state.position);
+      }
+
+      _lastPosition = state.position;
+
+      _checkPlaybackDesync(state);
+
+      final criticalDiagnosticsChange =
+          previous == null ||
+          previous.engine != state.engine ||
+          previous.currentTrack?.id != state.currentTrack?.id ||
+          previous.isPlaying != state.isPlaying;
+      if (criticalDiagnosticsChange) {
+        _playbackDiagnosticsDebounceTimer?.cancel();
+        _playbackDiagnosticsDebounceTimer = null;
+        unawaited(
+          _refreshAudioOutputDiagnostics(
+            reason: 'playback state changed',
+            activeSong: state.currentTrack,
+          ),
+        );
+      } else {
+        // A 50 ms progress stream must not continually reset this deadline:
+        // USB stability/payload checks become ready after the startup snapshot.
+        _playbackDiagnosticsDebounceTimer = coalescePlaybackDiagnosticsRefresh(
+          pending: _playbackDiagnosticsDebounceTimer,
+          interval: _playbackDiagnosticsDebounce,
+          refresh: () {
+            _playbackDiagnosticsDebounceTimer = null;
+            final snap = _lastPlaybackState;
+            unawaited(
+              _refreshAudioOutputDiagnostics(
+                reason: 'playback state changed',
+                activeSong: snap?.currentTrack,
+              ),
+            );
+          },
+        );
+      }
+    });
+  }
+
+  Future<void> refreshNotificationState() {
+    return _updateNotificationState();
+  }
+
+  /// Sets up the app's audio session (music content, focus and interruption
+  /// handling, ducking preference) before another player in the app, such as
+  /// internet radio, requests audio focus through it.
+  Future<void> prepareAudioSessionForExternalPlayer() =>
+      _configureSystemAudioSession();
+
+  // ponytail: remote volume ticks can be rapid (slider drags); keep them on the
+  // lightweight cast-only notification path instead of a full metadata refresh.
+  void _onRemoteVolumeChanged() {
+    final v = _castingService.remoteVolumeNotifier.value;
+    unawaited(
+      _notificationService.updateCastState(
+        isCasting: _castingService.isActive,
+        castDeviceName: _castingService.activeDevice?.name,
+        castVolumePercent: v == null ? null : (v * 100).round(),
+      ),
+    );
+  }
+
+  Future<void> _toggleFavoriteFromNotification() async {
+    final song = currentSongNotifier.value;
+    if (_allowsFavoriteActions(song)) {
+      await _favoritesService.toggleFavorite(song!.id, song: song);
+      favoriteNotificationToggleNotifier.value++;
+      await _updateNotificationState();
+    }
+  }
+
+  Future<void> _updateNotificationState() async {
+    final song = currentSongNotifier.value;
+    if (song == null) return;
+
+    var isFav = false;
+    if (_allowsFavoriteActions(song)) {
+      try {
+        isFav = await _favoritesService.isFavorite(song.id);
+      } catch (e) {
+        _debugLog('Failed to load favorite state: $e');
+      }
+    }
+
+    int? notificationColor;
+    try {
+      final colorMode = await _albumColorModePreferenceService.getMode();
+      if (colorMode != AlbumColorMode.off &&
+          song.albumArt != null &&
+          song.albumArt!.isNotEmpty) {
+        final songId = song.id;
+        if (songId == _lastNotificationColorSongId &&
+            _lastNotificationColor != null) {
+          notificationColor = _lastNotificationColor;
+        } else {
+          final color = await _colorExtractionService.extractDominantColor(
+            song.albumArt,
+          );
+          if (color != null) {
+            notificationColor = color.toARGB32();
+            _lastNotificationColor = notificationColor;
+            _lastNotificationColorSongId = songId;
+          }
+        }
+      }
+    } catch (e) {
+      _debugLog('Failed to extract notification color: $e');
+    }
+
+    await _notificationService.updateNotification(
+      song: song,
+      isPlaying: isPlayingNotifier.value,
+      duration: durationNotifier.value,
+      position: positionNotifier.value,
+      isShuffle: isShuffleNotifier.value,
+      isFavorite: isFav,
+      color: notificationColor,
+      isCasting: _castingService.isActive,
+      castDeviceName: _castingService.activeDevice?.name,
+      castVolumePercent: _castingService.remoteVolumeNotifier.value == null
+          ? null
+          : (_castingService.remoteVolumeNotifier.value! * 100).round(),
+    );
+
+    await _showFloatingPlayerOverlay();
+  }
+
+  /// The receiver owns its clock. Its completion bypasses the paused local
+  /// engine's gapless/crossfade flags and advances the logical queue once.
+  Future<void> castTrackFinished(String trackId, String loadId) =>
+      _enqueuePlaybackRequest(() async {
+        if (!_castingService.isActive ||
+            _castingService.currentCastLoadId != loadId ||
+            currentSongNotifier.value?.id != trackId)
+          return;
+        if (loopModeNotifier.value == LoopMode.stopAfterCurrent) {
+          final song = currentSongNotifier.value;
+          if (song != null) {
+            await _castingService.delegatePlay(song, autoplay: false);
+            positionNotifier.value = Duration.zero;
+            isPlayingNotifier.value = false;
+          }
+          return;
+        }
+        if (loopModeNotifier.value == LoopMode.one) {
+          final song = currentSongNotifier.value;
+          if (song != null) await _playInternal(song);
+        } else {
+          await _nextInternal();
+        }
+      }, remoteOutput: true);
+
+  Future<void> _onSongFinished({String? endedPath}) {
+    return _enqueuePlaybackRequest(
+      () => _onSongFinishedInternal(endedPath: endedPath),
+    );
+  }
+
+  Future<void> _onSongFinishedInternal({String? endedPath}) async {
+    if (_castingService.isActive) return;
+    _debugLog(
+      '_onSongFinished: loopMode=${loopModeNotifier.value}, currentIndex=$_currentIndex, playlistLength=${_playlist.length}, usingRustBackend=$_usingRustBackend, endedPath=$endedPath',
+    );
+    _debugLog(
+      '[crossfade] completion: gapless=$_isGaplessActive, '
+      'active=$_isCrossfadeActive, '
+      'preference=${_rustAudioService.crossfadeEnabledNotifier.value}, '
+      'locked=$isBitPerfectProcessingLocked, '
+      'duration=${_rustAudioService.crossfadeDurationNotifier.value}s, '
+      'handoff=${_isGaplessActive || _isCrossfadeActive ? "native" : "manual"}',
+    );
+
+    if (endedPath != null && _crossfadeUiHandoffFromPath == endedPath) {
+      _crossfadeUiHandoffFromPath = null;
+      await _finalizeCrossfadeUiHandoff(endedPath);
+      return;
+    }
+
+    if (_isGaplessActive || _isCrossfadeActive) {
+      await _handleGaplessTrackEnded();
+      return;
+    }
+
+    if (!shouldHandleManualCompletion(
+      usingRustBackend: _usingRustBackend,
+      loopMode: loopModeNotifier.value,
+      androidSingleTrackOnly:
+          !_usingRustBackend &&
+          ((_androidEngine?.isSingleTrackOnly ?? false) ||
+              requiresOnDemandAndroidSequence(_playlist) ||
+              _audioSourceSequence == null),
+    )) {
+      _debugLog('_onSongFinished: skipping manual completion handling');
+      return;
+    }
+
+    if (loopModeNotifier.value == LoopMode.stopAfterCurrent) {
+      _debugLog('_onSongFinished: stopAfterCurrent, pausing');
+      await _pauseInternal();
+      await seek(Duration.zero);
+      return;
+    }
+
+    if (loopModeNotifier.value == LoopMode.one) {
+      final songToReplay = currentSongNotifier.value ?? _songAtCurrentIndex();
+      if (songToReplay != null) {
+        _debugLog('_onSongFinished: LoopMode.one, replaying current song');
+        await _playInternal(songToReplay);
+      }
+    } else {
+      _debugLog('_onSongFinished: Calling next()');
+      await _nextInternal();
+    }
+  }
+
+  /// The engine has begun fading the queued successor in. Move the playlist UI
+  /// to the incoming track immediately so the app follows the audible handoff
+  /// instead of waiting for the outgoing track's TrackEnded event (which now
+  /// only queues the following successor).
+  Future<void> _onCrossfadeStarted(String fromPath, String toPath) async {
+    if (_castingService.isActive) return;
+    if (_playlist.isEmpty || _currentIndex < 0) return;
+    if (_crossfadeUiHandoffFromPath == fromPath) return;
+
+    final fromSong = currentSongNotifier.value;
+    if (fromSong == null) return;
+    final fromResolved = await _resolveRustPath(fromSong);
+    if (fromResolved != null && fromResolved != fromPath) {
+      _debugLog(
+        '[crossfade] UI handoff skipped: engine fading $fromPath while '
+        'current is ${fromSong.title}',
+      );
+      return;
+    }
+
+    // The completion path owns the pause-and-rewind behaviour; do not move the
+    // UI for a fade that is about to be stopped.
+    if (loopModeNotifier.value == LoopMode.stopAfterCurrent) return;
+
+    // The engine only fades into the successor queued by
+    // _queueNextTrackForGapless, which follows linear playlist order.
+    final isLastTrack = _currentIndex >= _playlist.length - 1;
+    if (isLastTrack && loopModeNotifier.value != LoopMode.all) return;
+    final nextIndex = isLastTrack ? 0 : _currentIndex + 1;
+    if (nextIndex == _currentIndex) return;
+    final nextSong = _playlist[nextIndex];
+
+    _crossfadeUiHandoffFromPath = fromPath;
+    _setCurrentIndex(nextIndex);
+    currentSongNotifier.value = nextSong;
+    // Keep the engine's reported track in sync so playback-state emissions
+    // cannot revert the UI to the outgoing song while the fade finishes.
+    _playbackManager.updateTrack(nextSong);
+    _consumeQueueEntryAt(_currentIndex);
+    _updatePriorityAnchor();
+    if (isPlayingNotifier.value) {
+      _updateNotificationState();
+    }
+    _debugLog(
+      '[crossfade] UI handoff at fade start: ${fromSong.title} -> '
+      '${nextSong.title}',
+    );
+  }
+
+  /// The UI already moved to the incoming track when the crossfade started.
+  /// The engine's TrackEnded for the outgoing path therefore only needs to
+  /// queue the successor for the new current track.
+  Future<void> _finalizeCrossfadeUiHandoff(String endedPath) async {
+    _debugLog(
+      '[crossfade] completion after early UI handoff: $endedPath; '
+      'current=${currentSongNotifier.value?.title}',
+    );
+    final currentSong = currentSongNotifier.value;
+    if (_usingRustBackend && currentSong != null) {
+      final expectedPath = await _resolveRustPath(currentSong);
+      final enginePath = _rustAudioService.currentPath;
+      if (expectedPath != null && enginePath != expectedPath) {
+        _debugLog(
+          '[crossfade] handoff mismatch after early UI handoff: '
+          'engineHasSource=${enginePath != null}; reloading ${currentSong.title}',
+        );
+        await _playSongAtCurrentIndex();
+        return;
+      }
+    }
+    unawaited(_queueNextTrackForGapless());
+    if (isPlayingNotifier.value && currentSong != null) {
+      _updateNotificationState();
+    }
+  }
+
+  Future<void> _handleGaplessTrackEnded() async {
+    if (_playlist.isEmpty) return;
+
+    if (loopModeNotifier.value == LoopMode.stopAfterCurrent) {
+      await _pauseInternal();
+      await seek(Duration.zero);
+      return;
+    }
+
+    if (_currentIndex < _playlist.length - 1) {
+      _setCurrentIndex(_currentIndex + 1);
+    } else if (shuffleModeNotifier.value == ShuffleMode.songsAndCategories ||
+        shuffleModeNotifier.value == ShuffleMode.categories) {
+      await _advanceToRandomCategory();
+      return;
+    } else if (loopModeNotifier.value == LoopMode.all) {
+      _setCurrentIndex(0);
+    } else if (loopModeNotifier.value.isAdvanceMode) {
+      await _advanceForMode(loopModeNotifier.value);
+      return;
+    } else {
+      await _handleQueueEnd();
+      return;
+    }
+
+    final currentSong = _songAtCurrentIndex();
+    if (currentSong != null && currentSong.isPending) {
+      // Not downloaded yet, so the engine had nothing queued: look it up.
+      await _playSongAtCurrentIndex();
+      return;
+    }
+    if (currentSong != null) {
+      currentSongNotifier.value = currentSong;
+      _playbackManager.updateTrack(currentSong);
+    }
+    _consumeQueueEntryAt(_currentIndex);
+    _updatePriorityAnchor();
+
+    if (_usingRustBackend && currentSong != null) {
+      final expectedPath = await _resolveRustPath(currentSong);
+      final enginePath = _rustAudioService.currentPath;
+      if (expectedPath != null && enginePath != expectedPath) {
+        _debugLog(
+          '[crossfade] handoff mismatch: engineHasSource=${enginePath != null}; '
+          'reloading ${currentSong.title}',
+        );
+        await _playSongAtCurrentIndex();
+        return;
+      }
+      _debugLog(
+        '[crossfade] handoff check: pathResolved=${expectedPath != null}, '
+        'engineMatchesExpected=${expectedPath != null && enginePath == expectedPath}',
+      );
+    }
+
+    unawaited(_queueNextTrackForGapless());
+
+    if (isPlayingNotifier.value && currentSong != null) {
+      _updateNotificationState();
+    }
+  }
+
+  Future<void> _stopPlayback() {
+    _cancelPendingPlayback();
+    _pendingPresentationTrackId = null;
+    _wasPlayingBeforeAudioInterruption = false;
+    _crossfadeUiHandoffFromPath = null;
+    return _enqueuePlaybackRequest(() async {
+      final stoppedSong = currentSongNotifier.value ?? _songAtCurrentIndex();
+      final stoppedPosition = positionNotifier.value;
+      if (stoppedSong != null) {
+        // Native Stop may reset its clock to zero. Keep the same bookmark in
+        // memory that startup restoration reads from disk for the next Play.
+        _rememberRestoredPlaybackContext(stoppedSong, stoppedPosition);
+      }
+      await _savePosition(
+        song: stoppedSong,
+        position: stoppedPosition,
+        wasPlaying: false,
+      );
+      _positionSaveTimer?.cancel();
+      _clearReplayTracking();
+      // Release even if the engine fails to publish its final stopped state.
+      if (_priorityAnchorActive) {
+        _priorityAnchorActive = false;
+        AppLog.instance.add(
+          '[PriorityAnchor] stop requested; playback stopped',
+        );
+        unawaited(_uac2Service.stopPriorityAnchor());
+      }
+      try {
+        await _playbackManager.stop();
+      } catch (e) {
+        _debugLog('Stop failed: $e');
+      }
+      await _refreshAudioOutputDiagnostics(reason: 'playback stopped');
+      cancelSleepTimer();
+    }, remoteOutput: _castingService.isActive);
+  }
+
+  /// Build audio sources for the playlist (gapless playback).
+  // ignore: deprecated_member_use
+  Future<just_audio.ConcatenatingAudioSource> _buildAudioSources() async {
+    if (_playlist.isEmpty) {
+      // ignore: deprecated_member_use
+      return just_audio.ConcatenatingAudioSource(children: const []);
+    }
+
+    const batchSize = 12;
+    final sources = <just_audio.AudioSource>[];
+
+    for (var start = 0; start < _playlist.length; start += batchSize) {
+      final end = (start + batchSize).clamp(0, _playlist.length);
+      final batch = _playlist.sublist(start, end);
+      final resolvedBatch = await Future.wait(
+        batch.map(_buildAudioSourceForSong),
+      );
+      sources.addAll(resolvedBatch);
+    }
+
+    // ignore: deprecated_member_use
+    _audioSourceSequence = just_audio.ConcatenatingAudioSource(
+      children: sources,
+    );
+    return _audioSourceSequence!;
+  }
+
+  Future<just_audio.AudioSource> _buildAudioSourceForSong(Song song) async {
+    if (song.isPending || song.filePath == null || song.filePath!.isEmpty) {
+      // Never turn a queued online placeholder into a bogus native audio
+      // source (Uri.parse('')). Keep resolution in QueuePreResolver.
+      throw StateError('Unresolved queue entry has no playable audio source');
+    }
+
+    final liveMorneye = song.sourcePackage == 'konnekted.morneye-live'
+        ? MorneyeLiveRegistry.instance.resolve(song.filePath)
+        : null;
+    if (song.sourcePackage == 'konnekted.morneye-live' && liveMorneye == null) {
+      throw StateError('Morneye stream expired. Select the song again.');
+    }
+    if (liveMorneye != null) {
+      return MorneyeLiveAudioSource(liveMorneye);
+    }
+    final streamSource = _streamSourceForSong(song);
+    if (streamSource != null) {
+      // Clipping is folded into the virtual WAV layout; ClippingAudioSource
+      // cannot wrap a StreamAudioSource (it requires a UriAudioSource).
+      return streamSource;
+    }
+
+    final resolved = await _resolvePlaybackUri(song);
+    final uri = resolved.uri;
+    final headers = proxySafeHeaders(resolved.headers);
+
+    if (song.startOffsetMs != null && song.startOffsetMs! > 0) {
+      final start = Duration(milliseconds: song.startOffsetMs!);
+      final end = song.endOffsetMs != null && song.endOffsetMs! > 0
+          ? Duration(milliseconds: song.endOffsetMs!)
+          : null;
+      return just_audio.ClippingAudioSource(
+        child: just_audio.AudioSource.uri(uri, headers: headers),
+        start: start,
+        end: end,
+      );
+    }
+
+    return just_audio.AudioSource.uri(uri, headers: headers);
+  }
+
+  /// Decodes ALAC/M4A/AIFF through the Rust engine without writing a WAV.
+  ///
+  /// Everything else keeps the existing direct-URI path: only formats that
+  /// previously forced an eager `wav_cache` conversion are streamed, so
+  /// external handoffs and unsupported content URIs are untouched.
+  just_audio.AudioSource? _streamSourceForSong(Song song) {
+    if (kIsWeb ||
+        song.isNetworkSource ||
+        (song.sourcePackage == 'konnekted.progressive' ||
+            song.sourcePackage == 'konnekted.morneye-live') ||
+        !_shouldConvertToWav(song)) {
+      return null;
+    }
+    final filePath = song.filePath;
+    if (filePath == null || filePath.isEmpty) return null;
+    final startOffsetMs = song.startOffsetMs;
+    return WavStreamAudioSource(
+      filePath: filePath,
+      durationHint: song.duration,
+      extensionHint: _preferredExtension(song),
+      startOffset: startOffsetMs != null && startOffsetMs > 0
+          ? Duration(milliseconds: startOffsetMs)
+          : null,
+      endOffset: song.endOffsetMs != null && song.endOffsetMs! > 0
+          ? Duration(milliseconds: song.endOffsetMs!)
+          : null,
+    );
+  }
+
+  Future<void> _insertIntoAudioSequence(int playlistIndex, Song song) async {
+    if (_usingRustBackend ||
+        _audioSourceSequence == null ||
+        song.isPending ||
+        song.filePath?.isNotEmpty != true ||
+        requiresOnDemandAndroidSequence(_playlist))
+      return;
+    final source = await _buildAudioSourceForSong(song);
+    _audioSourceSequence!.insert(playlistIndex, source);
+  }
+
+  void _removeFromAudioSequence(int playlistIndex) {
+    if (_usingRustBackend || _audioSourceSequence == null) return;
+    if (playlistIndex < _audioSourceSequence!.children.length) {
+      _audioSourceSequence!.removeAt(playlistIndex);
+    }
+  }
+
+  Future<({Uri uri, Map<String, String> headers})> _resolvePlaybackUri(
+    Song song,
+  ) async {
+    // ponytail: HTTP-first for network sources. Hand ExoPlayer the ranged URL
+    // so playback starts while bytes stream in, instead of blocking on a full
+    // cache download before the first frame. Falls back to cache-then-play
+    // (ensureLocal) for protocols without byte-range support (SMB/UPnP) or on
+    // resolve failure. Matches the Rust backend's existing strategy.
+    // Headers must travel with the URL: WebDAV returns Basic auth and
+    // ExoPlayer fetches the stream itself.
+    if (song.sourcePackage == 'konnekted.progressive') {
+      final uri = DiscoveryProgressiveStreams.instance.resolve(song.filePath);
+      if (uri == null) {
+        throw StateError('HTTP add-on stream expired. Select the song again.');
+      }
+      return (uri: uri, headers: const <String, String>{});
+    }
+    if (song.isNetworkSource) {
+      try {
+        final http = await RemoteSourceService.instance.resolveHttpPlayback(
+          song,
+        );
+        if (http != null) {
+          return (uri: Uri.parse(http.url), headers: http.headers);
+        }
+      } catch (e) {
+        _debugLog(
+          '[Playback] HTTP-first resolve failed for "${song.title}": $e',
+        );
+      }
+    }
+    final resolvedPath = await _resolvePreparedPlaybackPath(song);
+    if (resolvedPath == null || resolvedPath.isEmpty) {
+      return (uri: Uri.parse(''), headers: const <String, String>{});
+    }
+
+    return (
+      uri: _toPlaybackUri(resolvedPath),
+      headers: const <String, String>{},
+    );
+  }
+
+  Future<String?> _resolvePreparedPlaybackPath(Song song) async {
+    final filePath = song.filePath;
+    if (filePath == null || filePath.isEmpty) {
+      return null;
+    }
+
+    if (song.isNetworkSource) {
+      // Network songs always play from the local network cache: a cache hit
+      // is instant (gapless/crossfade handoff), a miss downloads first.
+      return RemoteSourceService.instance.ensureLocal(song);
+    }
+
+    final sourceKey = filePath;
+    var resolvedPath = filePath;
+    final parsed = Uri.tryParse(filePath);
+    final isAndroidContentUri =
+        !kIsWeb &&
+        defaultTargetPlatform == TargetPlatform.android &&
+        parsed?.scheme == 'content';
+
+    final needsWavWork = isAndroidContentUri || _shouldConvertToWav(song);
+    if (needsWavWork) {
+      final normalizedType = _playbackFileType(song);
+      _debugLog(
+        '[WAV-conv] resolve path: file=${song.title} '
+        'normType=$normalizedType engine=$currentEngineType '
+        'isContentUri=$isAndroidContentUri shouldConvert=${_shouldConvertToWav(song)}',
+      );
+    }
+
+    if (isAndroidContentUri && _shouldStageContentUriForPlayback(song)) {
+      final stagedPath = await _stageContentUriForPlayback(
+        filePath,
+        extensionHint: _preferredExtension(song),
+      );
+      _debugLog('[WAV-conv] staged: ${stagedPath ?? "null"}');
+      if (stagedPath != null) {
+        resolvedPath = stagedPath;
+      }
+    }
+
+    if (_shouldConvertToWav(song)) {
+      final convertedPath = await _convertPlaybackPathToWav(
+        sourceKey: sourceKey,
+        sourcePath: resolvedPath,
+      );
+      _debugLog(
+        '[WAV-conv] converted: ${convertedPath ?? "null (fallback to native)"}',
+      );
+      if (convertedPath != null) {
+        resolvedPath = convertedPath;
+      }
+    }
+
+    if (needsWavWork) {
+      _debugLog('[WAV-conv] final resolved path: $resolvedPath');
+    }
+    return resolvedPath;
+  }
+
+  bool _shouldStageForPlayback(Song song) {
+    final normalized = _playbackFileType(song);
+    return normalized == 'm4a' || normalized == 'aiff';
+  }
+
+  bool _shouldStageContentUriForPlayback(Song song) {
+    return song.isExternal || _shouldStageForPlayback(song);
+  }
+
+  Future<String?> _stageContentUriForPlayback(
+    String uri, {
+    required String extensionHint,
+  }) async {
+    final cached = _stagedPlaybackPathCache[uri];
+    if (cached != null && cached.isNotEmpty) {
+      return cached;
+    }
+
+    try {
+      final maxStagingBytes = await PlaybackCachePreferencesService()
+          .getMaxCacheBytes();
+      final stagedPath = await _storageChannel.invokeMethod<String>(
+        'cacheUriForPlayback',
+        {
+          'uri': uri,
+          'extensionHint': extensionHint,
+          'maxStagingBytes': maxStagingBytes,
+        },
+      );
+      if (stagedPath != null && stagedPath.isNotEmpty) {
+        _stagedPlaybackPathCache[uri] = stagedPath;
+        return stagedPath;
+      }
+    } catch (e) {
+      _debugLog('Failed to stage content URI for playback: $e');
+      AppLog.instance.add('[Playback] Content URI staging failed: $e');
+    }
+    return null;
+  }
+
+  String _preferredExtension(Song song) {
+    final fileType = _playbackFileType(song);
+    if (fileType == 'aiff' || fileType == 'm4a') return fileType;
+    if (RegExp(r'^[a-z0-9]+$').hasMatch(fileType) && fileType.isNotEmpty) {
+      return fileType;
+    }
+
+    final filePath = song.filePath;
+    if (filePath != null) {
+      final extension = extractPlaybackPathExtension(filePath);
+      if (extension.isNotEmpty) {
+        return extension;
+      }
+    }
+    return 'm4a';
+  }
+
+  Uri _toPlaybackUri(String rawPath) {
+    // Handle Windows absolute paths like C:\Music\song.flac.
+    if (RegExp(r'^[a-zA-Z]:\\').hasMatch(rawPath)) {
+      return Uri.file(rawPath, windows: true);
+    }
+
+    final parsed = Uri.tryParse(rawPath);
+    if (parsed != null && parsed.scheme.isNotEmpty) {
+      return parsed;
+    }
+
+    // Local filesystem path.
+    return Uri.file(rawPath);
+  }
+
+  bool _shouldConvertToWav(Song song) {
+    // ponytail: standard engine also routes ALAC/AIFF via the Rust converter.
+    // AAC-in-M4A fails the Symphonia probe (no default AAC), lands in
+    // _unsupportedWavConversionSources, and falls back to the staged M4A
+    // path so ExoPlayer plays it natively. Probe, not extension, decides A/B.
+    final normalized = _playbackFileType(song);
+    return normalized == 'm4a' || normalized == 'aiff';
+  }
+
+  Future<String?> _convertPlaybackPathToWav({
+    required String sourceKey,
+    required String sourcePath,
+  }) async {
+    if (_unsupportedWavConversionSources.contains(sourceKey)) {
+      return null;
+    }
+
+    final cached = _convertedPlaybackPathCache[sourceKey];
+    if (cached != null && cached.isNotEmpty) {
+      final cachedFile = Uri.file(cached).toFilePath();
+      if (await File(cachedFile).exists()) {
+        return cached;
+      }
+      _convertedPlaybackPathCache.remove(sourceKey);
+    }
+
+    final playbackUri = _toPlaybackUri(sourcePath);
+    if (playbackUri.scheme != 'file') {
+      _debugLog('[WAV-conv] skipping: not a file: scheme');
+      return null;
+    }
+
+    final localPath = playbackUri.toFilePath();
+
+    // Persistent cache: reuse a previously converted WAV, skipping probe +
+    // conversion. Avoids re-reading/re-converting every launch.
+    final persisted = await AlacConverterService.tryGetCachedWav(localPath);
+    if (persisted != null) {
+      _convertedPlaybackPathCache[sourceKey] = persisted;
+      _debugLog('[WAV-conv] using persisted cache: $persisted');
+      return persisted;
+    }
+
+    _debugLog(
+      '[WAV-conv] convert check: sourceScheme=${playbackUri.scheme} '
+      'sourcePath=$sourcePath',
+    );
+    final canConvert = await AlacConverterService.canConvertToWavFile(
+      localPath,
+    );
+    _debugLog('[WAV-conv] canConvert=$canConvert localPath=$localPath');
+    if (!canConvert) {
+      _unsupportedWavConversionSources.add(sourceKey);
+      return null;
+    }
+
+    try {
+      final convertedPath = await AlacConverterService.convertToWavFile(
+        localPath,
+      );
+      _convertedPlaybackPathCache[sourceKey] = convertedPath;
+      _unsupportedWavConversionSources.remove(sourceKey);
+      _debugLog('[WAV-conv] success: $convertedPath');
+      return convertedPath;
+    } catch (e) {
+      _unsupportedWavConversionSources.add(sourceKey);
+      _debugLog('Failed to convert playback path to WAV: $e');
+      return null;
+    }
+  }
+
+  String _playbackFileType(Song song) {
+    return canonicalPlaybackFileType(
+      fileType: song.fileType,
+      filePath: song.filePath,
+    );
+  }
+
+  Future<String?> _resolveRustPath(Song song) async {
+    final resolvedPath = await _resolvePreparedPlaybackPath(song);
+    if (resolvedPath == null || resolvedPath.isEmpty) return null;
+
+    final uri = _toPlaybackUri(resolvedPath);
+    if (uri.scheme == 'file') {
+      return uri.toFilePath();
+    }
+
+    if (uri.scheme == 'content') {
+      final stagedPath = await _stageContentUriForPlayback(
+        resolvedPath,
+        extensionHint: _preferredExtension(song),
+      );
+      if (stagedPath != null && stagedPath.isNotEmpty) {
+        return stagedPath;
+      }
+      AppLog.instance.add(
+        '[Playback] Rust source unavailable: "${song.title}" content URI '
+        'could not be staged (SAF access missing?)',
+      );
+      return null;
+    }
+
+    if (uri.scheme.isEmpty) {
+      return resolvedPath;
+    }
+
+    return null;
+  }
+
+  Future<void> _prepareImmediatePlaybackAsset(Song song) async {
+    if (song.sourcePackage == 'konnekted.progressive' ||
+        song.sourcePackage == 'konnekted.morneye-live')
+      return;
+    if (!_usingRustBackend && _streamSourceForSong(song) != null) {
+      // The just_audio stream source stages/decodes lazily; pre-converting
+      // here would write the WAV that source exists to avoid.
+      return;
+    }
+    if (!_shouldStageContentUriForPlayback(song) &&
+        !_shouldConvertToWav(song)) {
+      return;
+    }
+
+    await _resolvePreparedPlaybackPath(song);
+  }
+
+  RustAudioEngine _createRustEngine(AudioEngineType playbackMode) {
+    IosLocalAudioRequests.check();
+    return RustAudioEngine(
+      playbackMode: playbackMode,
+      rustAudioService: _rustAudioService,
+      ensureInitialized: () => _ensureRustEngineInitialized(playbackMode),
+      resolvePlaybackPath: _resolveRustPath,
+      resolveHttpSource: _resolveRustHttpSource,
+      // Direct USB owns a separate exclusive focus/transport lifecycle.
+      activateAudioSession: playbackMode.isDirectUsbExperimental
+          ? null
+          : () => _activateAudioSessionForRustEngine(requireGranted: true),
+      disposeEngine: _disposeUsbEngine,
+    );
+  }
+
+  /// HTTP-first source resolver for network songs. Returns null for local
+  /// songs or protocols without byte-range support (then the engine falls back
+  /// to cache-then-play via [_resolveRustPath]).
+  Future<({String url, Map<String, String> headers})?> _resolveRustHttpSource(
+    Song song,
+  ) async {
+    if (!song.isNetworkSource) return null;
+    try {
+      return await RemoteSourceService.instance.resolveHttpPlayback(song);
+    } catch (e) {
+      _debugLog('HTTP source resolve failed: $e');
+      return null;
+    }
+  }
+
+  Future<void> _ensureRustEngineInitialized(
+    AudioEngineType playbackMode,
+  ) => IosLocalAudioRequests.run(() async {
+    final inFlight = _rustEnginePreparationInFlight;
+    if (inFlight != null) {
+      _debugLog(
+        '[Engine] Waiting for in-flight Rust engine preparation to complete',
+      );
+      await IosLocalAudioRequests.wait(inFlight);
+      return;
+    }
+
+    final future = _doEnsureRustEngineInitialized(playbackMode);
+    _rustEnginePreparationInFlight = future;
+    try {
+      await IosLocalAudioRequests.wait(future);
+    } finally {
+      if (identical(_rustEnginePreparationInFlight, future)) {
+        _rustEnginePreparationInFlight = null;
+      }
+    }
+  });
+
+  Future<void> _doEnsureRustEngineInitialized(
+    AudioEngineType playbackMode,
+  ) async {
+    final requiresUsbDac =
+        playbackMode == AudioEngineType.usbDacExperimental &&
+        Platform.isAndroid;
+    if (requiresUsbDac) {
+      final deviceInfo = await AndroidAudioDeviceService.instance.refresh();
+      if (!deviceInfo.hasUsbDac) {
+        _debugLog('[Engine] USB init blocked: no USB DAC detected');
+        throw StateError('Rust USB engine requires a USB DAC');
+      }
+    }
+
+    if (!_rustAudioService.isInitialized) {
+      _debugLog(
+        '[Engine] Initializing Rust engine for ${playbackMode.logLabel}',
+      );
+    }
+
+    final rustAvailable = await _ensureRustBackendAvailable();
+    if (!rustAvailable) {
+      throw StateError(
+        'Rust audio engine is unavailable for ${playbackMode.logLabel}',
+      );
+    }
+
+    if (Platform.isAndroid) {
+      await _rustAudioService.setHighResMode(
+        playbackMode == AudioEngineType.dapInternalHighRes,
+      );
+      await _uac2Service.initialize();
+      await _refreshRustCapabilityInfo();
+
+      Uac2AudioFormat? directUsbFormat;
+      var preferredSampleRate = await _resolvePreferredRustSampleRate(
+        playbackMode,
+      );
+      if (playbackMode == AudioEngineType.usbDacExperimental) {
+        _debugLog(
+          '[Engine] Ensuring USB DAC is registered before engine preparation',
+        );
+        final dacRegistered = await _ensureUsbDacRegistered();
+        if (!dacRegistered) {
+          _debugLog(
+            '[Engine] Failed to register USB DAC before engine preparation',
+          );
+          throw StateError('USB DAC registration failed');
+        }
+
+        directUsbFormat =
+            _uac2Service.currentDeviceStatus?.currentFormat ??
+            _uac2Service.lastKnownFormat;
+        // Do NOT overwrite preferredSampleRate from the DAC's stored format.
+        // The stored format may be stale (hardcoded 48000 from initial DAC
+        // registration) or report 0 Hz (broken readback). The Rust engine
+        // already has the track's actual sample rate via
+        // requested_playback_format; passing null here lets it use that.
+      }
+
+      try {
+        await _rustAudioService.prepareEngine(
+          preferredSampleRate: preferredSampleRate,
+        );
+      } catch (error) {
+        final recovered =
+            playbackMode == AudioEngineType.usbDacExperimental &&
+            directUsbFormat != null &&
+            await _retryAndroidDirectUsbPreparationWithFallbackRate(
+              initialError: error,
+              currentFormat: directUsbFormat,
+            );
+        if (!recovered) {
+          rethrow;
+        }
+      }
+
+      await _applyRustPlaybackProcessingPolicy(playbackMode);
+    }
+
+    if (Platform.isIOS) {
+      await _activateAudioSessionForRustEngine();
+      await _rustAudioService.prepareEngine();
+      await _applyRustPlaybackProcessingPolicy(playbackMode);
+    }
+    _setupRustAudioListeners();
+  }
+
+  Future<int?> _resolvePreferredRustSampleRate(
+    AudioEngineType playbackMode,
+  ) async {
+    if (!Platform.isAndroid || playbackMode != AudioEngineType.rustOboe) {
+      return null;
+    }
+
+    final debugState = await _uac2Service.getAndroidPlaybackDebugState();
+    final rustAudioState = _mapValue(debugState?['rustAudioState']);
+    final deviceProfile = _mapValue(rustAudioState?['device_profile']);
+    if (!_isDetectedDapProfile(deviceProfile)) {
+      return null;
+    }
+
+    final deviceInfo = await AndroidAudioDeviceService.instance.refresh();
+    final internalRoute = switch (deviceInfo.routeType) {
+      null || 'unknown' || 'internal' || 'wired' => true,
+      _ => false,
+    };
+    if (!internalRoute || deviceInfo.hasUsbDac || deviceInfo.isBluetoothRoute) {
+      return null;
+    }
+
+    final formatPreference = await _preferencesService.getFormatPreference();
+    int? preferredSampleRate;
+    if (formatPreference == Uac2FormatPreference.highestQuality) {
+      // Bit-perfect DAP is OFF in rustOboe mode; Rust forces 48k via
+      // dap_force_dsp. Pin the same rate here so the intent is explicit
+      // and the Dart/Rust layers agree.
+      preferredSampleRate = 48000;
+    } else {
+      preferredSampleRate = await _preferredSampleRateForFormatStrategy(
+        formatPreference,
+      );
+    }
+    if (preferredSampleRate == null || preferredSampleRate <= 0) {
+      return null;
+    }
+
+    _debugLog(
+      '[Engine] DAP managed playback pinned to $preferredSampleRate Hz '
+      '(${formatPreference.name}) while Bit-perfect (DAP Internal) is disabled',
+    );
+    return preferredSampleRate;
+  }
+
+  Future<int?> _preferredSampleRateForFormatStrategy(
+    Uac2FormatPreference formatPreference,
+  ) async {
+    switch (formatPreference) {
+      case Uac2FormatPreference.highestQuality:
+        final capabilityInfo = await _uac2Service
+            .getAndroidAudioCapabilityInfo();
+        final maxSampleRate = capabilityInfo.maxSampleRate;
+        return maxSampleRate != null && maxSampleRate > 0
+            ? maxSampleRate
+            : 48000;
+      case Uac2FormatPreference.compatibility:
+        return 48000;
+      case Uac2FormatPreference.custom:
+        final customFormat = await _preferencesService.loadPreferredFormat();
+        return customFormat?.sampleRate ?? 48000;
+    }
+  }
+
+  /// Ensures USB DAC is registered with Rust before engine preparation.
+  /// This fixes the race condition where prepareEngine checks DAC state
+  /// before the DAC has been registered via JNI.
+  Future<bool> _ensureUsbDacRegistered() async {
+    try {
+      // Check if already registered
+      final diagnostics = await _uac2Service.getAndroidPlaybackDebugState();
+      final directUsbState = _mapValue(
+        _mapValue(diagnostics?['rustAudioState'])?['direct_usb'],
+      );
+      final alreadyRegistered = directUsbState?['registered'] == true;
+      final hasPlaybackFormat =
+          directUsbState?['playback_format_sample_rate'] != null;
+
+      if (alreadyRegistered && hasPlaybackFormat) {
+        _debugLog('[Engine] USB DAC already registered with playback format');
+        return true;
+      }
+
+      _debugLog(
+        '[Engine] Preparing USB DAC for playback (registered=$alreadyRegistered, hasFormat=$hasPlaybackFormat)',
+      );
+
+      // Use prepareAndroidExperimentalUsbPlayback which handles device selection,
+      // registration, and format setting all in one
+      // Try 48000 Hz first as it's more commonly supported than 44100 Hz
+      final format =
+          _uac2Service.currentDeviceStatus?.currentFormat ??
+          Uac2AudioFormat(sampleRate: 48000, bitDepth: 16, channels: 2);
+
+      final prepared = await _uac2Service.prepareAndroidExperimentalUsbPlayback(
+        format: format,
+      );
+
+      if (!prepared) {
+        _debugLog('[Engine] Failed to prepare USB DAC for playback');
+        return false;
+      }
+
+      // Verify registration and format are set
+      final verifyDiagnostics = await _uac2Service
+          .getAndroidPlaybackDebugState();
+      final verifyDirectUsbState = _mapValue(
+        _mapValue(verifyDiagnostics?['rustAudioState'])?['direct_usb'],
+      );
+      final nowRegistered = verifyDirectUsbState?['registered'] == true;
+      final nowHasFormat =
+          verifyDirectUsbState?['playback_format_sample_rate'] != null;
+
+      if (nowRegistered && nowHasFormat) {
+        _debugLog(
+          '[Engine] USB DAC successfully prepared: registered=$nowRegistered, hasFormat=$nowHasFormat, rate=${verifyDirectUsbState?['playback_format_sample_rate']}',
+        );
+      } else {
+        _debugLog(
+          '[Engine] USB DAC preparation incomplete: registered=$nowRegistered, hasFormat=$nowHasFormat',
+        );
+      }
+
+      return nowRegistered && nowHasFormat;
+    } catch (e) {
+      _debugLog('[Engine] Error ensuring USB DAC registration: $e');
+      return false;
+    }
+  }
+
+  Future<void> _applyRustPlaybackProcessingPolicy(
+    AudioEngineType playbackMode,
+  ) async {
+    if (!_rustAudioService.isInitialized) {
+      return;
+    }
+
+    _debugLog(
+      '[crossfade] policy: engine=${playbackMode.logLabel}, '
+      'preference=${_rustAudioService.crossfadeEnabledNotifier.value}, '
+      'locked=$isBitPerfectProcessingLocked, bitPerfect=$isBitPerfectModeEnabled, '
+      'duration=${_rustAudioService.crossfadeDurationNotifier.value}s',
+    );
+
+    // The engine can remain in passthrough after bit-perfect is disabled.
+    // Select DSP before sending software volume so the callback applies it.
+    final convertedUsbDsd =
+        playbackMode == AudioEngineType.usbDacExperimental &&
+        currentSongNotifier.value?.isDsd == true &&
+        Uac2PreferencesService.dsdOutputModeSync == DsdOutputMode.forcePcm;
+    if (!isBitPerfectModeEnabled || convertedUsbDsd) {
+      await _rustAudioService.setPipelineModePassthrough(false);
+    }
+
+    if (isBitPerfectModeEnabled) {
+      await _rustAudioService.setCrossfade(
+        enabled: false,
+        durationSecs: _rustAudioService.crossfadeDurationNotifier.value,
+      );
+      if (!convertedUsbDsd &&
+          (playbackMode == AudioEngineType.usbDacExperimental ||
+              playbackMode == AudioEngineType.dapInternalHighRes)) {
+        await _rustAudioService.setPipelineModePassthrough(true);
+      }
+      await _reconcileVolumeForTier(_determineCurrentTier());
+      await _rustAudioService.setPlaybackSpeed(1.0);
+      await _rustAudioService.setPitchShiftSemitones(0.0);
+    } else if (playbackMode == AudioEngineType.usbDacExperimental) {
+      await _reconcileVolumeForTier(_determineCurrentTier());
+      await _rustAudioService.setPlaybackSpeed(1.0);
+      await _rustAudioService.setPitchShiftSemitones(0.0);
+      await _rustAudioService.setCrossfade(
+        enabled: false,
+        durationSecs: _rustAudioService.crossfadeDurationNotifier.value,
+      );
+    } else {
+      await _rustAudioService.setVolume(_currentVolume);
+      await _rustAudioService.setPlaybackSpeed(playbackSpeedNotifier.value);
+      // Crossfade is suppressed whenever DSP processing is locked out — this
+      // includes 432 Hz tuning, where the crossfade mix bypasses speed
+      // resampling and would emit audio at the wrong pitch.
+      final crossfadeOn =
+          !isBitPerfectProcessingLocked &&
+          _rustAudioService.crossfadeEnabledNotifier.value;
+      await _rustAudioService.setCrossfade(
+        enabled: crossfadeOn,
+        durationSecs: _rustAudioService.crossfadeDurationNotifier.value,
+      );
+    }
+
+    if (!isBitPerfectProcessingLocked) {
+      final curveIndex = await _appPreferencesService.getCrossfadeCurveIndex();
+      final curves = <rust_audio.CrossfadeCurveType>[
+        rust_audio.CrossfadeCurveType.equalPower,
+        rust_audio.CrossfadeCurveType.linear,
+        rust_audio.CrossfadeCurveType.squareRoot,
+        rust_audio.CrossfadeCurveType.sCurve,
+      ];
+      final curve = curves[curveIndex.clamp(0, curves.length - 1)];
+      await _rustAudioService.setCrossfadeCurve(curve);
+    }
+
+    await reapplyEqualizer();
+    // Crossfeed is a headphone refinement for the Rust DSP path and has no
+    // just_audio equivalent; it is suppressed whenever DSP is locked out
+    // (bit-perfect passthrough, 432 Hz tuning).
+    final crossfeedLevel = await _appPreferencesService.getCrossfeedLevel();
+    await _rustAudioService.setCrossfeed(
+      isBitPerfectProcessingLocked ? 0 : crossfeedLevel,
+    );
+    // The final policy pass must not restore a stored pitch value after the
+    // earlier bit-perfect branch zeroed it; pitch forces the Rust callback
+    // out of passthrough and invalidates the bit-perfect claim.
+    await _rustAudioService.setPitchShiftSemitones(
+      isBitPerfectProcessingLocked ? 0.0 : pitchSemitonesNotifier.value,
+    );
+    _updatePriorityAnchor();
+  }
+
+  Future<bool> _retryAndroidDirectUsbPreparationWithFallbackRate({
+    required Object initialError,
+    required Uac2AudioFormat currentFormat,
+  }) async {
+    if (!_isDirectUsbClockSetupFailure(initialError.toString())) {
+      return false;
+    }
+    if (await _uac2Service.isBitPerfectEnabled()) {
+      _debugLog(
+        '[Engine] Bit-perfect (USB DAC) requires an exact verified DAC rate; '
+        'skipping fallback-rate direct retry from '
+        '${currentFormat.sampleRate} Hz',
+      );
+      return false;
+    }
+
+    final fallbackFormat = await _uac2Service
+        .suggestAndroidExperimentalUsbOutputFormat(
+          requested: currentFormat,
+          disallowedSampleRates: <int>{currentFormat.sampleRate},
+        );
+    if (fallbackFormat == null ||
+        fallbackFormat.sampleRate == currentFormat.sampleRate) {
+      return false;
+    }
+
+    _debugLog(
+      '[Engine] Direct USB clock setup failed at ${currentFormat.sampleRate} Hz; '
+      'retrying direct USB at ${fallbackFormat.sampleRate} Hz',
+    );
+
+    final reset = await _uac2Service.resetAndroidDirectUsbPath(
+      format: fallbackFormat,
+    );
+    if (!reset) {
+      return false;
+    }
+
+    await _refreshRustCapabilityInfo();
+    await _rustAudioService.prepareEngine(
+      preferredSampleRate: fallbackFormat.sampleRate,
+    );
+    return true;
+  }
+
+  /// A timed-out just_audio prepare leaves an outstanding native codec
+  /// operation. Do not hand the same player back to the next tap: detach it
+  /// immediately, then dispose with a bounded wait so playback remains usable
+  /// even if Media3 itself never completes the old operation.
+  Future<void> _retireStalledAndroidPlayer(
+    just_audio.AudioPlayer player,
+  ) async {
+    if (identical(_justAudioPlayer, player)) {
+      _justAudioPlayer = null;
+      _audioSourceSequence = null;
+    }
+    _debugLog('[Playback] Resetting Android player after stalled source');
+    try {
+      await IosLocalAudioPlayers.dispose(player)
+          .timeout(Duration(seconds: Platform.isIOS ? 12 : 3));
+    } catch (error) {
+      if (Platform.isIOS) {
+        unawaited(IosLocalAudioRequests.failLocalOutput(error));
+        rethrow;
+      }
+      _debugLog('[Playback] Timed-out Android player cleanup: $error');
+    }
+  }
+
+  Future<void> _disposeAndroidEngine() async {
+    _androidEngine = null;
+    final player = _justAudioPlayer;
+    if (player == null) return;
+
+    _debugLog('[Engine] Disposing Android engine');
+
+    // iPhone teardown uses the shared native disposal acknowledgement. Stop
+    // can itself wait on the media services that this teardown is retiring.
+    if (!Platform.isIOS) {
+      try {
+        await player.stop();
+      } catch (_) {}
+    }
+    await IosLocalAudioPlayers.dispose(player);
+    await _deactivateAndroidAudioSession();
+    if (identical(_justAudioPlayer, player)) {
+      _justAudioPlayer = null;
+      _audioSourceSequence = null;
+    }
+  }
+
+  Future<void> _disposeUsbEngine() async {
+    if (!_rustAudioService.isInitialized) return;
+
+    _debugLog('[Engine] Disposing Rust engine');
+    if (_rustListenersAttached) {
+      if (_rustStateListener != null) {
+        _rustAudioService.stateNotifier.removeListener(_rustStateListener!);
+      }
+      if (_rustPositionListener != null) {
+        _rustAudioService.positionNotifier.removeListener(
+          _rustPositionListener!,
+        );
+      }
+      if (_rustDurationListener != null) {
+        _rustAudioService.durationNotifier.removeListener(
+          _rustDurationListener!,
+        );
+      }
+      _rustStateListener = null;
+      _rustPositionListener = null;
+      _rustDurationListener = null;
+      _rustListenersAttached = false;
+    }
+    if (!_iosLocalRetirement) {
+      try {
+        await _rustAudioService.stop();
+      } catch (_) {}
+    }
+    try {
+      await _rustAudioService.shutdown();
+    } catch (_) {
+      if (_iosLocalRetirement) rethrow;
+    }
+
+    _rustBackendAvailable = false;
+    _rustEngine = null;
+
+    if (Platform.isAndroid) {
+      await _rustAudioService.setHighResMode(false);
+    }
+    _usingRustBackend = false;
+  }
+
+  Future<void> _handleEngineSwitch({
+    required AudioEngineType? from,
+    required AudioEngineType to,
+    required bool initializeNewEngine,
+    required String reason,
+  }) => IosLocalAudioRequests.run(() async {
+    if (!initializeNewEngine) {
+      await IosLocalAudioRequests.wait(_playbackManager.detachEngine());
+      _usingRustBackend = false;
+      await IosLocalAudioRequests.wait(
+        _refreshAudioOutputDiagnostics(reason: 'engine detached'),
+      );
+      return;
+    }
+
+    // ALWAYS fully dispose the outgoing engine before initializing the new one.
+    // This prevents USB "Resource busy" from overlapping sessions.
+    if (from != to || from == null) {
+      if (_rustEngine != null) {
+        _debugLog('[Engine] Full dispose of Rust engine before ${to.logLabel}');
+        await IosLocalAudioRequests.wait(_disposeUsbEngine());
+      }
+      if (_justAudioPlayer != null) {
+        _debugLog(
+          '[Engine] Full dispose of Android engine before ${to.logLabel}',
+        );
+        await IosLocalAudioRequests.wait(_disposeAndroidEngine());
+      }
+    }
+
+    if (to == AudioEngineType.usbDacExperimental) {
+      await IosLocalAudioRequests.wait(
+        _releaseAndroidManagedAudioResources(
+          reason: 'switching to USB_DAC_EXPERIMENTAL',
+        ),
+      );
+    }
+
+    final hasDetachedAndroidPrewarm = _justAudioPlayer != null;
+    if (hasDetachedAndroidPrewarm) {
+      _debugLog(
+        '[Engine] Disposing detached Android prewarm before ${to.logLabel}',
+      );
+      await IosLocalAudioRequests.wait(_disposeAndroidEngine());
+    }
+
+    if (to.usesRustBackend) {
+      await IosLocalAudioRequests.wait(
+        _playbackManager.ensureEngine(
+          engineType: to,
+          createEngine: () async {
+            _rustEngine = _createRustEngine(to);
+            return _rustEngine!;
+          },
+        ),
+      );
+      _usingRustBackend = true;
+      if (to != AudioEngineType.usbDacExperimental) {
+        await IosLocalAudioRequests.wait(_activateAudioSessionForRustEngine());
+      }
+      await IosLocalAudioRequests.wait(
+        _reconcileVolumeForTier(_determineCurrentTier()),
+      );
+    } else {
+      await IosLocalAudioRequests.wait(
+        _playbackManager.ensureEngine(
+          engineType: to,
+          createEngine: () async => _createAndroidEngine(),
+        ),
+      );
+      _usingRustBackend = false;
+    }
+
+    _debugLog(
+      '[Engine] Switch complete: ${from?.logLabel ?? 'none'} -> '
+      '${to.logLabel} ($reason)',
+    );
+    await IosLocalAudioRequests.wait(
+      _refreshAudioOutputDiagnostics(reason: 'engine switch complete'),
+    );
+  });
+
+  Song? _songAtCurrentIndex() {
+    if (_currentIndex < 0 || _currentIndex >= _playlist.length) {
+      return null;
+    }
+    return _playlist[_currentIndex];
+  }
+
+  void _syncCurrentIndexToTrack(Song song) {
+    if (_playlist.isEmpty) {
+      return;
+    }
+
+    // Duplicate IDs represent distinct queue occurrences. The selected
+    // position is authoritative until native Media3 reports an actual index
+    // transition; an ID-only lookup would jump to the first occurrence.
+    if (_currentIndex >= 0 &&
+        _currentIndex < _playlist.length &&
+        _playlist[_currentIndex].id == song.id) {
+      return;
+    }
+    final exact = _playlist.indexWhere((entry) => identical(entry, song));
+    final resolvedIndex = exact >= 0
+        ? exact
+        : _playlist.indexWhere((entry) => entry.id == song.id);
+    if (resolvedIndex >= 0 && resolvedIndex != _currentIndex) {
+      _setCurrentIndex(resolvedIndex);
+    }
+  }
+
+  void _rememberRestoredPlaybackContext(Song song, Duration position) {
+    _restoredSongId = song.id;
+    _restoredPosition = position;
+  }
+
+  Duration _consumeRestoredPositionForSong(Song song) {
+    if (_restoredSongId != song.id) {
+      return Duration.zero;
+    }
+
+    final restoredPosition = _restoredPosition;
+    _clearRestoredPlaybackContext(songId: song.id);
+    return restoredPosition;
+  }
+
+  void _clearRestoredPlaybackContext({String? songId}) {
+    if (songId != null && _restoredSongId != songId) {
+      return;
+    }
+
+    _restoredSongId = null;
+    _restoredPosition = Duration.zero;
+  }
+
+  Future<AudioEngineType> _normalizeRequestedEngine(
+    AudioEngineType desiredEngine, {
+    required String reason,
+  }) async {
+    if (Platform.isIOS) {
+      return desiredEngine == AudioEngineType.iosRust ||
+              desiredEngine == AudioEngineType.rustOboe
+          ? AudioEngineType.iosRust
+          : AudioEngineType.iosSystem;
+    }
+    if (desiredEngine != AudioEngineType.usbDacExperimental ||
+        !Platform.isAndroid) {
+      return desiredEngine;
+    }
+
+    final deviceInfo = await AndroidAudioDeviceService.instance.refresh();
+    if (deviceInfo.hasUsbDac) {
+      return desiredEngine;
+    }
+
+    _debugLog(
+      '[Engine] USB engine requested without a USB DAC; '
+      'falling back to Android ($reason)',
+    );
+    return AudioEngineType.normalAndroid;
+  }
+
+  Future<AudioEngineType> _ensureEngineReady(
+    AudioEngineType desiredEngine, {
+    required Song song,
+    required String reason,
+  }) => IosLocalAudioRequests.run(() async {
+    final preparedEngine = await _prepareRequestedEngineForSong(
+      desiredEngine,
+      song: song,
+      reason: reason,
+    );
+    IosLocalAudioRequests.check();
+    await _sessionManager.switchMode(
+      preparedEngine,
+      initializeNewEngine: true,
+      reason: reason,
+    );
+    return preparedEngine;
+  });
+
+  // Keep this key in memory only: filePath may contain signed source URLs.
+  String _usbTrackKey(Song song) =>
+      '${song.id}|${song.filePath}|${song.sampleRate}|${song.bitDepth}|${song.fileType}';
+
+  Future<void> _rearmUsbAfterTrackScopedFallback(Song song) async {
+    final key = _usbTrackKey(song);
+    if (!shouldRearmUsbAfterTrackScopedFallback(
+      fallbackTrackKey: _usbTrackScopedFallbackKey,
+      requestedTrackKey: key,
+    )) {
+      return;
+    }
+    _usbTrackScopedFallbackKey = null;
+    AppLog.instance.add(
+      '[USB] Re-evaluating direct USB for a new recording '
+      'after track-scoped Android routing',
+    );
+    // Respect the connected route and the user's engine preference. Do not
+    // clear suppression caused by an actual USB transport failure.
+    await _sessionManager.syncRouteSelection(
+      reason: 'new recording after track-scoped Android routing',
+    );
+  }
+
+  Future<void> _stopUsbStreamBeforeEngineRouteChange() async {
+    if (_sessionManager.initializedMode == AudioEngineType.usbDacExperimental &&
+        _rustAudioService.isInitialized) {
+      _debugLog('[USB] Stopping native stream before leaving direct route');
+      await _rustAudioService.stop();
+    }
+  }
+
+  Future<AudioEngineType> _prepareRequestedEngineForSong(
+    AudioEngineType desiredEngine, {
+    required Song song,
+    required String reason,
+  }) async {
+    final normalizedEngine = await _normalizeRequestedEngine(
+      desiredEngine,
+      reason: reason,
+    );
+
+    if (Platform.isIOS) {
+      _sessionManager.clearFallbackReason();
+      final systemStreaming =
+          song.sourcePackage == 'konnekted.progressive' ||
+          song.sourcePackage == 'konnekted.morneye-live';
+      if (systemStreaming && normalizedEngine == AudioEngineType.iosRust) {
+        await _sessionManager.recordFallback(
+          requestedMode: normalizedEngine,
+          fallbackMode: AudioEngineType.iosSystem,
+          reason:
+              'This add-on stream uses system playback; Rust DSP is bypassed',
+        );
+      }
+      final needsRust =
+          _requiresRustDecoderForSong(song) ||
+          // AVPlayer volume is capped at unity. Positive ReplayGain needs
+          // native DSP; Android's LoudnessEnhancer is unavailable on iPhone.
+          await _computeReplayGainDbFor(song) > 0;
+      return resolveEngineForSong(
+        preferred: normalizedEngine,
+        requiresRustDecoder: needsRust,
+        requiresSystemStreaming: systemStreaming,
+      );
+    }
+    if (!Platform.isAndroid) {
+      _sessionManager.clearFallbackReason();
+      return normalizedEngine;
+    }
+
+    final engineForSong = _routeEngineForSong(normalizedEngine, song);
+
+    if (Uac2PreferencesService.isAndroidMixerUsbSelectedSync) {
+      // Never present a truncated 32-bit or unknown-precision source as
+      // bit-perfect. Probe local files if metadata is incomplete; otherwise
+      // the Android USB mixer will decline and the Rust fallback will play.
+      int? measuredBits = song.bitDepth;
+      if (measuredBits == null || measuredBits <= 0) {
+        final path = await _resolveRustPath(song);
+        if (path != null && path.isNotEmpty) {
+          try {
+            final probed = await rust_audio.audioProbeFormat(path: path);
+            measuredBits = probed.bitsPerSample;
+          } catch (error) {
+            _debugLog('[USB-MIXER] Unable to verify source precision: $error');
+          }
+        }
+      }
+      await _preferencesService.setAndroidMixerSourceBitDepth(measuredBits);
+    }
+
+    switch (engineForSong) {
+      case AudioEngineType.iosSystem:
+      case AudioEngineType.iosRust:
+        return engineForSong;
+      case AudioEngineType.normalAndroid:
+        if (normalizedEngine == AudioEngineType.usbDacExperimental) {
+          _usbTrackScopedFallbackKey = _usbTrackKey(song);
+          AppLog.instance.add(
+            '[USB] Android-only playback for this '
+            'recording; direct USB will be reconsidered on the next one',
+          );
+        }
+        // Never release the native interface while Rust still has a live
+        // isochronous submission queue; stop its pump first.
+        await _stopUsbStreamBeforeEngineRouteChange();
+        await _uac2Service.releaseAndroidDirectUsbRuntime();
+        await _rustAudioService.setHighResMode(false);
+        // Keep the failure reason visible so disabling crossfade can tell the
+        // user-initiated Standard selection apart from a Rust fallback.
+        if (_sessionManager.fallbackRequestedMode == null) {
+          _sessionManager.clearFallbackReason();
+        }
+        return engineForSong;
+      case AudioEngineType.rustOboe:
+        await _stopUsbStreamBeforeEngineRouteChange();
+        await _uac2Service.releaseAndroidDirectUsbRuntime();
+        await _rustAudioService.setHighResMode(false);
+        _sessionManager.clearFallbackReason();
+        return engineForSong;
+      case AudioEngineType.dapInternalHighRes:
+        await _stopUsbStreamBeforeEngineRouteChange();
+        await _uac2Service.releaseAndroidDirectUsbRuntime();
+        await _rustAudioService.setHighResMode(true);
+        _sessionManager.clearFallbackReason();
+        return engineForSong;
+      case AudioEngineType.usbDacExperimental:
+        var trackFormat = _deriveUac2FormatFromSong(song);
+        if (trackFormat == null) {
+          final resolvedPath = await _resolveRustPath(song);
+          if (resolvedPath != null && resolvedPath.isNotEmpty) {
+            try {
+              final probed = await rust_audio.audioProbeFormat(
+                path: resolvedPath,
+              );
+              final probedBitDepth = probed.bitsPerSample;
+              _debugLog(
+                '[Engine] Metadata missing — probed format: '
+                '${probed.sampleRate}Hz/$probedBitDepth-bit/'
+                '${probed.channels}ch',
+              );
+              if (probedBitDepth != null &&
+                  const {16, 24, 32}.contains(probedBitDepth)) {
+                trackFormat = Uac2AudioFormat(
+                  sampleRate: probed.sampleRate,
+                  bitDepth: probedBitDepth,
+                  channels: probed.channels,
+                );
+              } else {
+                _debugLog(
+                  '[Engine] Direct USB requires measured PCM depth; '
+                  'probe returned ${probed.bitsPerSample}, not assuming 16-bit',
+                );
+              }
+            } catch (e) {
+              _debugLog('[Engine] Format probe failed: $e');
+            }
+          }
+          if (trackFormat == null) {
+            // Unmeasurable source metadata is a limitation of this recording,
+            // not evidence that the USB DAC stopped working. Never invent a
+            // 16-bit default; retry direct USB for the next resolved song.
+            AppLog.instance.add(
+              '[USB] Track-only Android fallback: source '
+              'format could not be verified; retry on next recording',
+            );
+            await _stopUsbStreamBeforeEngineRouteChange();
+            await _uac2Service.releaseAndroidDirectUsbRuntime();
+            await _rustAudioService.setHighResMode(false);
+            _usbTrackScopedFallbackKey = _usbTrackKey(song);
+            await _sessionManager.recordFallback(
+              requestedMode: normalizedEngine,
+              fallbackMode: AudioEngineType.normalAndroid,
+              reason:
+                  'track PCM format is unknown '
+                  '(track-specific; retry on next recording)',
+            );
+            return AudioEngineType.normalAndroid;
+          }
+        }
+
+        // Check the DAC's *actual alternate settings* before stopping the
+        // healthy current USB stream. This is a song-format incompatibility,
+        // not a broken USB transport or a reason to blacklist the DAC.
+        // Never downconvert 24-bit to a 16-bit alternate in bit-perfect mode.
+        if (!trackFormat.isDsdStream && _uac2Service.isBitPerfectEnabledSync) {
+          final supported = await _uac2Service
+              .suggestAndroidExperimentalUsbOutputFormat(
+                requested: trackFormat,
+              );
+          if (!exactDirectUsbFormatSupported(trackFormat, supported)) {
+            AppLog.instance.add(
+              '[USB] Track-only Android fallback: '
+              '${trackFormat.sampleRate}Hz/${trackFormat.bitDepth}-bit/'
+              '${trackFormat.channels}ch is unavailable on this DAC; '
+              'will retry direct USB for the next recording',
+            );
+            if (_sessionManager.initializedMode ==
+                    AudioEngineType.usbDacExperimental &&
+                _rustAudioService.isInitialized) {
+              await _rustAudioService.stop();
+            }
+            await _uac2Service.releaseAndroidDirectUsbRuntime();
+            await _rustAudioService.setHighResMode(false);
+            _usbTrackScopedFallbackKey = _usbTrackKey(song);
+            await _sessionManager.recordFallback(
+              requestedMode: normalizedEngine,
+              fallbackMode: AudioEngineType.normalAndroid,
+              reason:
+                  'track format ${trackFormat.sampleRate}Hz/'
+                  '${trackFormat.bitDepth}-bit is unsupported by this DAC '
+                  '(track-specific; retry on next recording)',
+            );
+            return AudioEngineType.normalAndroid;
+          }
+        }
+
+        // Only retire the Android player after the candidate format has
+        // passed the DAC compatibility check.
+        await _releaseAndroidManagedAudioResources(
+          reason: 'before direct USB initialization',
+        );
+        final alreadyInUsbMode =
+            _sessionManager.initializedMode ==
+                AudioEngineType.usbDacExperimental &&
+            _rustEngine != null;
+        // In bit-perfect mode, a candidate rate/depth from independent
+        // capability lists is not proof the DAC supports that combination.
+        // Never replace the track's verified PCM format with a fallback.
+        final requestedUsbOutputFormat =
+            alreadyInUsbMode && !isBitPerfectModeEnabled
+            ? await _uac2Service.suggestAndroidExperimentalUsbOutputFormat(
+                requested: trackFormat,
+              )
+            : trackFormat;
+        final currentUsbFormat =
+            _uac2Service.lastKnownFormat ??
+            _uac2Service.currentDeviceStatus?.currentFormat;
+        final targetUsbOutputFormat = requestedUsbOutputFormat ?? trackFormat;
+        final formatMatches =
+            alreadyInUsbMode &&
+            _sameUac2Format(currentUsbFormat, targetUsbOutputFormat);
+
+        var lostNativeRegistration = false;
+        if (formatMatches) {
+          // A failed native transfer can leave the cached format unchanged
+          // even after libusb has released its registration.
+          final debug = await _uac2Service.getAndroidPlaybackDebugState();
+          final rust = _mapValue(debug?['rustAudioState']);
+          final usb = _mapValue(rust?['direct_usb']);
+          final explicitlyUnregistered = usb?['registered'] == false;
+          if (explicitlyUnregistered) {
+            lostNativeRegistration = true;
+            _debugLog(
+              '[Engine] Cached USB format matches but native DAC is '
+              'not registered; re-preparing instead of reusing stale state',
+            );
+          } else {
+            _debugLog(
+              '[Engine] USB engine already active with matching format '
+              '(${targetUsbOutputFormat.sampleRate}Hz/'
+              '${targetUsbOutputFormat.bitDepth}-bit/'
+              '${targetUsbOutputFormat.channels}ch), skipping re-preparation',
+            );
+            _sessionManager.clearFallbackReason();
+            return normalizedEngine;
+          }
+        }
+
+        // Change the USB alternate setting only after the previous stream
+        // has stopped. Updating native playback format while an old 16-bit
+        // URB queue is still submitting can fail the next libusb transfer.
+        if (alreadyInUsbMode &&
+            (!formatMatches || lostNativeRegistration) &&
+            _rustAudioService.isInitialized) {
+          _debugLog(
+            '[Engine] Stopping old USB stream before PCM renegotiation',
+          );
+          await _rustAudioService.stop();
+        }
+
+        final prepared = await _uac2Service
+            .prepareAndroidExperimentalUsbPlayback(
+              format: targetUsbOutputFormat,
+            );
+        if (!prepared) {
+          await _uac2Service.markAndroidDirectUsbFallback(
+            'experimental direct USB path could not be prepared',
+          );
+          await _uac2Service.releaseAndroidDirectUsbRuntime();
+          await _rustAudioService.setHighResMode(false);
+          await _sessionManager.recordFallback(
+            requestedMode: normalizedEngine,
+            fallbackMode: AudioEngineType.normalAndroid,
+            reason: 'experimental direct USB path could not be prepared',
+          );
+          return AudioEngineType.normalAndroid;
+        }
+
+        final preparedUsbFormat =
+            _uac2Service.currentDeviceStatus?.currentFormat ??
+            _uac2Service.lastKnownFormat ??
+            trackFormat;
+        final needsDirectUsbPrewarm =
+            alreadyInUsbMode &&
+            (lostNativeRegistration ||
+                !_sameUac2Format(currentUsbFormat, preparedUsbFormat));
+        if (needsDirectUsbPrewarm && _rustAudioService.isInitialized) {
+          _debugLog(
+            '[Engine] Prewarming active USB engine for '
+            '${preparedUsbFormat.sampleRate}Hz/${preparedUsbFormat.bitDepth}-bit/'
+            '${preparedUsbFormat.channels}ch before playback',
+          );
+          _uac2Service.setPrewarming();
+          await _rustAudioService.prepareEngine(
+            preferredSampleRate: preparedUsbFormat.sampleRate,
+          );
+          await _applyRustPlaybackProcessingPolicy(normalizedEngine);
+        }
+
+        await _rustAudioService.setHighResMode(false);
+        _sessionManager.clearFallbackReason();
+        return normalizedEngine;
+    }
+  }
+
+  /// The Android system tier cannot decode DSD or WavPack containers: route
+  /// those tracks to the Rust shared output (PCM on non-bit-perfect routes)
+  /// regardless of what the current audio route prefers.
+  AudioEngineType _routeEngineForSong(
+    AudioEngineType desiredEngine,
+    Song song,
+  ) {
+    // Signed HTTP add-on URLs are resolved by Media3 directly, never staged
+    // through the Rust local-file decoder, which does not own these handles.
+    if (song.sourcePackage == 'konnekted.progressive' ||
+        song.sourcePackage == 'konnekted.morneye-live') {
+      return AudioEngineType.normalAndroid;
+    }
+    final routed = resolveEngineForSong(
+      preferred: desiredEngine,
+      requiresRustDecoder: song.requiresRustDecoder,
+      isAtmosJoc: song.atmosEncoded,
+    );
+    if (song.atmosEncoded) {
+      AtmosDiagnostics.record('engine_routing', {
+        'codec': song.fileType.toUpperCase() == 'AC-4' ? 'ac4' : 'eac3_joc',
+        'desiredEngine': desiredEngine.name,
+        'engine': routed.name,
+        'reason': routed != desiredEngine
+            ? 'dolby_requires_system'
+            : 'native_system',
+      });
+    } else if (routed != desiredEngine) {
+      _debugLog(
+        '[Engine] ${song.title} needs the Rust decoder '
+        '(${song.fileType.toUpperCase()}); routing '
+        '${desiredEngine.logLabel} -> ${routed.logLabel}',
+      );
+    }
+    return routed;
+  }
+
+  /// Track ids already rerouted (or attempted) from the system tier to the
+  /// Rust engine because ExoPlayer cannot decode their container.
+  final Set<String> _rustDecoderRerouteAttempts = <String>{};
+
+  bool _requiresRustDecoderForSong(Song song) =>
+      song.requiresRustDecoder ||
+      (Platform.isIOS &&
+          const {
+            'ogg',
+            'oga',
+            'ogx',
+            'opus',
+          }.contains(_playbackFileType(song)));
+
+  /// Auto-advance and crossfade swaps inside a just_audio playlist never pass
+  /// through [_playInternal]; restart a DSF/DFF/WavPack track the system tier
+  /// cannot decode on the Rust engine.
+  void _maybeRerouteTrackToRustDecoder(
+    Song song, {
+    required Duration position,
+  }) {
+    final needsRust = _requiresRustDecoderForSong(song);
+    if (_usingRustBackend || !needsRust) return;
+    if (song.filePath == null || _castingService.isActive) return;
+    if (!_rustDecoderRerouteAttempts.add(song.id)) return;
+    _debugLog(
+      '[Engine] ${song.title} needs the Rust decoder; rerouting from '
+      '${currentEngineType.logLabel}',
+    );
+    unawaited(
+      _enqueuePlaybackRequest(() => _rerouteTrackToRustDecoder(song, position)),
+    );
+  }
+
+  Future<void> _rerouteTrackToRustDecoder(
+    Song song,
+    Duration position,
+  ) => IosLocalAudioRequests.run(() async {
+    try {
+      await IosLocalAudioRequests.wait(initAudio());
+      final activeEngine = await IosLocalAudioRequests.wait(
+        _ensureEngineReady(
+          AudioEngineType.rustOboe,
+          song: song,
+          reason: 'container requires the Rust decoder',
+        ),
+      );
+      if (!_usingRustBackend) return;
+      final index = _playlist.indexWhere((entry) => entry.id == song.id);
+      if (index != -1) {
+        _setCurrentIndex(index);
+      }
+      await IosLocalAudioRequests.wait(_prepareImmediatePlaybackAsset(song));
+      await IosLocalAudioRequests.wait(
+        _applyRustPlaybackProcessingPolicy(activeEngine),
+      );
+      await IosLocalAudioRequests.wait(
+        _refreshReplayGainForSong(song, pushSpawnDefault: true),
+      );
+      await IosLocalAudioRequests.wait(
+        _runWithSuppressedSequenceStateUpdates(() async {
+          await IosLocalAudioRequests.wait(
+            _playbackManager.playTrack(song, initialPosition: position),
+          );
+        }),
+      );
+      _ensurePositionSaveTimer();
+      _updatePriorityAnchor();
+      if (_shouldQueueNextTrack && _playlist.length > 1) {
+        unawaited(_queueNextTrackForGapless());
+      }
+      await IosLocalAudioRequests.wait(
+        _refreshAudioOutputDiagnostics(
+          reason: 'track rerouted to Rust decoder',
+          activeSong: song,
+        ),
+      );
+    } catch (e) {
+      _debugLog('[Engine] Rust decoder reroute failed for ${song.title}: $e');
+    }
+  });
+
+  /// Play a specific song.
+  Future<void> play(
+    Song song, {
+    List<Song>? playlist,
+    int? playlistIndex,
+    PlaybackContext? context,
+  }) {
+    final selection = ++_selectionGeneration;
+    _debugLog('[UI] tap(${song.id})');
+    _cancelPendingPlayback();
+    final pauseRevision = _iosPauseRevision;
+    // Capture the occurrence before re-resolution can reconstruct Song objects.
+    final requestedIndex = playlist != null
+        ? selectedPlaylistIndex(playlist, song, indexHint: playlistIndex)
+        : playlistIndex == null
+        ? null
+        : selectedPlaylistIndex(_playlist, song, indexHint: playlistIndex);
+    final selectionIntent = Platform.isIOS && !_castingService.isActive
+        ? _IosPlaySelection(
+            song,
+            playlist == null ? null : List<Song>.unmodifiable(playlist),
+            selection,
+            requestedIndex: requestedIndex,
+          )
+        : null;
+    if (selectionIntent != null) {
+      _iosPlaySelection = selectionIntent;
+      final phase = IosLocalAudioRequests.lifecycle.phase.value;
+      if (phase == LocalAudioPhase.recovering ||
+          phase == LocalAudioPhase.lost ||
+          phase == LocalAudioPhase.blocked) {
+        _selectPlaybackSong(
+          song,
+          playlist: selectionIntent.playlist,
+          indexHint: selectionIntent.requestedIndex,
+        );
+        selectionIntent.prepared = true;
+        _pendingPresentationTrackId = song.id;
+        _publishRestoredPlaybackState(song, position: Duration.zero);
+      }
+    }
+    if (context != null) setPlaybackContext(context);
+    // Immediate UI feedback: surface the loading state synchronously so the
+    // mini-player shows a spinner before the (possibly queued) playback
+    // request even starts running. Cleared by _playInternal's finally.
+    _markOnlinePreparation(song);
+    return _enqueuePlaybackRequest(() async {
+      // A sleeping network source can take time to fail. Only the latest
+      // tap should run when it clears, rather than loading every stale tap.
+      if (selection != _selectionGeneration ||
+          (Platform.isIOS && pauseRevision != _iosPauseRevision))
+        return;
+      await _playInternal(
+        song,
+        playlist: selectionIntent?.playlist ?? playlist,
+        playlistIndex: requestedIndex,
+        selectionIntent: selectionIntent,
+      );
+    }, remoteOutput: _castingService.isActive);
+  }
+
+  Future<void> _enqueuePlaybackRequest(
+    Future<void> Function() action, {
+    bool remoteOutput = false,
+  }) {
+    _debugLog('[PlayerService] _enqueuePlaybackRequest called');
+    final previous = _playRequestQueue;
+    Future<void> execute() async {
+      await previous;
+      if (!remoteOutput) IosLocalAudioRequests.check();
+      _debugLog(
+        '[PlayerService] _enqueuePlaybackRequest: previous operation complete, executing action',
+      );
+      try {
+        await action();
+      } catch (e, stack) {
+        _debugLog(
+          '[PlayerService] _enqueuePlaybackRequest action error: $e\n$stack',
+        );
+        rethrow;
+      }
+    }
+
+    final scheduled = remoteOutput
+        ? IosLocalAudioRequests.runRemote(execute)
+        : IosLocalAudioRequests.run(execute);
+    final selectedRevision = _selectionGeneration;
+    final operation = scheduled.catchError((Object e) {
+      if (Platform.isIOS &&
+          IosLocalAudioRequests.isRetired(e) &&
+          selectedRevision == _selectionGeneration) {
+        isNetworkLoadingNotifier.value = false;
+        onlinePreparationTitleNotifier.value = null;
+      }
+      _debugLog('[PlayerService] _enqueuePlaybackRequest queue error: $e');
+    });
+    _playRequestQueue = operation;
+    return operation;
+  }
+
+  Future<T> _runForCurrentOutput<T>(Future<T> Function() action) =>
+      _castingService.isActive
+      ? IosLocalAudioRequests.runRemote(action)
+      : IosLocalAudioRequests.run(action);
+
+  /// Serialize a confirmed output handoff with track changes and local engine
+  /// operations. Unlike ordinary UI requests, transport errors reach the caller.
+  Future<T> runOutputTransition<T>(
+    Future<T> Function(PlaybackOutputTransition local) action,
+  ) {
+    final result = Completer<T>();
+    unawaited(
+      _enqueuePlaybackRequest(() async {
+        try {
+          await _externalPlaybackOwner.releaseCurrent();
+        } catch (error, stack) {
+          result.completeError(error, stack);
+          return;
+        }
+        final generation = _pendingPlaybackGeneration;
+        final selectedSongId = currentSongNotifier.value?.id;
+        final local = PlaybackOutputTransition(
+          song: currentSongNotifier.value,
+          position: positionNotifier.value,
+          wasPlaying: isPlayingNotifier.value,
+          isCurrent: () =>
+              generation == _pendingPlaybackGeneration &&
+              currentSongNotifier.value?.id == selectedSongId,
+          pauseLocal: () => IosLocalAudioRequests.run(() async {
+            // Deliberately address the attached local engine directly: publishing
+            // remote ownership first would make pause() pause the receiver instead.
+            if (_playbackManager.hasAttachedEngine)
+              await _playbackManager.pause();
+            isPlayingNotifier.value = false;
+            _wasPlayingBeforeAudioInterruption = false;
+            _updatePriorityAnchor();
+          }),
+          resumeLocal: () => IosLocalAudioRequests.run(_resumeInternal),
+        );
+        try {
+          result.complete(await action(local));
+        } catch (error, stack) {
+          result.completeError(error, stack);
+        }
+      }, remoteOutput: true),
+    );
+    return result.future;
+  }
+
+  /// Claim video only after the previous output and local/Cast audio have
+  /// yielded. A newer user selection cancels the pending video acquisition.
+  Future<ExternalPlaybackLease> acquireExternalPlayback(
+    Future<void> Function() release, {
+    Future<void> Function()? onMediaReset,
+  }) {
+    final generation = _pendingPlaybackGeneration;
+    return runOutputTransition((local) async {
+      if (generation != _pendingPlaybackGeneration) {
+        throw StateError('Playback changed before video could take ownership.');
+      }
+      if (_castingService.isActive) {
+        await _castingService.delegatePause();
+      } else {
+        await local.pauseLocal();
+      }
+      if (generation != _pendingPlaybackGeneration) {
+        throw StateError('Playback changed before video could take ownership.');
+      }
+      return IosLocalAudioRequests.run(
+        () async =>
+            _externalPlaybackOwner.claim(release, onMediaReset: onMediaReset),
+      );
+    });
+  }
+
+  Future<void> resumeAfterExternalPlayback(
+    ExternalPlaybackLease lease,
+    Song? expectedSong, {
+    required int intentRevision,
+  }) {
+    return _enqueuePlaybackRequest(() async {
+      if (!lease.isReleased ||
+          !lease.isLatest ||
+          intentRevision != _pendingPlaybackGeneration ||
+          !identical(currentSongNotifier.value, expectedSong))
+        return;
+      await _resumeInternal(intentRevision: intentRevision);
+    });
+  }
+
+  /// Keep a selected queue occurrence through source re-resolution.
+  @visibleForTesting
+  static int selectedPlaylistIndex(
+    List<Song> songs,
+    Song selected, {
+    int? indexHint,
+  }) {
+    if (indexHint != null &&
+        indexHint >= 0 &&
+        indexHint < songs.length &&
+        songs[indexHint].id == selected.id) {
+      return indexHint;
+    }
+    final exact = songs.indexWhere((entry) => identical(entry, selected));
+    return exact >= 0
+        ? exact
+        : songs.indexWhere((entry) => entry.id == selected.id);
+  }
+
+  void _selectPlaybackSong(Song song, {List<Song>? playlist, int? indexHint}) {
+    if (playlist != null) {
+      _replacePlaybackContext(playlist);
+      _setCurrentIndex(
+        selectedPlaylistIndex(_playlist, song, indexHint: indexHint),
+      );
+      if (isShuffleNotifier.value) {
+        final shuffled = buildShufflePlaybackOrder(
+          songs: _playlist,
+          current: song,
+        );
+        _playlist
+          ..clear()
+          ..addAll(shuffled);
+        _playlistQueueEntryIds
+          ..clear()
+          ..addAll(List<int?>.filled(shuffled.length, null));
+        _setCurrentIndex(0);
+      }
+      _insertQueuedEntriesAfterCurrent();
+    } else {
+      final existingIndex = selectedPlaylistIndex(
+        _playlist,
+        song,
+        indexHint: indexHint,
+      );
+      if (existingIndex == -1) {
+        _replacePlaybackContext([song]);
+        _setCurrentIndex(0);
+      } else {
+        _setCurrentIndex(existingIndex);
+      }
+    }
+
+    if (_currentIndex == -1) {
+      _setCurrentIndex(0);
+    }
+    // The online cache assigns the same logical song ID to its Atmos and
+    // standard releases. The latest selected file is authoritative; leaving
+    // the prior queue entry intact makes Media3 seek/play a stale source
+    // after a same-song version change or a source-provider switch.
+    if (_currentIndex >= 0 &&
+        _currentIndex < _playlist.length &&
+        _playlist[_currentIndex].id == song.id &&
+        shouldReplaceQueuedAudioSource(_playlist[_currentIndex], song)) {
+      _debugLog(
+        '[Playback] Replacing queued audio version for selected song '
+        '(Atmos=${song.atmosEncoded})',
+      );
+      _playlist[_currentIndex] = song;
+    }
+
+    _armAutoSyncGuard(song);
+    _consumeQueueEntryAt(_currentIndex);
+    _clearRestoredPlaybackContext(songId: song.id);
+  }
+
+  Future<void> _playInternal(
+    Song song, {
+    List<Song>? playlist,
+    int? playlistIndex,
+    _IosPlaySelection? selectionIntent,
+  }) => _runForCurrentOutput(() async {
+    final intent = _pendingPlaybackGeneration;
+    final originalPlaylist = playlist;
+    final requestedIndex =
+        selectionIntent?.requestedIndex ??
+        playlistIndex ??
+        (originalPlaylist != null
+            ? selectedPlaylistIndex(originalPlaylist, song)
+            : _currentIndex >= 0 &&
+                  _currentIndex < _playlist.length &&
+                  identical(_playlist[_currentIndex], song)
+            ? _currentIndex
+            : null);
+    if (!_castingService.isActive) {
+      await IosLocalAudioRequests.wait(_externalPlaybackOwner.releaseCurrent());
+    }
+    if (intent != _pendingPlaybackGeneration) return;
+    if (Platform.isIOS) _iosPositionSavingPaused = false;
+    // Qobuz/Morneye and HTTP add-on handles are ephemeral. The Likes-page
+    // conversion alone cannot protect an ordinary queue left open longer
+    // than the media registration lifetime. Re-arm stale queue entries
+    // before a local player builds any future audio sources.
+    final recovered = replayableStreamSelection(song, playlist ?? _playlist);
+    if (!identical(song, recovered.selected) && recovered.selected.isPending) {
+      AppLog.instance.add(
+        '[Playback] Refreshing expired online stream for ' + song.title,
+      );
+    }
+    song = recovered.selected;
+    if (playlist != null) {
+      playlist = recovered.queue;
+    }
+    if (playlist == null || selectionIntent?.prepared == true) {
+      // A selection presented during recovery already has its canonical queue
+      // (including shuffle and manually inserted entries). Repair descriptors
+      // in place instead of selecting again and shuffling it a second time.
+      final currentQueue = playlist == null
+          ? recovered.queue
+          : replayableStreamSelection(song, _playlist).queue;
+      var changed = false;
+      for (var i = 0; i < _playlist.length; i++) {
+        if (identical(_playlist[i], currentQueue[i])) continue;
+        _playlist[i] = currentQueue[i];
+        changed = true;
+      }
+      // Shuffle restoration must not resurrect expired handles or an older
+      // recording of the explicitly selected song, even if the visible queue
+      // already contains the current version. Preserve the original ordering.
+      final replacements = {for (final entry in currentQueue) entry.id: entry};
+      for (var i = 0; i < _originalPlaylist.length; i++) {
+        final original = _originalPlaylist[i];
+        final replacement = replacements[original.id];
+        if (replacement != null &&
+            (original.id == song.id || needsStreamReResolution(original))) {
+          _originalPlaylist[i] = replacement;
+        }
+      }
+      if (changed) _notifyUpNextChanged();
+    }
+    if (selectionIntent != null) {
+      selectionIntent.song = song;
+      selectionIntent.playlist = playlist == null
+          ? null
+          : List<Song>.unmodifiable(playlist!);
+    }
+    if (!_castingService.isActive) {
+      await IosLocalAudioRequests.wait(initAudio());
+    }
+    final loadingGen = ++_networkLoadingGen;
+    _markOnlinePreparation(song);
+    onlinePlaybackError.value = null;
+    _cancelPendingPlayback();
+    try {
+      _debugLog(
+        '[Playback] play() called for ${song.title} '
+        '(selected mode: ${_sessionManager.selectedMode.logLabel})',
+      );
+
+      _positionSaveTimer?.cancel();
+      clearAbRepeat();
+      _crossfadeUiHandoffFromPath = null;
+
+      if (selectionIntent?.prepared != true) {
+        _selectPlaybackSong(
+          song,
+          playlist: playlist,
+          indexHint: requestedIndex,
+        );
+        if (selectionIntent != null) selectionIntent.prepared = true;
+      }
+
+      if (song.isPending) {
+        await IosLocalAudioRequests.wait(_playPendingSong(song));
+        return;
+      }
+
+      if (_castingService.isActive) {
+        final handled = await IosLocalAudioRequests.wait(
+          _castingService.delegatePlay(song),
+        );
+        if (handled) return;
+      }
+
+      if (song.filePath != null) {
+        _pendingPresentationTrackId = song.id;
+        _pendingFailures = 0;
+        await IosLocalAudioRequests.wait(_prepareImmediatePlaybackAsset(song));
+        // Route changes are already pushed into the session manager via the
+        // device listener initialized in initAudio(). Re-querying the platform
+        // here adds latency to the first tap on stable speaker routes.
+        await IosLocalAudioRequests.wait(
+          _rearmUsbAfterTrackScopedFallback(song),
+        );
+        // A codec fallback changes the selected engine. Re-evaluate iPhone
+        // processing preferences so the next ordinary track can return to
+        // AVPlayer instead of inheriting the previous track's Rust fallback.
+        final desiredEngine = Platform.isIOS
+            ? await IosLocalAudioRequests.wait(
+                _sessionManager.resolvePreferredMode(),
+              )
+            : _sessionManager.selectedMode;
+        final activeEngine = await IosLocalAudioRequests.wait(
+          _ensureEngineReady(
+            desiredEngine,
+            song: song,
+            reason: 'playback requested',
+          ),
+        );
+        _debugLog(
+          '[Engine] Playback route resolved to ${activeEngine.logLabel}',
+        );
+        if (song.atmosEncoded)
+          AtmosDiagnostics.record('playback_route', {
+            'engine': activeEngine.name,
+            'encoded': true,
+            'reason': _usingRustBackend
+                ? 'unexpected_rust_engine'
+                : 'android_mediacodec',
+          });
+        if (_usingRustBackend) {
+          await IosLocalAudioRequests.wait(
+            _applyRustPlaybackProcessingPolicy(activeEngine),
+          );
+          // ReplayGain must reach the engine before the play command so the
+          // spawned source is stamped with this track's gain.
+          await IosLocalAudioRequests.wait(
+            _refreshReplayGainForSong(song, pushSpawnDefault: true),
+          );
+        }
+        await IosLocalAudioRequests.wait(
+          _runWithSuppressedSequenceStateUpdates(() async {
+            await IosLocalAudioRequests.wait(_playbackManager.playTrack(song));
+          }),
+        );
+        if (song.atmosEncoded)
+          AtmosDiagnostics.record('player_loaded', {
+            'outcome': 'source_submitted',
+            'engine': activeEngine.name,
+          });
+        if (!_usingRustBackend && !song.atmosEncoded) {
+          unawaited(
+            IosLocalAudioRequests.ignoreRetired(
+              _applyReplayGainForSystemTier(song),
+            ),
+          );
+        }
+        _ensurePositionSaveTimer();
+        _updatePriorityAnchor();
+        if (_shouldQueueNextTrack && _playlist.length > 1) {
+          unawaited(_queueNextTrackForGapless());
+        }
+        await IosLocalAudioRequests.wait(
+          _refreshAudioOutputDiagnostics(
+            reason: 'playback started',
+            activeSong: song,
+          ),
+        );
+      }
+    } catch (e, stackTrace) {
+      if (IosLocalAudioRequests.isRetired(e)) rethrow;
+      final recovered = await IosLocalAudioRequests.wait(
+        _handleDirectUsbStartupRefusal(
+          e,
+          song: song,
+          initialPosition: Duration.zero,
+        ),
+      );
+      if (recovered) {
+        return;
+      }
+      final rustRecovered = await IosLocalAudioRequests.wait(
+        _handleDeadRustEngineFailure(
+          e,
+          song: song,
+          initialPosition: Duration.zero,
+        ),
+      );
+      if (rustRecovered) {
+        return;
+      }
+      if (_pendingPresentationTrackId == song.id) {
+        _pendingPresentationTrackId = null;
+      }
+      AppLog.instance.add(
+        '[Playback] Failed to start ${song.title} on ${currentEngineType.logLabel}: $e',
+      );
+      _playbackManager.invalidateLoadedTrack();
+      isPlayingNotifier.value = false;
+      onlinePlaybackError.value = e is TimeoutException
+          ? e.message ?? 'Playback timed out. Retry this song.'
+          : 'Could not open “${song.title}”. Retry, or check that the file or source is available.';
+      _debugLog(
+        '[Playback] play() failed for ${song.title} '
+        'on ${currentEngineType.logLabel}: $e',
+      );
+      debugPrintStack(stackTrace: stackTrace);
+      if (_castingService.isActive) {
+        final confirmed = _castingService.currentSong;
+        if (confirmed != null) {
+          _selectPlaybackSong(confirmed);
+          durationNotifier.value = confirmed.duration;
+          _castingService.replayConfirmedStatus();
+        }
+      }
+      rethrow;
+    } finally {
+      // Only the most-recent play request is allowed to clear the loading
+      // flag. Superseded requests (user tapped another song while this one
+      // was still queued/loading) leave it untouched so the spinner stays up
+      // until the latest tap resolves.
+      if (loadingGen == _networkLoadingGen && _pendingPlaybackId == null) {
+        isNetworkLoadingNotifier.value = false;
+        onlinePreparationTitleNotifier.value = null;
+      }
+    }
+  });
+
+  /// Rare CDN mismatch recovery: discard the existing ranged reader because
+  /// Media3 has already cached its incorrect Content-Length, then restart the
+  /// validated complete file while retaining the logical Discovery queue.
+  /// Serialized with normal user selections and ignored if the user has moved
+  /// to another song.
+  Future<void> recoverCompletedMorneyeStream(
+    String liveHandle,
+    Song completed,
+  ) => _enqueuePlaybackRequest(() async {
+    final current = currentSongNotifier.value;
+    final index = _currentIndex;
+    if (current?.filePath != liveHandle ||
+        index < 0 ||
+        index >= _playlist.length ||
+        _playlist[index].filePath != liveHandle)
+      return;
+    if (!_usingRustBackend) {
+      try {
+        await _playbackManager.detachEngine().timeout(
+          const Duration(seconds: 4),
+        );
+      } catch (error) {
+        _debugLog('[Morneye] Failed to reset invalid range decoder: $error');
+        return;
+      }
+      _androidEngine = null;
+      _justAudioPlayer = null;
+      _audioSourceSequence = null;
+    }
+    if (currentSongNotifier.value?.filePath != liveHandle) return;
+    _playlist[index] = completed;
+    _notifyUpNextChanged();
+    _debugLog('[Morneye] Resuming verified full-file fallback');
+    await _playSongAtCurrentIndex();
+  });
+
+  Future<void> _playSongAtCurrentIndex() async {
+    final song = _songAtCurrentIndex();
+    if (song == null) return;
+    if (song.sourceType == 'lokal' && linkedDesktopAvailable != null) {
+      var reachable = false;
+      try {
+        reachable = await linkedDesktopAvailable!(song)
+            .timeout(const Duration(seconds: 3), onTimeout: () => false);
+      } catch (_) {
+        reachable = false;
+      }
+      if (!reachable) {
+        _debugLog(
+          '[Playback] Desktop unavailable; skipping queue entry ${song.title}',
+        );
+        if (!identical(_offlineDesktopSkipQueue, _playlist)) {
+          _offlineDesktopSkipQueue = _playlist;
+          _offlineDesktopSkippedSlots.clear();
+        }
+        _offlineDesktopSkippedSlots.add(_currentIndex);
+        if (_offlineDesktopSkippedSlots.length >= _playlist.length) {
+          _offlineDesktopSkippedSlots.clear();
+          isNetworkLoadingNotifier.value = false;
+          onlinePlaybackError.value = 'Desktop files are unavailable. Reconnect to your PC or copy them for offline playback.';
+          return;
+        }
+        // In random shuffle, excluded slots are never reselected during this
+        // failure cycle. Otherwise a repeated failed random pick could
+        // exhaust the budget before a phone-local song is ever attempted.
+        await _nextInternal();
+        return;
+      }
+    }
+    _offlineDesktopSkippedSlots.clear();
+    _markOnlinePreparation(song); // Before initAudio / engine handoff.
+    await _playInternal(song);
+  }
+
+  Future<void> _queueNextTrackForGapless() async {
+    if (!_shouldQueueNextTrack || _playlist.isEmpty) {
+      _debugLog(
+        '[crossfade] queue skipped: rust=$_usingRustBackend, '
+        'gapless=$_isGaplessActive, active=$_isCrossfadeActive, '
+        'preference=${_rustAudioService.crossfadeEnabledNotifier.value}, '
+        'locked=$isBitPerfectProcessingLocked, loop=${loopModeNotifier.value}, '
+        'playlistLength=${_playlist.length}',
+      );
+      return;
+    }
+
+    final isLastTrack = _currentIndex >= _playlist.length - 1;
+    if (isLastTrack && loopModeNotifier.value != LoopMode.all) {
+      _debugLog('[crossfade] queue skipped: end of non-repeating playlist');
+      return;
+    }
+
+    final nextIndex = isLastTrack ? 0 : _currentIndex + 1;
+    final nextSong = _playlist[nextIndex];
+    if (nextSong.sourceType == 'lokal' && linkedDesktopAvailable != null) {
+      bool available;
+      try {
+        available = await linkedDesktopAvailable!(nextSong)
+            .timeout(const Duration(seconds: 3), onTimeout: () => false);
+      } catch (_) {
+        available = false;
+      }
+      if (!available) {
+        _debugLog('[crossfade] Desktop successor unavailable; do not preload');
+        return;
+      }
+    }
+    _debugLog(
+      '[crossfade] queue successor: index=$nextIndex, title=${nextSong.title}, '
+      'active=$_isCrossfadeActive, '
+      'duration=${_rustAudioService.crossfadeDurationNotifier.value}s',
+    );
+
+    // HTTP-first: try a direct ranged stream, fall back to cache-then-play.
+    if (nextSong.isNetworkSource) {
+      try {
+        final http = await RemoteSourceService.instance.resolveHttpPlayback(
+          nextSong,
+        );
+        if (http != null) {
+          await _rustAudioService.setReplayGainDefault(
+            await _computeReplayGainDbFor(nextSong),
+          );
+          await _rustAudioService.queueNextHttp(
+            url: http.url,
+            headers: http.headers,
+          );
+          _debugLog(
+            '[crossfade] HTTP queue request returned; readiness reported separately',
+          );
+          return;
+        }
+      } catch (e) {
+        _debugLog('HTTP queue-next failed, falling back to cache: $e');
+      }
+    }
+
+    final nextPath = await _resolveRustPath(nextSong);
+    if (nextPath != null) {
+      await _rustAudioService.setReplayGainDefault(
+        await _computeReplayGainDbFor(nextSong),
+      );
+      await _rustAudioService.queueNext(nextPath);
+      _debugLog(
+        '[crossfade] local queue request returned; readiness reported separately',
+      );
+    } else {
+      _debugLog(
+        '[crossfade] queue skipped: no playable path for ${nextSong.title}',
+      );
+    }
+  }
+
+  /// Resolves the next song for the just_audio crossfade engine. Mirrors the
+  /// linear-next rule used by the Rust gapless path (shuffle is honoured
+  /// because [_playlist] is pre-shuffled at play time). Returns null when there
+  /// is no successor so the engine lets the track end naturally.
+  Song? _resolveAndroidCrossfadeNext() {
+    if (_playlist.isEmpty) return null;
+    if (loopModeNotifier.value == LoopMode.one ||
+        loopModeNotifier.value == LoopMode.stopAfterCurrent)
+      return null;
+    final isLastTrack = _currentIndex >= _playlist.length - 1;
+    if (isLastTrack && loopModeNotifier.value != LoopMode.all) return null;
+    final next = _playlist[isLastTrack ? 0 : _currentIndex + 1];
+    // PC streams are checked asynchronously by _playSongAtCurrentIndex.
+    // Do not let the native engine commit an unchecked desktop successor.
+    // Phone-copied files have sourceType=null and remain gapless.
+    if (next.sourceType == 'lokal') return null;
+    return next.isPending ? null : next;
+  }
+
+  /// Called by the just_audio engine after a crossfade swap completes. The
+  /// engine's emitted PlaybackState already drives currentSongNotifier, index
+  /// sync, notification, replay tracking and position save via
+  /// [_bindPlaybackState]; this only covers the two gaps that path leaves out.
+  void _onAndroidTrackAdvanced(Song song) {
+    final index = _playlist.indexWhere((entry) => entry.id == song.id);
+    if (index >= 0) {
+      _setCurrentIndex(index);
+    }
+    _consumeQueueEntryAt(_currentIndex);
+    _updatePriorityAnchor();
+  }
+
+  /// Called when the system tier errors while a track is loaded. DSD and
+  /// WavPack containers are not decodable by ExoPlayer, so retry them on the
+  /// Rust decoder instead of leaving playback stalled on the failed track.
+  void _onAndroidTrackError(Song song) {
+    _playbackManager.invalidateLoadedTrack();
+    isNetworkLoadingNotifier.value = false;
+    isPlayingNotifier.value = false;
+    AppLog.instance.add(
+      '[Playback] Android source failed: title=${song.title} type=${song.fileType} network=${song.isNetworkSource}',
+    );
+    // The system tier ran into a queued placeholder: look it up and play it.
+    final index = _justAudioPlayer?.currentIndex;
+    if (index != null &&
+        index >= 0 &&
+        index < _playlist.length &&
+        _playlist[index].isPending) {
+      final pending = _playlist[index];
+      unawaited(
+        _enqueuePlaybackRequest(() async {
+          if (index >= _playlist.length || _playlist[index].id != pending.id) {
+            return;
+          }
+          _setCurrentIndex(index);
+          await _playSongAtCurrentIndex();
+        }),
+      );
+      return;
+    }
+    if (!_requiresRustDecoderForSong(song)) {
+      onlinePlaybackError.value =
+          'Could not open “${song.title}”. Retry, or check that the file or source is available.';
+      return;
+    }
+    _debugLog(
+      '[Playback] System tier failed to decode ${song.title}; '
+      'retrying on the Rust decoder',
+    );
+    _maybeRerouteTrackToRustDecoder(song, position: positionNotifier.value);
+  }
+
+  Future<void> _savePosition({
+    Song? song,
+    Duration? position,
+    bool? wasPlaying,
+  }) async {
+    final resolvedSong = song ?? currentSongNotifier.value;
+    if (!_shouldPersistSong(resolvedSong)) return;
+    final persistedSong = resolvedSong!;
+
+    try {
+      await _lastPlayedService.saveLastPlayed(
+        persistedSong.id,
+        position ?? positionNotifier.value,
+        playlistSongIds: _playlistNonQueueIds(),
+        currentIndex: _currentIndex,
+        wasPlaying: wasPlaying ?? isPlayingNotifier.value,
+      );
+    } catch (e) {
+      _debugLog('Failed to save last played position: $e');
+    }
+  }
+
+  Future<void> persistLastPlayed() async {
+    await _savePosition();
+  }
+
+  void _persistPausedRustPosition() {
+    if (!_iosPositionSavingPaused ||
+        !_usingRustBackend ||
+        isPlayingNotifier.value ||
+        _iosLocalRetirement ||
+        _castingService.isActive ||
+        _pendingPresentationTrackId != null) {
+      return;
+    }
+    final phase = IosLocalAudioRequests.lifecycle.phase.value;
+    if (phase != LocalAudioPhase.ready && phase != LocalAudioPhase.paused) {
+      return;
+    }
+    final song = currentSongNotifier.value;
+    if (song == null ||
+        _playbackManager.latestState?.currentTrack?.id != song.id) {
+      return;
+    }
+    // RustAudioEngine publishes requested seeks optimistically. Persist only
+    // the actual native cursor notifier, including backward paused seeks.
+    unawaited(
+      _savePosition(
+        song: song,
+        position: _rustAudioService.positionNotifier.value,
+        wasPlaying: false,
+      ),
+    );
+  }
+
+  Future<void> _confirmPausedPositionSaving({required bool persist}) async {
+    if (!Platform.isIOS) return;
+    _iosPositionSavingPaused = true;
+    _positionSaveTimer?.cancel();
+    _positionSaveTimer = null;
+    if (!persist) return;
+    await _savePosition(
+      position: _usingRustBackend && _playbackManager.hasAttachedEngine
+          ? _rustAudioService.positionNotifier.value
+          : positionNotifier.value,
+      wasPlaying: false,
+    );
+  }
+
+  Future<void> restorePlaybackModes() async {
+    final shuffleIdx = await _appPreferencesService.getShuffleMode();
+    if (shuffleIdx >= 0 && shuffleIdx < ShuffleMode.values.length) {
+      shuffleModeNotifier.value = ShuffleMode.values[shuffleIdx];
+    }
+    final loopIdx = await _appPreferencesService.getLoopMode();
+    if (loopIdx >= 0 && loopIdx < LoopMode.values.length) {
+      loopModeNotifier.value = LoopMode.values[loopIdx];
+      await _updateLoopMode();
+    }
+    final advanceIdx = await _appPreferencesService.getAdvanceListOrder();
+    if (advanceIdx >= 0 && advanceIdx < AdvanceListOrder.values.length) {
+      _advanceListOrder = AdvanceListOrder.values[advanceIdx];
+    }
+    wrapAroundQueueNotifier.value = await _appPreferencesService
+        .getWrapAroundQueue();
+    autoplayOnQueueEndNotifier.value = await _appPreferencesService
+        .getAutoplayOnQueueEnd();
+    _scheduleAutoplayPreview();
+  }
+
+  Future<void> restoreLastPlayed() async {
+    if (currentSongNotifier.value != null || isPlayingNotifier.value) {
+      return;
+    }
+
+    final lastPlayed = await _lastPlayedService.getLastPlayed();
+    if (lastPlayed != null) {
+      if (currentSongNotifier.value != null || isPlayingNotifier.value) {
+        return;
+      }
+
+      final restoredPlaylist = lastPlayed.playlist;
+
+      if (restoredPlaylist != null && restoredPlaylist.isNotEmpty) {
+        _replacePlaybackContext(restoredPlaylist);
+        final fallbackIndex = restoredPlaylist.indexWhere(
+          (song) => song.id == lastPlayed.song.id,
+        );
+        _setCurrentIndex(
+          lastPlayed.playlistIndex ?? (fallbackIndex >= 0 ? fallbackIndex : 0),
+        );
+      } else {
+        _replacePlaybackContext([lastPlayed.song]);
+        _setCurrentIndex(0);
+      }
+
+      if (_currentIndex < 0 || _currentIndex >= _playlist.length) {
+        _setCurrentIndex(0);
+      }
+
+      final restoredSong = _playlist[_currentIndex];
+      _rememberRestoredPlaybackContext(restoredSong, lastPlayed.position);
+      _publishRestoredPlaybackState(
+        restoredSong,
+        position: lastPlayed.position,
+      );
+
+      if (restoredSong.filePath != null) {
+        _debugLog(
+          '[Playback] Restored ${restoredSong.title} at '
+          '${lastPlayed.position.inMilliseconds}ms; waiting for explicit playback',
+        );
+      }
+    }
+  }
+
+  Future<void> pause() {
+    if (Platform.isIOS) _iosPauseRevision++;
+    _cancelPendingPlayback();
+    _debugLog('[PlayerService] pause() called');
+    // Manual pause cancels any pending auto-resume from a transient focus
+    // loss; otherwise the next notification's end event restarts playback.
+    // The interruption handler calls _pauseInternal directly, not here.
+    _wasPlayingBeforeAudioInterruption = false;
+    return _enqueuePlaybackRequest(
+      _pauseInternal,
+      remoteOutput: _castingService.isActive,
+    );
+  }
+
+  Future<void> _pauseInternal() async {
+    // Keep the most recent position once at pause instead of rewriting the
+    // unchanged resume position to storage every five seconds indefinitely.
+    _positionSaveTimer?.cancel();
+    _positionSaveTimer = null;
+    if (_castingService.isActive) {
+      await _castingService.delegatePause();
+      return;
+    }
+    return IosLocalAudioRequests.run(() async {
+      await IosLocalAudioRequests.wait(_externalPlaybackOwner.releaseCurrent());
+      return _pauseLocalOutput();
+    });
+  }
+
+  Future<void> _pauseLocalOutput() async {
+    final intent = _pendingPlaybackGeneration;
+    final songId = currentSongNotifier.value?.id;
+    _debugLog(
+      '[Playback] pause() called, hasAttachedEngine=${_playbackManager.hasAttachedEngine}',
+    );
+    if (isPlayingNotifier.value) {
+      isPlayingNotifier.value = false;
+    }
+    _updatePriorityAnchor();
+    // If no engine has been attached yet (e.g. pausing a restored-but-not-started
+    // track), there is nothing to pause — the optimistic update above is enough.
+    if (!_playbackManager.hasAttachedEngine) {
+      _debugLog(
+        '[Playback] pause(): no engine attached, returning after optimistic update',
+      );
+      await _confirmPausedPositionSaving(persist: true);
+      return;
+    }
+    var pauseConfirmed = false;
+    try {
+      await IosLocalAudioRequests.wait(_playbackManager.pause());
+      pauseConfirmed = true;
+    } catch (e) {
+      if (IosLocalAudioRequests.isRetired(e)) rethrow;
+      _debugLog('Pause failed: $e');
+      // The engine may still be playing after a rejected pause. Keep
+      // position persistence and network prefetch alive until the next
+      // successful transport transition.
+      _ensurePositionSaveTimer();
+      if (Platform.isIOS) {
+        onlinePlaybackError.value = 'Audio did not confirm Pause. Try again.';
+      }
+    }
+    if (pauseConfirmed) {
+      await _confirmPausedPositionSaving(
+        persist:
+            intent == _pendingPlaybackGeneration &&
+            currentSongNotifier.value?.id == songId,
+      );
+    }
+    await _savePosition();
+    await _refreshAudioOutputDiagnostics(
+      reason: 'playback paused',
+      activeSong: currentSongNotifier.value,
+    );
+    if (Platform.isIOS && pauseConfirmed) isPlayingNotifier.value = false;
+  }
+
+  Future<void> resume() {
+    final intent = _pendingPlaybackGeneration;
+    return _enqueuePlaybackRequest(
+      () => _resumeInternal(intentRevision: intent),
+      remoteOutput: _castingService.isActive,
+    );
+  }
+
+  Future<void> _resumeInternal({int? intentRevision}) async {
+    final intent = intentRevision ?? _pendingPlaybackGeneration;
+    if (intent != _pendingPlaybackGeneration) return;
+    if (_castingService.isActive) {
+      await _castingService.delegateResume();
+      return;
+    }
+    await _externalPlaybackOwner.releaseCurrent();
+    if (intent != _pendingPlaybackGeneration) return;
+    return IosLocalAudioRequests.run(_resumeLocalOutput);
+  }
+
+  Future<void> _resumeLocalOutput() async {
+    if (Platform.isIOS) _iosPositionSavingPaused = false;
+    await IosLocalAudioRequests.wait(initAudio());
+
+    // A car/lock-screen Play can arrive before main finishes restoring the
+    // paused queue. Hydrate the saved track and playhead on demand as well.
+    if (currentSongNotifier.value == null && _songAtCurrentIndex() == null) {
+      await IosLocalAudioRequests.wait(restorePlaybackModes());
+      await IosLocalAudioRequests.wait(restoreLastPlayed());
+    }
+    final song = currentSongNotifier.value ?? _songAtCurrentIndex();
+    if (song == null) return;
+    if (song.isPending) {
+      await IosLocalAudioRequests.wait(_playPendingSong(song));
+      return;
+    }
+    if (song.filePath == null) return;
+
+    _debugLog('[Playback] resume() called');
+    onlinePlaybackError.value = null;
+    // Use the cached route selection maintained by the session manager's device
+    // listener rather than doing another blocking device probe on resume.
+    final desiredEngine = Platform.isIOS
+        ? await IosLocalAudioRequests.wait(
+            _sessionManager.resolvePreferredMode(),
+          )
+        : _sessionManager.selectedMode;
+    final activeEngine = await IosLocalAudioRequests.wait(
+      _ensureEngineReady(desiredEngine, song: song, reason: 'resume requested'),
+    );
+    _debugLog('[Engine] Resume route resolved to ${activeEngine.logLabel}');
+    if (Platform.isIOS && _usingRustBackend) {
+      await IosLocalAudioRequests.wait(
+        _refreshReplayGainForSong(song, pushSpawnDefault: true),
+      );
+    }
+
+    final latestState = _playbackManager.latestState;
+    final canResumeDirectly =
+        _playbackManager.canResumeCurrentTrack &&
+        latestState != null &&
+        latestState.engine == activeEngine &&
+        latestState.currentTrack?.id == song.id;
+    if (canResumeDirectly) {
+      await IosLocalAudioRequests.wait(_playbackManager.play());
+    } else {
+      final retainedPosition = _consumeRestoredPositionForSong(song);
+      final resumePosition = positionNotifier.value > Duration.zero
+          ? positionNotifier.value
+          : retainedPosition;
+      await IosLocalAudioRequests.wait(_prepareImmediatePlaybackAsset(song));
+      await _runWithSuppressedSequenceStateUpdates(() async {
+        await IosLocalAudioRequests.wait(
+          _playbackManager.playTrack(song, initialPosition: resumePosition),
+        );
+      });
+    }
+
+    _ensurePositionSaveTimer();
+    // A resume only loads the current track. Without a successor queued the
+    // first transition hard-cuts and can never crossfade, so mirror the
+    // queueing that _playInternal does when starting a track.
+    if (_shouldQueueNextTrack &&
+        _playlist.length > 1 &&
+        !_rustAudioService.hasQueuedNext) {
+      unawaited(_queueNextTrackForGapless());
+    }
+    _updatePriorityAnchor();
+    await _refreshAudioOutputDiagnostics(
+      reason: 'playback resumed',
+      activeSong: song,
+    );
+  }
+
+  bool _isDirectUsbStartupRefusal(String message) {
+    // Native event-loop faults lack the "Android USB direct" prefix.
+    if (isRecoverableDirectUsbTransportError(message)) return true;
+    final normalized = message.toLowerCase();
+    return message.contains('Requested ') ||
+        message.contains('No isochronous OUT endpoint can carry') ||
+        message.contains('requires explicit feedback endpoint') ||
+        message.contains('cannot be verified') ||
+        message.contains('requires PCM transport') ||
+        message.contains('requires at least') ||
+        message.contains('transport, got') ||
+        normalized.contains('android direct usb') ||
+        normalized.contains('direct usb backend') ||
+        normalized.contains('no android direct usb') ||
+        normalized.contains('isochronous transfer') ||
+        normalized.contains('failed to set usb clock') ||
+        normalized.contains('failed to set usb alt setting') ||
+        normalized.contains('requires verified dac rate') ||
+        normalized.contains('is not supported by clock') ||
+        normalized.contains('android usb direct') ||
+        normalized.contains('usb dac disconnected') ||
+        normalized.contains('usb session already active') ||
+        normalized.contains('failed to claim usb interface') ||
+        normalized.contains('android managed output stream') ||
+        normalized.contains('sending on a disconnected channel') ||
+        normalized.contains('refusing direct usb') ||
+        normalized.contains('failed to set uac1 sampling frequency');
+  }
+
+  bool _isDirectUsbClockSetupFailure(String message) {
+    final normalized = message.toLowerCase();
+    return normalized.contains('failed to set usb clock') ||
+        normalized.contains('requires verified dac rate') ||
+        normalized.contains('cannot be verified') ||
+        normalized.contains('is not supported by clock') ||
+        normalized.contains('dac reports');
+  }
+
+  bool _isExclusiveUsbUnavailableFailure(String message) {
+    final normalized = message.toLowerCase();
+    return normalized.contains('input/output error') ||
+        normalized.contains('device or resource busy') ||
+        normalized.contains('resource busy') ||
+        normalized.contains('access denied') ||
+        normalized.contains('permission denied') ||
+        normalized.contains('usb session already active') ||
+        normalized.contains('libusb_no_device') ||
+        normalized.contains('usb direct host handle lost') ||
+        normalized.contains('no such device');
+  }
+
+  /// USB access denied needs a user permission grant, not a session
+  /// suppression: keep the direct path retryable instead of hiding it.
+  bool _isDirectUsbPermissionFailure(String message) {
+    final normalized = message.toLowerCase();
+    return normalized.contains('access denied') ||
+        normalized.contains('permission denied');
+  }
+
+  /// A failed transfer can leave a native endpoint, format, and Rust engine
+  /// out of sync. Merely replaying the same track reuses that broken session.
+  /// Recover at most twice: stop the source, release/drain the old USB session,
+  /// re-register the *current track's* PCM format and reopen the engine.
+  Future<bool> _recoverDirectUsbTransport({
+    required Song song,
+    required Duration initialPosition,
+    required bool autoPlay,
+  }) async {
+    Uac2AudioFormat? format = _deriveUac2FormatFromSong(song);
+    if (format == null && !song.isDsd) {
+      final path = await _resolveRustPath(song);
+      if (path != null) {
+        try {
+          final probe = await rust_audio.audioProbeFormat(path: path);
+          if (probe.bitsPerSample case final bits?
+              when const {16, 24, 32}.contains(bits)) {
+            format = Uac2AudioFormat(
+              sampleRate: probe.sampleRate,
+              bitDepth: bits,
+              channels: probe.channels,
+            );
+          }
+        } catch (e) {
+          _debugLog('[USB] Recovery PCM format probe failed: $e');
+        }
+      }
+    }
+    if (format == null) {
+      AppLog.instance.add(
+        '[USB] Cannot recover direct USB: PCM/DSD '
+        'format of selected track is not verified',
+      );
+      return false;
+    }
+
+    final selection = _selectionGeneration;
+    for (final delay in const [
+      Duration(milliseconds: 350),
+      Duration(milliseconds: 1000),
+    ]) {
+      await Future<void>.delayed(delay);
+      if (selection != _selectionGeneration ||
+          currentSongNotifier.value?.id != song.id ||
+          currentEngineType != AudioEngineType.usbDacExperimental) {
+        return false; // User already selected a different track or route.
+      }
+      try {
+        await _rustAudioService.stop();
+        final reset = await _uac2Service.resetAndroidDirectUsbPath(
+          format: format,
+        );
+        if (!reset) {
+          AppLog.instance.add(
+            '[USB] Recovery deferred: native interface '
+            'still stopping or activation declined',
+          );
+          continue;
+        }
+        await _refreshRustCapabilityInfo();
+        await _rustAudioService.prepareEngine(
+          preferredSampleRate: format.sampleRate,
+        );
+        await _applyRustPlaybackProcessingPolicy(
+          AudioEngineType.usbDacExperimental,
+        );
+        await _prepareImmediatePlaybackAsset(song);
+        await _runWithSuppressedSequenceStateUpdates(() async {
+          await _playbackManager.playTrack(
+            song,
+            initialPosition: initialPosition,
+            autoPlay: autoPlay,
+          );
+        });
+        _sessionManager.clearFallbackReason();
+        AppLog.instance.add(
+          '[USB] Recovered direct USB after transport '
+          'failure: ${format.sampleRate}Hz/${format.bitDepth}-bit/'
+          '${format.channels}ch',
+        );
+        return true;
+      } catch (e) {
+        AppLog.instance.add('[USB] Session reset retry failed: $e');
+      }
+    }
+    return false;
+  }
+
+  static const List<Duration> _directUsbRetryDelays = [
+    Duration(milliseconds: 150),
+    Duration(milliseconds: 400),
+    Duration(milliseconds: 900),
+  ];
+
+  /// Cheap dongles lose the first isochronous start while the kernel driver
+  /// detaches or the bus resets. Retry before condemning the session.
+  Future<bool> _retryDirectUsbStart({
+    required Song song,
+    required Duration initialPosition,
+    required bool autoPlay,
+  }) async {
+    for (final delay in _directUsbRetryDelays) {
+      await Future<void>.delayed(delay);
+      try {
+        await _prepareImmediatePlaybackAsset(song);
+        await _runWithSuppressedSequenceStateUpdates(() async {
+          await _playbackManager.playTrack(
+            song,
+            initialPosition: initialPosition,
+            autoPlay: autoPlay,
+          );
+        });
+        return true;
+      } catch (e) {
+        _debugLog('[Engine] Direct USB startup retry failed: $e');
+      }
+    }
+    return false;
+  }
+
+  Future<bool> _handleDirectUsbStartupRefusal(
+    Object error, {
+    required Song? song,
+    required Duration initialPosition,
+    bool autoResumeAfterFallback = true,
+  }) async {
+    if (!Platform.isAndroid ||
+        currentEngineType != AudioEngineType.usbDacExperimental) {
+      return false;
+    }
+
+    final message = error.toString();
+    if (!_isDirectUsbStartupRefusal(message)) {
+      return false;
+    }
+
+    _debugLog(
+      '[Engine] Direct USB startup refused: $message. Falling back to NORMAL_ANDROID',
+    );
+    final permissionFailure = _isDirectUsbPermissionFailure(message);
+    final transportFailure = isRecoverableDirectUsbTransportError(message);
+    final transientBusFailure =
+        (_isExclusiveUsbUnavailableFailure(message) || transportFailure) &&
+        !permissionFailure;
+
+    // A failed isochronous submit cannot be fixed by just replaying the
+    // same source: re-register and reopen the native endpoint first.
+    if (transportFailure && song != null) {
+      final recovered = await _recoverDirectUsbTransport(
+        song: song,
+        initialPosition: initialPosition,
+        autoPlay: autoResumeAfterFallback,
+      );
+      if (recovered) {
+        _ensurePositionSaveTimer();
+        await _refreshAudioOutputDiagnostics(
+          reason: 'direct USB transport reset recovered',
+          activeSong: song,
+        );
+        return true;
+      }
+    }
+
+    if (transientBusFailure && !transportFailure && song != null) {
+      final recovered = await _retryDirectUsbStart(
+        song: song,
+        initialPosition: initialPosition,
+        autoPlay: autoResumeAfterFallback,
+      );
+      if (recovered) {
+        _debugLog('[Engine] Direct USB startup recovered after retry');
+        _ensurePositionSaveTimer();
+        await _refreshAudioOutputDiagnostics(
+          reason: 'direct USB retry succeeded',
+          activeSong: song,
+        );
+        return true;
+      }
+    }
+
+    await _uac2Service.markAndroidDirectUsbFallback(message);
+    await _uac2Service.releaseAndroidDirectUsbRuntime();
+    await _rustAudioService.setHighResMode(false);
+    // A single USB I/O/URB failure must not blacklist a still attached DAC
+    // for every following track. Keep manual retry available on that route.
+    if (transientBusFailure && !transportFailure) {
+      await _sessionManager.suppressExperimentalUsbForCurrentDevice(
+        reason: message,
+      );
+    } else if (permissionFailure) {
+      _debugLog(
+        '[Engine] USB permission denied; keeping the direct USB engine '
+        'available for a manual retry',
+      );
+    }
+    await _sessionManager.recordFallback(
+      requestedMode: AudioEngineType.usbDacExperimental,
+      fallbackMode: AudioEngineType.normalAndroid,
+      reason: message,
+    );
+    await _sessionManager.switchMode(
+      AudioEngineType.normalAndroid,
+      initializeNewEngine: true,
+      reason: 'direct USB startup refused',
+    );
+
+    if (song != null) {
+      await _prepareImmediatePlaybackAsset(song);
+      await _runWithSuppressedSequenceStateUpdates(() async {
+        await _playbackManager.playTrack(
+          song,
+          initialPosition: initialPosition,
+          autoPlay: autoResumeAfterFallback,
+        );
+      });
+      _ensurePositionSaveTimer();
+      await _refreshAudioOutputDiagnostics(
+        reason: autoResumeAfterFallback
+            ? 'direct USB fallback resumed'
+            : 'direct USB fallback paused (pause-on-disconnect)',
+        activeSong: song,
+      );
+    }
+
+    return true;
+  }
+
+  /// Recovery for a Rust engine whose command thread died mid-session
+  /// (FRB "disconnected channel" errors or a thread-crash event). The
+  /// service layer already retried once against a respawned engine; if we
+  /// land here the failure is persistent, so try one more explicit respawn
+  /// and, failing that, fall back to the plain Android engine.
+  Future<bool> _handleDeadRustEngineFailure(
+    Object error, {
+    required Song? song,
+    required Duration initialPosition,
+  }) async {
+    if (!Platform.isAndroid || !_usingRustBackend) {
+      return false;
+    }
+
+    final message = error.toString();
+    if (!isDeadRustEngineError(message)) {
+      return false;
+    }
+    if (_deadRustEngineRecoveryActive) {
+      return false;
+    }
+
+    _deadRustEngineRecoveryActive = true;
+    try {
+      final now = DateTime.now();
+      _deadRustEngineRecoveryTimestamps.removeWhere(
+        (timestamp) =>
+            now.difference(timestamp) >= deadRustEngineRecoveryWindow,
+      );
+      _deadRustEngineRecoveryTimestamps.add(now);
+      final forceFallback = shouldForceRustEngineFallback(
+        recoveryTimestamps: _deadRustEngineRecoveryTimestamps,
+        now: now,
+      );
+
+      _debugLog(
+        forceFallback
+            ? '[Engine] Rust engine failed '
+                  '${_deadRustEngineRecoveryTimestamps.length} times within '
+                  '${deadRustEngineRecoveryWindow.inSeconds}s ($message); '
+                  'skipping respawn and falling back to NORMAL_ANDROID'
+            : '[Engine] Rust engine unreachable ($message); attempting respawn',
+      );
+      var revived = false;
+      if (!forceFallback) {
+        try {
+          await _rustAudioService.prepareEngine();
+          revived = true;
+        } catch (e) {
+          _debugLog('[Engine] Rust engine respawn failed: $e');
+        }
+      }
+
+      if (!revived) {
+        await _rustAudioService.setHighResMode(false);
+        await _sessionManager.recordFallback(
+          requestedMode: currentEngineType,
+          fallbackMode: AudioEngineType.normalAndroid,
+          reason: forceFallback
+              ? 'rust audio engine failed repeatedly: $message'
+              : 'rust audio engine unrecoverable: $message',
+        );
+        await _sessionManager.switchMode(
+          AudioEngineType.normalAndroid,
+          initializeNewEngine: true,
+          reason: 'rust audio engine command channel dead',
+        );
+      }
+
+      if (song != null) {
+        await _prepareImmediatePlaybackAsset(song);
+        await _runWithSuppressedSequenceStateUpdates(() async {
+          await _playbackManager.playTrack(
+            song,
+            initialPosition: initialPosition,
+          );
+        });
+        _ensurePositionSaveTimer();
+        await _refreshAudioOutputDiagnostics(
+          reason: revived
+              ? 'rust engine respawned'
+              : 'rust engine fallback to NORMAL_ANDROID',
+          activeSong: song,
+        );
+      }
+      return true;
+    } finally {
+      _deadRustEngineRecoveryActive = false;
+    }
+  }
+
+  Future<void> togglePlayPause() {
+    _debugLog(
+      '[PlayerService] togglePlayPause called, isPlaying=${isPlayingNotifier.value}',
+    );
+    return _enqueuePlaybackRequest(() async {
+      _debugLog(
+        '[PlayerService] togglePlayPause executing, isPlaying=${isPlayingNotifier.value}',
+      );
+      try {
+        if (isPlayingNotifier.value) {
+          _wasPlayingBeforeAudioInterruption = false;
+          await _pauseInternal();
+        } else {
+          await _resumeInternal();
+        }
+      } catch (e, stack) {
+        if (IosLocalAudioRequests.isRetired(e)) rethrow;
+        final recovered = await _handleDirectUsbStartupRefusal(
+          e,
+          song: currentSongNotifier.value,
+          initialPosition: positionNotifier.value,
+        );
+        if (recovered) {
+          return;
+        }
+        _playbackManager.invalidateLoadedTrack();
+        isPlayingNotifier.value = false;
+        onlinePlaybackError.value = 'Playback could not resume. Retry the song or choose another source.';
+        AppLog.instance.add('[Playback] Resume failed: $e');
+        _debugLog('[PlayerService] togglePlayPause error: $e\n$stack');
+      }
+    }, remoteOutput: _castingService.isActive);
+  }
+
+  Future<void> seek(Duration position) async {
+    if (_castingService.isActive) {
+      await _castingService.delegateSeek(position);
+      return;
+    }
+    try {
+      await IosLocalAudioRequests.run(() async {
+        // A recovered/stopped selection can have no loaded native source.
+        // An explicit seek, including to zero, replaces the retained bookmark.
+        final stoppedSelection =
+            !_playbackManager.canResumeCurrentTrack &&
+            _restoredSongId != null &&
+            _restoredSongId == currentSongNotifier.value?.id;
+        if ((Platform.isIOS && !_playbackManager.hasAttachedEngine) ||
+            stoppedSelection) {
+          final song = currentSongNotifier.value ?? _songAtCurrentIndex();
+          if (song != null) {
+            final limit = durationNotifier.value;
+            final target = position < Duration.zero
+                ? Duration.zero
+                : limit > Duration.zero && position > limit
+                ? limit
+                : position;
+            _rememberRestoredPlaybackContext(song, target);
+            _publishRestoredPlaybackState(song, position: target);
+            await _savePosition(position: target, wasPlaying: false);
+          }
+          return;
+        }
+        await IosLocalAudioRequests.wait(_playbackManager.seek(position));
+        unawaited(_updateNotificationState());
+      });
+    } catch (e) {
+      if (IosLocalAudioRequests.isRetired(e)) return;
+      _playbackManager.invalidateLoadedTrack();
+      onlinePlaybackError.value = 'Could not seek. Retry the song.';
+      AppLog.instance.add('[Playback] Seek failed: $e');
+      _debugLog('Seek failed: $e');
+    }
+  }
+
+  Future<void> next() {
+    _cancelPendingPlayback();
+    // Direct user taps need immediate feedback even if playback requests are
+    // serialized behind an earlier network operation.
+    if (peekNext case final song? when song.isPending) {
+      _markOnlinePreparation(song);
+    }
+    _debugLog('[PlayerService] next() called');
+    return _enqueuePlaybackRequest(
+      _nextInternal,
+      remoteOutput: _castingService.isActive,
+    );
+  }
+
+  Future<void> _nextInternal() async {
+    _debugLog(
+      '[PlayerService] _nextInternal() called, playlist.length=${_playlist.length}, currentIndex=$_currentIndex',
+    );
+    if (_playlist.isEmpty) {
+      _debugLog(
+        '[PlayerService] _nextInternal: playlist is empty, returning early',
+      );
+      return;
+    }
+
+    _debugLog(
+      'next(): currentIndex=$_currentIndex, playlistLength=${_playlist.length}, loopMode=${loopModeNotifier.value}',
+    );
+
+    if (shuffleModeNotifier.value == ShuffleMode.random &&
+        _playlist.length > 1) {
+      final candidates = <int>[
+        for (var index = 0; index < _playlist.length; index++)
+          if (index != _currentIndex &&
+              !_offlineDesktopSkippedSlots.contains(index))
+            index,
+      ];
+      if (candidates.isEmpty) {
+        _offlineDesktopSkippedSlots.clear();
+        onlinePlaybackError.value = 'Desktop files are unavailable. Reconnect to your PC or copy them for offline playback.';
+        return;
+      }
+      _setCurrentIndex(candidates[math.Random().nextInt(candidates.length)]);
+      await _playSongAtCurrentIndex();
+      return;
+    }
+
+    if (_currentIndex < _playlist.length - 1) {
+      final targetIndex = _currentIndex + 1;
+      _setCurrentIndex(targetIndex);
+      await _playSongAtCurrentIndex();
+      return;
+    }
+
+    final shuffle = shuffleModeNotifier.value;
+    if (shuffle == ShuffleMode.songsAndCategories ||
+        shuffle == ShuffleMode.categories) {
+      _debugLog(
+        'next(): category shuffle active, advancing to random category',
+      );
+      await _advanceToRandomCategory();
+      return;
+    }
+
+    if (loopModeNotifier.value == LoopMode.all) {
+      _debugLog('next(): LoopMode.all, wrapping to index 0');
+      _setCurrentIndex(0);
+      await _playSongAtCurrentIndex();
+      return;
+    }
+
+    if (loopModeNotifier.value.isAdvanceMode) {
+      _debugLog(
+        'next(): ${loopModeNotifier.value}, advancing to next category',
+      );
+      await _advanceForMode(loopModeNotifier.value);
+      return;
+    }
+
+    _debugLog('next(): End of playlist');
+    await _handleQueueEnd();
+  }
+
+  Future<void> previous({bool allowRestart = true}) {
+    _cancelPendingPlayback();
+    _debugLog('[PlayerService] previous() called (allowRestart=$allowRestart)');
+    return _enqueuePlaybackRequest(
+      () => _previousInternal(allowRestart: allowRestart),
+      remoteOutput: _castingService.isActive,
+    );
+  }
+
+  /// Swipe/slide to previous: always goes to previous track, ignoring the 10s restart rule.
+  /// Use this for carousel swipe gestures.
+  Future<void> previousBySwipe() => previous(allowRestart: false);
+
+  Future<void> _previousInternal({required bool allowRestart}) async {
+    _debugLog(
+      '[PlayerService] _previousInternal() called, playlist.length=${_playlist.length}, currentIndex=$_currentIndex, allowRestart=$allowRestart',
+    );
+    if (_playlist.isEmpty) {
+      _debugLog(
+        '[PlayerService] _previousInternal: playlist is empty, returning early',
+      );
+      return;
+    }
+
+    if (allowRestart &&
+        shouldRestartCurrentTrackOnPrevious(positionNotifier.value)) {
+      await seek(Duration.zero);
+      return;
+    }
+
+    if (_currentIndex > 0) {
+      final targetIndex = _currentIndex - 1;
+      _setCurrentIndex(targetIndex);
+      await _playSongAtCurrentIndex();
+      return;
+    }
+
+    if (wrapAroundQueue && _playlist.length > 1) {
+      _setCurrentIndex(_playlist.length - 1);
+      await _playSongAtCurrentIndex();
+      return;
+    }
+
+    await seek(Duration.zero);
+  }
+
+  // ========== Carousel peek helpers (Poweramp-style swipe) ==========
+  // Lightweight, synchronous peek into the *linear* queue order. Mirrors the
+  // core of _nextInternal/_previousInternal without side-effects so the UI
+  // can render adjacent stages during a drag. Shuffle random is approximated
+  // linearly (heavy category/advance modes return null -> rubber-band).
+  Song? get peekNext {
+    if (_playlist.isEmpty) return null;
+    final shuffle = shuffleModeNotifier.value;
+    // Random shuffle: next is non-deterministic; approximate with linear next
+    // so the user still sees a peek. Visual mismatch is preferable to no peek.
+    if (shuffle == ShuffleMode.random) {
+      if (_currentIndex < _playlist.length - 1)
+        return _playlist[_currentIndex + 1];
+      if (loopModeNotifier.value == LoopMode.all) return _playlist.first;
+      return null;
+    }
+    // Category shuffles / advance modes are complex (async repo lookups);
+    // peek returns linear next; commit will resolve via real _nextInternal.
+    if (shuffle == ShuffleMode.categories ||
+        shuffle == ShuffleMode.songsAndCategories) {
+      if (_currentIndex < _playlist.length - 1)
+        return _playlist[_currentIndex + 1];
+      return null;
+    }
+    if (_currentIndex < _playlist.length - 1)
+      return _playlist[_currentIndex + 1];
+    if (loopModeNotifier.value == LoopMode.all) return _playlist.first;
+    if (loopModeNotifier.value.isAdvanceMode) return null; // async advance
+    return null;
+  }
+
+  Song? get peekPrevious {
+    if (_playlist.isEmpty) return null;
+    // For swipe/slide (previousBySwipe / allowRestart=false) the peek always
+    // shows the previous track so the carousel can slide. For the control
+    // button (allowRestart=true) the 10s restart is handled inside
+    // _previousInternal and FullPlayerScreen avoids animating when it would
+    // restart, so peek remains unconditional for the slide gesture.
+    if (_currentIndex > 0) return _playlist[_currentIndex - 1];
+    if (wrapAroundQueue && _playlist.length > 1) return _playlist.last;
+    return null;
+  }
+
+  bool get hasNext => peekNext != null;
+  bool get hasPrevious => peekPrevious != null;
+
+  /// Rebuild the current playlist with updated settings
+  Future<void> _rebuildPlaylist() async {
+    if (_usingRustBackend) return;
+    if (_playlist.isEmpty ||
+        _currentIndex < 0 ||
+        requiresOnDemandAndroidSequence(_playlist))
+      return;
+
+    try {
+      _isRebuildingPlaylist = true;
+      final player = _justAudioPlayer;
+      if (player == null) return;
+      final wasPlaying = isPlayingNotifier.value;
+      final currentPosition = positionNotifier.value;
+
+      final source = await _buildAudioSources();
+      _audioSourceSequence = source;
+
+      await _runWithSuppressedSequenceStateUpdates(() async {
+        await player.setAudioSource(
+          _audioSourceSequence!,
+          initialIndex: _currentIndex,
+          initialPosition: currentPosition,
+          preload: true,
+        );
+
+        await _updateLoopMode();
+      });
+
+      if (wasPlaying) {
+        await player.play();
+      }
+    } catch (e) {
+      _debugLog('Error rebuilding playlist: $e');
+    } finally {
+      _isRebuildingPlaylist = false;
+    }
+  }
+
+  /// Update loop mode based on current loop mode setting
+  Future<void> _updateLoopMode() async {
+    final player = _justAudioPlayer;
+    if (player == null) return;
+
+    switch (loopModeNotifier.value) {
+      case LoopMode.off:
+      case LoopMode.advanceAlbum:
+      case LoopMode.advanceArtist:
+      case LoopMode.advanceFolder:
+      case LoopMode.advancePlaylist:
+      case LoopMode.stopAfterCurrent:
+        await player.setLoopMode(just_audio.LoopMode.off);
+        break;
+      case LoopMode.one:
+        await player.setLoopMode(just_audio.LoopMode.one);
+        break;
+      case LoopMode.all:
+        // Fast-start/crossfade may only load the current song. Do not enable
+        // native all on a one-item sequence: it would repeat that same song.
+        // Manual completion advances through the logical playlist until an
+        // asynchronous in-place restore has populated the full sequence.
+        final nativeMode =
+            (_androidEngine?.isSingleTrackOnly == true ||
+                    requiresOnDemandAndroidSequence(_playlist)) &&
+                _playlist.length > 1
+            ? just_audio.LoopMode.off
+            : just_audio.LoopMode.all;
+        await player.setLoopMode(nativeMode);
+        break;
+    }
+  }
+
+  // ==================== Shuffle/Loop Toggles ====================
+
+  Future<void> toggleShuffle() async {
+    final enable = !shuffleModeNotifier.value.isActive;
+    await setShuffleMode(enable ? ShuffleMode.songs : ShuffleMode.off);
+  }
+
+  Future<void> setShuffleMode(ShuffleMode mode) async {
+    final wasActive = shuffleModeNotifier.value.isActive;
+    shuffleModeNotifier.value = mode;
+    // Publish the new shuffle state immediately even if a playlist rebuild
+    // takes time or fails; Android notification actions share this notifier.
+    unawaited(_updateNotificationState());
+    _playedCategoryIds.clear();
+    unawaited(_appPreferencesService.setShuffleMode(mode.index));
+
+    final enable = mode.isActive;
+    if (enable == wasActive) return;
+
+    final current = currentSongNotifier.value;
+    final oldCurrentIndex = _currentIndex;
+    final basePlaylist = <Song>[];
+    for (var i = 0; i < _playlist.length; i++) {
+      if (_playlistQueueEntryIds[i] == null) {
+        basePlaylist.add(_playlist[i]);
+      }
+    }
+
+    final reorderedBasePlaylist = enable
+        ? buildShufflePlaybackOrder(songs: basePlaylist, current: current)
+        : restorePlaybackOrder(
+            originalPlaylist: _originalPlaylist,
+            current: current,
+            insertionIndex: _currentIndex,
+          );
+
+    _playlist
+      ..clear()
+      ..addAll(reorderedBasePlaylist);
+    _playlistQueueEntryIds
+      ..clear()
+      ..addAll(List<int?>.filled(reorderedBasePlaylist.length, null));
+    if (current != null) {
+      _setCurrentIndex(_playlist.indexWhere((song) => song.id == current.id));
+    }
+    if (_currentIndex < 0 && _playlist.isNotEmpty) {
+      _setCurrentIndex(0);
+    }
+    _insertQueuedEntriesAfterCurrent();
+
+    if (!_usingRustBackend) {
+      await _syncPlaylistAfterShuffle(oldCurrentIndex: oldCurrentIndex);
+    }
+    await _updateNotificationState();
+  }
+
+  /// A restored native playlist may exist even when _audioSourceSequence is
+  /// null. Collapse the actual Media3 sequence before it can publish stale
+  /// indices after a logical shuffle, queue append or a pending-track insert.
+  /// Preserve Repeat One; Repeat All uses manual logical queue advancement.
+  Future<void> _enterOnDemandNativeQueueMode({bool force = false}) async {
+    if (_usingRustBackend ||
+        (!force && !requiresOnDemandAndroidSequence(_playlist)))
+      return;
+    final engine = _androidEngine;
+    if (engine == null) return;
+    final selection = _selectionGeneration;
+    final playback = _pendingPlaybackGeneration;
+    // Shuffle and queue edits enter here directly from UI actions, outside a
+    // play request. Capture their own scope before any fenced native await.
+    await IosLocalAudioRequests.run(() async {
+      final collapsed = await IosLocalAudioRequests.wait(
+        engine.enterOnDemandQueueMode(
+          concatenated: _audioSourceSequence,
+          isCurrent: () =>
+              selection == _selectionGeneration &&
+              identical(engine, _androidEngine),
+          mayResume: () => playback == _pendingPlaybackGeneration,
+        ),
+      );
+      if (selection != _selectionGeneration ||
+          !identical(engine, _androidEngine))
+        return;
+      if (collapsed) _audioSourceSequence = null;
+      await IosLocalAudioRequests.wait(_updateLoopMode());
+    });
+  }
+
+  Future<void> _syncPlaylistAfterShuffle({required int oldCurrentIndex}) async {
+    // Shuffling a Discovery playlist does not make its pending songs playable.
+    // Let the logical order change immediately, without rebuilding Media3
+    // with empty URLs or resetting the currently playing decoder.
+    if (requiresOnDemandAndroidSequence(_playlist)) {
+      await _enterOnDemandNativeQueueMode();
+      return;
+    }
+    final player = _justAudioPlayer;
+    final seq = _audioSourceSequence;
+    if (player == null) {
+      await _rebuildPlaylist();
+      return;
+    }
+    if (seq == null) {
+      // Fast-start restoration mutates the player directly. Keep its current
+      // decoder while retiring an order that predates the logical shuffle.
+      if (player.sequence.isEmpty) {
+        await _rebuildPlaylist();
+      } else {
+        await _enterOnDemandNativeQueueMode(force: true);
+      }
+      return;
+    }
+    if (_playlist.isEmpty || _currentIndex < 0) {
+      await _rebuildPlaylist();
+      return;
+    }
+    final seqLen = seq.children.length;
+    if (oldCurrentIndex < 0 || oldCurrentIndex >= seqLen) {
+      await _rebuildPlaylist();
+      return;
+    }
+    if (seqLen != _playlist.length) {
+      await _rebuildPlaylist();
+      return;
+    }
+
+    _isRebuildingPlaylist = true;
+    try {
+      final newSources = <just_audio.AudioSource>[];
+      for (final song in _playlist) {
+        newSources.add(await _buildAudioSourceForSong(song));
+      }
+
+      await _runWithSuppressedSequenceStateUpdates(() async {
+        final int newIdx = _currentIndex;
+
+        if (oldCurrentIndex > 0) {
+          seq.removeRange(0, oldCurrentIndex);
+        }
+        final afterCurrent = seq.children.length - 1;
+        if (afterCurrent > 0) {
+          seq.removeRange(1, seq.children.length);
+        }
+
+        if (newIdx > 0) {
+          seq.insertAll(0, newSources.sublist(0, newIdx));
+        }
+        if (newIdx + 1 < newSources.length) {
+          seq.insertAll(newIdx + 1, newSources.sublist(newIdx + 1));
+        }
+
+        await _updateLoopMode();
+
+        // Give ExoPlayer's queued index-change events time to drain while
+        // suppression is still active so they don't flash the wrong song.
+        await Future.delayed(const Duration(milliseconds: 50));
+      });
+    } finally {
+      _isRebuildingPlaylist = false;
+    }
+  }
+
+  static const _quickLoopCycle = [LoopMode.off, LoopMode.all, LoopMode.one];
+
+  Future<void> toggleLoopMode() async {
+    final current = loopModeNotifier.value;
+    final quickIdx = _quickLoopCycle.indexOf(current);
+    final next = quickIdx == -1
+        ? LoopMode.off
+        : _quickLoopCycle[(quickIdx + 1) % _quickLoopCycle.length];
+    await setLoopMode(next);
+  }
+
+  Future<void> setLoopMode(LoopMode mode) async {
+    if (loopModeNotifier.value == mode) return;
+    loopModeNotifier.value = mode;
+    unawaited(_appPreferencesService.setLoopMode(mode.index));
+    // just_audio applies repeat mode directly to the existing sequence.
+    // Reconstructing every AudioSource and calling setAudioSource() when the
+    // user taps Repeat All can stall the main player, particularly for HTTP
+    // and on-demand sources. Keep the current stream, index and position.
+    await _updateLoopMode();
+    if (!_usingRustBackend && _androidEngine?.isSingleTrackOnly == true) {
+      // Stop After Current, Repeat One and Repeat All can all change which
+      // successor is legal. Remove any child queued under the old mode.
+      await _androidEngine!.invalidateOnDemandGaplessSuccessor();
+    }
+    if (mode == LoopMode.all &&
+        !_usingRustBackend &&
+        _playlist.length > 1 &&
+        !requiresOnDemandAndroidSequence(_playlist) &&
+        _androidEngine?.isSingleTrackOnly == true &&
+        _androidEngine?.isCrossfadeActive == false) {
+      final engine = _androidEngine!;
+      final selection = _selectionGeneration;
+      // No blocking replay, Media3 reset or full source reconstruction.
+      // Restore in the background while manual Repeat All remains functional.
+      unawaited(() async {
+        final restored = await engine.restoreFastStartPlaylist(
+          isCurrent: () =>
+              _selectionGeneration == selection &&
+              loopModeNotifier.value == LoopMode.all &&
+              !requiresOnDemandAndroidSequence(_playlist) &&
+              identical(_androidEngine, engine),
+        );
+        if (restored &&
+            _selectionGeneration == selection &&
+            loopModeNotifier.value == LoopMode.all &&
+            identical(_androidEngine, engine)) {
+          await _updateLoopMode();
+        }
+      }());
+    }
+  }
+
+  // ==================== Volume ====================
+
+  Future<void> setVolume(double volume) async {
+    if (!volume.isFinite || _switchingDsdForVolume) return;
+    final tier = _determineCurrentTier();
+    final tierSupportsBoost =
+        _extendedVolumeEnabled &&
+        (tier == VolumeTier.software || tier == VolumeTier.system);
+    final maxForTier = tierSupportsBoost ? 2.0 : 1.0;
+    final clampedVolume = volume.clamp(0.0, maxForTier).toDouble();
+
+    if (_castingService.isActive) {
+      // Cast devices cannot exceed 100 %.
+      _currentVolume = clampedVolume.clamp(0.0, 1.0);
+      await _castingService.delegateSetVolume(_currentVolume);
+      await _reconcileSystemVolumeBoost(0.0);
+      return;
+    }
+    // The active transport, not the PCM bit-perfect preference, protects both
+    // DoP and native DSD. Never update the UI for an ignored/failed request.
+    if (_usbDsdWireActive) {
+      if (tier == VolumeTier.hardware) {
+        _debugLog('[VolFlow] DSD HW path: uac2 setVolume($clampedVolume)');
+        final hwOk = await _uac2Service.setVolume(clampedVolume);
+        if (hwOk) {
+          _currentVolume =
+              _uac2Service.currentDeviceStatus?.volume ?? _currentVolume;
+        }
+        _onHwVolumeResult(hwOk);
+      } else if (Uac2PreferencesService.autoSwitchDsdForVolumeSync &&
+          clampedVolume < 1.0 &&
+          _usingRustBackend &&
+          _rustAudioService.isInitialized) {
+        await _switchDoPForVolumeTrack(clampedVolume);
+      } else {
+        _debugLog(
+          '[VolFlow] DSD: no verified hardware volume — volume unchanged',
+        );
+      }
+      await _reconcileSystemVolumeBoost(0.0);
+      return;
+    }
+
+    _activeTier = tier;
+    switch (tier) {
+      case VolumeTier.hardware:
+        _debugLog('[VolFlow] HW path: uac2 setVolume($clampedVolume)');
+        final hwOk = await _uac2Service.setVolume(clampedVolume);
+        if (hwOk) {
+          _currentVolume =
+              _uac2Service.currentDeviceStatus?.volume ?? _currentVolume;
+        }
+        _onHwVolumeResult(hwOk);
+        if (!hwOk && !_isPassthroughActive && _usingRustBackend) {
+          // Lie-detector fallback: DAC claimed hardware volume but rejected
+          // the write — engine gain still works on the DSP path.
+          _debugLog('[VolFlow] HW write failed — falling back to engine gain');
+          await _rustAudioService.setVolume(clampedVolume);
+          _rememberSoftwareVolume(clampedVolume);
+        }
+        await _reconcileSystemVolumeBoost(0.0);
+        break;
+      case VolumeTier.software:
+        if (_usingRustBackend) {
+          _debugLog('[VolFlow] SW path: engine setVolume($clampedVolume)');
+          await _rustAudioService.setVolume(clampedVolume);
+        }
+        _rememberSoftwareVolume(clampedVolume);
+        // No native effect on the Rust path; ensure any stale boost is released.
+        await _reconcileSystemVolumeBoost(0.0);
+        break;
+      case VolumeTier.system:
+        final player = _justAudioPlayer;
+        final effective =
+            math.min(clampedVolume, 1.0) * _replayGainState.linear;
+        if (player != null) {
+          // ExoPlayer clamps at 1.0; the boost portion (>1.0, from extended
+          // volume and/or ReplayGain) is applied via Android LoudnessEnhancer.
+          await player.setVolume(math.min(effective, 1.0));
+        }
+        _rememberSoftwareVolume(clampedVolume);
+        await _reconcileSystemVolumeBoost(effective);
+        break;
+      case VolumeTier.unavailable:
+        _debugLog(
+          '[VolFlow] Volume unavailable (bit-perfect passthrough) — ignored',
+        );
+        await _reconcileSystemVolumeBoost(0.0);
+        break;
+    }
+  }
+
+  void _rememberSoftwareVolume(double volume) {
+    _currentVolume = volume;
+    if (currentEngineType == AudioEngineType.usbDacExperimental ||
+        currentEngineType == AudioEngineType.dapInternalHighRes) {
+      unawaited(_preferencesService.setUsbSoftwareVolume(volume));
+    }
+  }
+
+  // ==================== ReplayGain ====================
+
+  ReplayGainAppliedState get replayGainState => _replayGainState;
+
+  /// Compute the effective ReplayGain (dB) for [song] from the persisted
+  /// settings. 0.0 when the mode is off or tags are missing.
+  Future<double> _computeReplayGainDbFor(Song song) async {
+    // ReplayGain is a software multiplication and would silently force the
+    // Rust callback out of bit-perfect passthrough. Suppress it before a
+    // source is queued, not only when updating the live track.
+    if (Uac2PreferencesService.isAndroidMixerUsbSelectedSync &&
+        _uac2Service.isBitPerfectEnabledSync)
+      return 0.0;
+    final mode = await _appPreferencesService.getReplayGainMode();
+    if (mode == ReplayGainMode.off) return 0.0;
+    final preampDb = await _appPreferencesService.getReplayGainPreampDb();
+    final preventClipping = await _appPreferencesService
+        .getReplayGainPreventClipping();
+    final effectiveMode = effectiveReplayGainModeForSong(
+      mode: mode,
+      song: song,
+      albumContext:
+          _playbackContext.source == PlaybackSource.album &&
+          (_playbackContext.sourceName?.trim().toLowerCase() ?? '') ==
+              (song.album?.trim().toLowerCase() ?? ''),
+      queue: playlist,
+    );
+    return computeReplayGainDbForSong(
+      song,
+      mode: effectiveMode,
+      preampDb: preampDb,
+      preventClipping: preventClipping,
+    );
+  }
+
+  /// Recompute [_replayGainState] from persisted settings for [song]. When
+  /// [pushSpawnDefault], also pushes the value as the spawn-time default to
+  /// the Rust engine (must run before [play]/[queueNext] so the spawned
+  /// source is stamped with this track's gain — the running source, if any,
+  /// keeps its own gain).
+  Future<void> _refreshReplayGainForSong(
+    Song? song, {
+    bool pushSpawnDefault = false,
+  }) async {
+    final mode = await _appPreferencesService.getReplayGainMode();
+    if (mode == ReplayGainMode.off ||
+        song == null ||
+        (currentEngineType == AudioEngineType.rustOboe &&
+            Uac2PreferencesService.isAndroidMixerUsbSelectedSync &&
+            _uac2Service.isBitPerfectEnabledSync)) {
+      _replayGainState = ReplayGainAppliedState.neutral;
+    } else {
+      final preampDb = await _appPreferencesService.getReplayGainPreampDb();
+      final preventClipping = await _appPreferencesService
+          .getReplayGainPreventClipping();
+      _replayGainState = ReplayGainAppliedState(
+        mode: mode,
+        gainDb: computeReplayGainDbForSong(
+          song,
+          mode: effectiveReplayGainModeForSong(
+            mode: mode,
+            song: song,
+            albumContext:
+                _playbackContext.source == PlaybackSource.album &&
+                (_playbackContext.sourceName?.trim().toLowerCase() ?? '') ==
+                    (song.album?.trim().toLowerCase() ?? ''),
+            queue: playlist,
+          ),
+          preampDb: preampDb,
+          preventClipping: preventClipping,
+        ),
+      );
+    }
+    if (pushSpawnDefault &&
+        _usingRustBackend &&
+        _rustAudioService.isInitialized) {
+      try {
+        await _rustAudioService.setReplayGainDefault(_replayGainState.gainDb);
+      } catch (e) {
+        _debugLog('[RG] default push to engine failed: $e');
+      }
+    }
+  }
+
+  /// Fold [_replayGainState] into the just_audio (system tier) volume and
+  /// LoudnessEnhancer boost for [song].
+  Future<void> _applyReplayGainForSystemTier(
+    Song? song,
+  ) => IosLocalAudioRequests.run(() async {
+    await IosLocalAudioRequests.wait(_refreshReplayGainForSong(song));
+    if (Platform.isIOS &&
+        _replayGainState.gainDb > 0 &&
+        song?.id == currentSongNotifier.value?.id &&
+        !_usingRustBackend) {
+      // Native playlist auto-advance does not pass through play(). Re-resolve
+      // this track's processing requirement before applying a capped volume.
+      await IosLocalAudioRequests.wait(syncIosProcessingRoute());
+      if (_usingRustBackend) return;
+    }
+    if (_determineCurrentTier() != VolumeTier.system) return;
+    final player = _justAudioPlayer;
+    if (player == null) return;
+    final effective =
+        math.min(_currentVolume.clamp(0.0, 1.0), 1.0) * _replayGainState.linear;
+    try {
+      await IosLocalAudioRequests.wait(
+        player.setVolume(math.min(effective, 1.0)),
+      );
+    } catch (e) {
+      _debugLog('[RG] system-volume fold failed: $e');
+    }
+    await IosLocalAudioRequests.wait(_reconcileSystemVolumeBoost(effective));
+  });
+
+  /// Re-apply ReplayGain to the current track after the user changes the
+  /// settings (mode / pre-amp / clipping prevention).
+  Future<void> applyReplayGainFromSettings() async {
+    final song =
+        currentSongNotifier.value ?? _playbackManager.latestState?.currentTrack;
+    await _refreshReplayGainForSong(song);
+    if (Platform.isIOS) await syncIosProcessingRoute();
+    if (_usingRustBackend && _rustAudioService.isInitialized) {
+      try {
+        // Live update: the running source must change with the settings too.
+        await _rustAudioService.setReplayGain(_replayGainState.gainDb);
+      } catch (e) {
+        _debugLog('[RG] live push to engine failed: $e');
+      }
+    }
+    if (!_usingRustBackend && _determineCurrentTier() == VolumeTier.system) {
+      await _applyReplayGainForSystemTier(song);
+    }
+  }
+
+  /// Opt-in DSD-to-PCM conversion must renegotiate the USB transport as well
+  /// as the decoder. Seeking alone can feed PCM into the old DoP endpoint.
+  Future<void> _switchDoPForVolumeTrack(double volume) async {
+    final path = _rustAudioService.currentPath;
+    if (path == null || _switchingDsdForVolume) return;
+    final previousMode = Uac2PreferencesService.dsdOutputModeSync;
+    final wasPlaying = _rustAudioService.isPlaying;
+    final progress = rust_audio.audioGetProgress();
+    final posSecs = progress?.positionSecs ?? 0.0;
+    _switchingDsdForVolume = true;
+    try {
+      _debugLog('[VolFlow] DSD → PCM opt-in conversion for volume=$volume');
+      await _rustAudioService.stop();
+      await Uac2PreferencesService().setDsdOutputMode(DsdOutputMode.forcePcm);
+      rust_audio.audioSetDsdOutputMode(mode: 0);
+      // Stage the replacement engine's gain before its first PCM callback,
+      // avoiding an initial full-scale playback burst.
+      await _rustAudioService.setVolume(volume);
+      await _rustAudioService.play(path);
+      if (!wasPlaying) await _rustAudioService.pause();
+      await _rustAudioService.seek(
+        Duration(milliseconds: (posSecs * 1000).round()),
+      );
+      await _refreshAudioOutputDiagnostics(reason: 'DSD volume PCM conversion');
+      if (_currentUsbDsdMode != 'pcm') {
+        throw StateError(
+          'DSD volume conversion did not activate direct USB PCM',
+        );
+      }
+      _rememberSoftwareVolume(volume);
+      _debugLog('[VolFlow] DSD → PCM transport and decoder reconfigured');
+    } catch (error) {
+      // Fail stopped: never resume packed DSD through an uncertain format.
+      await _rustAudioService.stop();
+      await Uac2PreferencesService().setDsdOutputMode(previousMode);
+      rust_audio.audioSetDsdOutputMode(
+        mode: switch (previousMode) {
+          DsdOutputMode.auto => 3,
+          DsdOutputMode.forcePcm => 0,
+          DsdOutputMode.forceDop => 1,
+          DsdOutputMode.native => 2,
+        },
+      );
+      await _rustAudioService.setVolume(1.0);
+      _activeUsbDsdMode = null;
+      _activeUsbDsdSongId = null;
+      await _syncUac2PlaybackStatus(
+        currentSongNotifier.value,
+        isPlaying: false,
+      );
+      _debugLog('[VolFlow] DSD → PCM conversion refused: $error');
+      rethrow;
+    } finally {
+      _switchingDsdForVolume = false;
+    }
+    await _syncUac2PlaybackStatus(
+      currentSongNotifier.value,
+      isPlaying: wasPlaying,
+    );
+    await _reconcileVolumeForTier(_determineCurrentTier());
+    unawaited(_queueNextTrackForGapless());
+  }
+
+  /// Flow's generated recommendations extend the context *after* every
+  /// existing upcoming track. Unlike addToQueue, they must never jump ahead
+  /// of manually queued songs or reorder the already displayed session.
+  Future<void> appendToPlaylistTail(Song song) async {
+    if (_playlist.isEmpty) return;
+    final at = _playlist.length;
+    _playlist.add(song);
+    _playlistQueueEntryIds.add(null);
+    if (!_usingRustBackend) {
+      if (requiresOnDemandAndroidSequence(_playlist)) {
+        await _enterOnDemandNativeQueueMode();
+      } else if (_audioSourceSequence == null) {
+        await _enterOnDemandNativeQueueMode(force: true);
+      } else {
+        try {
+          await _insertIntoAudioSequence(at, song);
+        } catch (error) {
+          if (IosLocalAudioRequests.isRetired(error)) rethrow;
+          _debugLog('Native queue append deferred; preserving logical queue');
+          await _enterOnDemandNativeQueueMode(force: true);
+        }
+      }
+    }
+    _notifyUpNextChanged();
+    _debounceQueueChanged();
+  }
+
+  Future<int> addToQueue(Song song) async {
+    final entry = _QueueEntry(id: _nextQueueEntryId++, song: song);
+    _queuedEntries.add(entry);
+    final index = _queuedEntries.length - 1;
+    if (_playlist.isNotEmpty) {
+      final insertIndex = (_currentIndex + 1 + _queuedEntries.length - 1).clamp(
+        0,
+        _playlist.length,
+      );
+      _playlist.insert(insertIndex, song);
+      _playlistQueueEntryIds.insert(insertIndex, entry.id);
+
+      if (!_usingRustBackend) {
+        if (requiresOnDemandAndroidSequence(_playlist)) {
+          await _enterOnDemandNativeQueueMode();
+        } else if (_audioSourceSequence == null) {
+          await _enterOnDemandNativeQueueMode(force: true);
+        } else {
+          try {
+            await _insertIntoAudioSequence(insertIndex, song);
+          } catch (error) {
+            if (IosLocalAudioRequests.isRetired(error)) rethrow;
+            _debugLog('Native queue append deferred; preserving logical queue');
+            await _enterOnDemandNativeQueueMode(force: true);
+          }
+        }
+      }
+    }
+    _notifyQueueChanged();
+    _notifyUpNextChanged();
+    if (!_playlist.isNotEmpty ||
+        _usingRustBackend ||
+        _audioSourceSequence == null) {
+      _debounceQueueChanged();
+    }
+    return index;
+  }
+
+  Future<void> playFromQueueIndex(int index) {
+    _cancelPendingPlayback();
+    return _enqueuePlaybackRequest(
+      () => _playFromQueueIndexInternal(index),
+      remoteOutput: _castingService.isActive,
+    );
+  }
+
+  Future<void> _playFromQueueIndexInternal(int index) async {
+    if (index < 0 || index >= _queuedEntries.length) return;
+    final entry = _queuedEntries.removeAt(index);
+    final playlistIndex = _findPlaylistIndexForQueueEntry(entry.id);
+    if (playlistIndex != -1) {
+      _playlistQueueEntryIds[playlistIndex] = null;
+      _notifyQueueChanged();
+      _setCurrentIndex(playlistIndex);
+      await _playSongAtCurrentIndex();
+      return;
+    }
+
+    _notifyQueueChanged();
+    _notifyUpNextChanged();
+    await _playInternal(entry.song);
+  }
+
+  Future<void> clearQueue() async {
+    if (_queuedEntries.isEmpty) return;
+    final queuedIds = _queuedEntries.map((entry) => entry.id).toSet();
+    for (var i = _playlistQueueEntryIds.length - 1; i >= 0; i--) {
+      final queueId = _playlistQueueEntryIds[i];
+      if (queueId != null && queuedIds.contains(queueId)) {
+        _playlist.removeAt(i);
+        _playlistQueueEntryIds.removeAt(i);
+        if (i < _currentIndex) {
+          _setCurrentIndex(_currentIndex - 1);
+        }
+      }
+    }
+    _queuedEntries.clear();
+    _notifyUpNextChanged();
+    _debounceQueueChanged();
+  }
+
+  /// Clears everything after the current song: both manual queue entries
+  /// and all upcoming playlist items.
+  Future<void> clearAllUpcoming() async {
+    // First clear manual queue entries
+    _queuedEntries.clear();
+
+    // Then remove everything after the current index from the playlist
+    if (_playlist.isNotEmpty && _currentIndex >= 0) {
+      final keepCount = (_currentIndex + 1).clamp(0, _playlist.length);
+      if (keepCount < _playlist.length) {
+        _playlist.removeRange(keepCount, _playlist.length);
+        _playlistQueueEntryIds.removeRange(
+          keepCount,
+          _playlistQueueEntryIds.length,
+        );
+      }
+    }
+
+    _notifyQueueChanged();
+    _notifyUpNextChanged();
+    _debounceQueueChanged();
+  }
+
+  /// Removes a single song from the up-next list by its upNext-relative index.
+  /// Index 0 is the first song after the currently playing song.
+  Future<void> removeFromUpNext(int upNextIndex) async {
+    final playlistIndex = _currentIndex + 1 + upNextIndex;
+    if (playlistIndex < 0 || playlistIndex >= _playlist.length) return;
+
+    // If this playlist slot belongs to a manual queue entry, remove that too
+    final queueEntryId = _playlistQueueEntryIds[playlistIndex];
+    if (queueEntryId != null) {
+      _queuedEntries.removeWhere((entry) => entry.id == queueEntryId);
+      _notifyQueueChanged();
+    }
+
+    _playlist.removeAt(playlistIndex);
+    _playlistQueueEntryIds.removeAt(playlistIndex);
+    _removeFromAudioSequence(playlistIndex);
+
+    _notifyUpNextChanged();
+    if (_usingRustBackend || _audioSourceSequence == null) {
+      _debounceQueueChanged();
+    }
+  }
+
+  Future<void> removeFromQueue(int index) async {
+    if (index < 0 || index >= _queuedEntries.length) return;
+    final entry = _queuedEntries[index];
+    await _removeQueueEntryById(entry.id);
+  }
+
+  Future<void> moveQueueItem(int oldIndex, int newIndex) async {
+    if (oldIndex < 0 ||
+        oldIndex >= _queuedEntries.length ||
+        newIndex < 0 ||
+        newIndex >= _queuedEntries.length) {
+      return;
+    }
+    if (oldIndex == newIndex) return;
+
+    final entry = _queuedEntries.removeAt(oldIndex);
+    _queuedEntries.insert(newIndex, entry);
+
+    for (var i = _playlistQueueEntryIds.length - 1; i >= 0; i--) {
+      if (_playlistQueueEntryIds[i] != null) {
+        _playlist.removeAt(i);
+        _playlistQueueEntryIds.removeAt(i);
+      }
+    }
+    _insertQueuedEntriesAfterCurrent();
+    // The drag already updated the manual queue. Publish its new order
+    // immediately, not only after the audio-sequence rebuild debounce.
+    _notifyQueueChanged();
+    _notifyUpNextChanged();
+    _debounceQueueChanged();
+  }
+
+  /// Jump to an absolute playlist slot, including one before Now Playing.
+  /// Unlike play(song, playlist: ...), this leaves the queue untouched and
+  /// addresses a specific occurrence even when a song appears twice.
+  Future<void> playFromPlaylistIndex(int index) {
+    _cancelPendingPlayback();
+    return _enqueuePlaybackRequest(() async {
+      if (index < 0 || index >= _playlist.length) return;
+      _setCurrentIndex(index);
+      await _playSongAtCurrentIndex();
+    }, remoteOutput: _castingService.isActive);
+  }
+
+  Future<void> playFromUpNextIndex(int index) {
+    _cancelPendingPlayback();
+    return _enqueuePlaybackRequest(
+      () => _playFromUpNextIndexInternal(index),
+      remoteOutput: _castingService.isActive,
+    );
+  }
+
+  Future<void> _playFromUpNextIndexInternal(int index) async {
+    final playlistIndex = _currentIndex + 1 + index;
+    if (playlistIndex < 0 || playlistIndex >= _playlist.length) {
+      return;
+    }
+
+    _setCurrentIndex(playlistIndex);
+    await _playSongAtCurrentIndex();
+  }
+
+  Future<void> moveQueueItemToNext(int index) async {
+    if (index <= 0 || index >= _queuedEntries.length) return;
+    await moveQueueItem(index, 0);
+  }
+
+  Future<void> moveUpNextItem(int oldIndex, int newIndex) async {
+    final upNextLength = _playlist.length - _currentIndex - 1;
+    if (oldIndex < 0 ||
+        oldIndex >= upNextLength ||
+        newIndex < 0 ||
+        newIndex >= upNextLength) {
+      return;
+    }
+    if (oldIndex == newIndex) return;
+
+    final playlistOldIndex = _currentIndex + 1 + oldIndex;
+    final playlistNewIndex = _currentIndex + 1 + newIndex;
+    // SliverReorderableList's pre-removal drop index has ALREADY been
+    // normalized by QueueList. Subtracting a second time broke downward
+    // moves (including 0 -> 1, which became a no-op).
+    final song = _playlist.removeAt(playlistOldIndex);
+    final entryId = _playlistQueueEntryIds.removeAt(playlistOldIndex);
+    _playlist.insert(playlistNewIndex, song);
+    _playlistQueueEntryIds.insert(playlistNewIndex, entryId);
+
+    // Up Next includes manual queue entries. A drag here must update that
+    // backing order too, or the separate Manual Queue list looks unchanged
+    // and a subsequent manual edit silently resets what the user dragged.
+    final byId = {for (final entry in _queuedEntries) entry.id: entry};
+    final visibleQueueIds = _playlistQueueEntryIds.whereType<int>();
+    final reorderedEntries = [
+      for (final id in visibleQueueIds)
+        if (byId[id] case final entry?) entry,
+    ];
+    if (reorderedEntries.length == _queuedEntries.length) {
+      _queuedEntries
+        ..clear()
+        ..addAll(reorderedEntries);
+      _notifyQueueChanged();
+    }
+    _notifyUpNextChanged();
+    _debounceQueueChanged();
+  }
+
+  // ==================== Playback Speed ====================
+
+  Future<void> setPlaybackSpeed(double speed) =>
+      IosLocalAudioRequests.run(() async {
+        final clampedSpeed = speed.clamp(0.5, 2.0).toDouble();
+        if (isBitPerfectProcessingLocked) {
+          _debugLog(
+            '[Playback] Ignoring playback-speed change while Bit-perfect (USB DAC) is enabled',
+          );
+          if (_usingRustBackend) {
+            await _rustAudioService.setPlaybackSpeed(1.0);
+          } else {
+            final player = _justAudioPlayer;
+            if (player != null) {
+              await player.setSpeed(1.0);
+            }
+          }
+          return;
+        }
+        playbackSpeedNotifier.value = clampedSpeed;
+        if (_usingRustBackend) {
+          await _rustAudioService.setPlaybackSpeed(clampedSpeed);
+        } else {
+          final player = _justAudioPlayer;
+          if (player != null) {
+            await player.setSpeed(clampedSpeed);
+          }
+        }
+      });
+
+  Future<void> cyclePlaybackSpeed() async {
+    const speeds = [0.75, 1.0, 1.25, 1.5, 1.75, 2.0];
+    final currentIndex = speeds.indexOf(playbackSpeedNotifier.value);
+    final nextIndex = (currentIndex + 1) % speeds.length;
+    await setPlaybackSpeed(speeds[nextIndex]);
+  }
+
+  // ==================== Pitch Shift ====================
+
+  Future<void> setPitchSemitones(double semitones) =>
+      IosLocalAudioRequests.run(() async {
+        final clamped = semitones.clamp(-12.0, 12.0).toDouble();
+        debugPrint(
+          '[PITCH] setPitchSemitones($semitones) -> clamped=$clamped, '
+          'usingRustBackend=$_usingRustBackend, '
+          'bitPerfectLocked=$isBitPerfectProcessingLocked',
+        );
+        if (isBitPerfectProcessingLocked) {
+          _debugLog(
+            '[Playback] Ignoring pitch-shift change while Bit-perfect (USB DAC) is enabled',
+          );
+          if (_usingRustBackend) {
+            await _rustAudioService.setPitchShiftSemitones(0.0);
+          } else {
+            final player = _justAudioPlayer;
+            if (player != null && !Platform.isIOS) {
+              await player.setPitch(1.0);
+            }
+          }
+          return;
+        }
+        pitchSemitonesNotifier.value = clamped;
+        if (Platform.isIOS) {
+          // just_audio's independent pitch API is Android-only. SoundTouch in
+          // the Rust backend implements this control on iPhone.
+          EqEngineHint.iosPitchActive = clamped != 0;
+          await syncIosProcessingRoute();
+        }
+        if (_usingRustBackend) {
+          await _rustAudioService.setPitchShiftSemitones(clamped);
+        } else {
+          final player = _justAudioPlayer;
+          if (player != null && !Platform.isIOS) {
+            // ponytail: just_audio setPitch takes a frequency ratio (1.0 = no shift).
+            final ratio = math.pow(2, clamped / 12).toDouble();
+            await player.setPitch(ratio);
+          }
+        }
+      });
+
+  // ==================== Sleep Timer ====================
+
+  void setSleepTimer(Duration duration) {
+    cancelSleepTimer();
+
+    sleepTimerRemainingNotifier.value = duration;
+
+    _sleepTimer = Timer(duration, () {
+      _stopPlayback();
+      sleepTimerRemainingNotifier.value = null;
+    });
+
+    _sleepTimerCountdown = Timer.periodic(const Duration(seconds: 1), (timer) {
+      final remaining = sleepTimerRemainingNotifier.value;
+      if (remaining != null && remaining.inSeconds > 0) {
+        sleepTimerRemainingNotifier.value =
+            remaining - const Duration(seconds: 1);
+      } else {
+        timer.cancel();
+      }
+    });
+  }
+
+  void cancelSleepTimer() {
+    _sleepTimer?.cancel();
+    _sleepTimer = null;
+    _sleepTimerCountdown?.cancel();
+    _sleepTimerCountdown = null;
+    sleepTimerRemainingNotifier.value = null;
+  }
+
+  bool get isSleepTimerActive => sleepTimerRemainingNotifier.value != null;
+
+  void _armAutoSyncGuard(Song song) {
+    _autoSyncGuardSongId = song.id;
+  }
+
+  void _clearAutoSyncGuard() {
+    _autoSyncGuardSongId = null;
+  }
+
+  void _checkPlaybackDesync(PlaybackState state) {
+    final engineTrack = state.currentTrack;
+    _engineCurrentTrack = engineTrack;
+
+    final uiSong = currentSongNotifier.value;
+
+    if (engineTrack == null) {
+      _desyncDetectionTimer?.cancel();
+      _desyncDetectionTimer = null;
+      if (playbackDesyncedNotifier.value) {
+        playbackDesyncedNotifier.value = false;
+      }
+      return;
+    }
+
+    if (uiSong != null && uiSong.id == engineTrack.id) {
+      _desyncDetectionTimer?.cancel();
+      _desyncDetectionTimer = null;
+      if (playbackDesyncedNotifier.value) {
+        playbackDesyncedNotifier.value = false;
+      }
+      return;
+    }
+
+    if (_desyncDetectionTimer != null) return;
+
+    _desyncDetectionTimer = Timer(_desyncThreshold, () {
+      if (_engineCurrentTrack != null &&
+          currentSongNotifier.value?.id != _engineCurrentTrack!.id) {
+        playbackDesyncedNotifier.value = true;
+      }
+    });
+  }
+
+  void syncNow() {
+    _desyncDetectionTimer?.cancel();
+    _desyncDetectionTimer = null;
+    playbackDesyncedNotifier.value = false;
+
+    final engineTrack = _engineCurrentTrack;
+    if (engineTrack == null) return;
+
+    currentSongNotifier.value = engineTrack;
+    _syncCurrentIndexToTrack(engineTrack);
+    _syncUac2PlaybackStatus(engineTrack, isPlaying: isPlayingNotifier.value);
+    _updateNotificationState();
+  }
+
+  void _ensurePositionSaveTimer() {
+    if (Platform.isIOS && _iosPositionSavingPaused) return;
+    _positionSaveTimer?.cancel();
+    _positionSaveTimer = Timer.periodic(const Duration(seconds: 5), (_) {
+      _savePosition();
+      _maybePrefetchNextNetworkSong();
+    });
+  }
+
+  /// Last song id handed to [RemoteSourceService.prefetch]. Reset whenever the
+  /// current track changes so a replayed song re-prefetches its successor.
+  String? _prefetchedNextSongId;
+
+  /// P1.7: when the current network-sourced track is within 10s of its end,
+  /// start downloading the linear-next song so gapless/crossfade handoff reads
+  /// a local path. Cache hits make repeated calls no-ops (and the marker is
+  /// reset on track change, which also covers wrap-around).
+  void _maybePrefetchNextNetworkSong() {
+    final current = currentSongNotifier.value;
+    if (current == null || !current.isNetworkSource) return;
+    if (_playlist.isEmpty || _currentIndex < 0) return;
+
+    final duration = durationNotifier.value;
+    if (duration <= Duration.zero) return;
+    if (positionNotifier.value < duration - const Duration(seconds: 10)) {
+      return;
+    }
+
+    if (_currentIndex >= _playlist.length - 1 &&
+        loopModeNotifier.value != LoopMode.all) {
+      return;
+    }
+    final nextIndex = _currentIndex >= _playlist.length - 1
+        ? 0
+        : _currentIndex + 1;
+    final next = _playlist[nextIndex];
+    if (!next.isNetworkSource) return;
+    if (next.id == _prefetchedNextSongId) return;
+
+    _prefetchedNextSongId = next.id;
+    unawaited(RemoteSourceService.instance.prefetch(next));
+  }
+
+  void _startHwVolumeHealthTimer() {
+    _hwVolumeHealthTimer?.cancel();
+    _hwVolumeHealthTimer = Timer.periodic(
+      const Duration(seconds: 5),
+      (_) => _checkHwVolumeHealth(),
+    );
+  }
+
+  void _stopHwVolumeHealthTimer() {
+    _hwVolumeHealthTimer?.cancel();
+    _hwVolumeHealthTimer = null;
+  }
+
+  Future<void> _checkHwVolumeHealth() async {
+    if (_activeTier != VolumeTier.hardware) return;
+    final healthy = await _uac2Service.verifyHardwareVolumeHealth();
+    if (healthy == false) {
+      _debugLog(
+        '[VolFlow] HW volume readback failed — reevaluating volume authority',
+      );
+      _onHwVolumeResult(false);
+    }
+  }
+
+  void _publishRestoredPlaybackState(Song song, {required Duration position}) {
+    if (currentSongNotifier.value != song) {
+      currentSongNotifier.value = song;
+    }
+    if (isPlayingNotifier.value) {
+      isPlayingNotifier.value = false;
+    }
+    if (positionNotifier.value != position) {
+      positionNotifier.value = position;
+    }
+    if (bufferedPositionNotifier.value != Duration.zero) {
+      bufferedPositionNotifier.value = Duration.zero;
+    }
+    if (durationNotifier.value != song.duration) {
+      durationNotifier.value = song.duration;
+    }
+  }
+
+  void dispose() {
+    isPlayingNotifier.removeListener(_updatePriorityAnchor);
+    if (_priorityAnchorActive) {
+      _priorityAnchorActive = false;
+      unawaited(_uac2Service.stopPriorityAnchor());
+    }
+    if (Platform.isIOS) {
+      IosLocalAudioRequests.lifecycle.unregister(this);
+      IosLocalAudioRequests.restoreSession = null;
+      _rustAudioService.positionNotifier.removeListener(
+        _persistPausedRustPosition,
+      );
+    }
+    _playbackDiagnosticsDebounceTimer?.cancel();
+    _playbackDiagnosticsDebounceTimer = null;
+    _queueDebounceTimer?.cancel();
+    _positionSaveTimer?.cancel();
+    _stopHwVolumeHealthTimer();
+    unawaited(_audioFocusSubscription?.cancel());
+    unawaited(_noisyAudioSubscription?.cancel());
+    unawaited(_bluetoothDeviceEventSubscription?.cancel());
+    unawaited(_usbDacDetachSubscription?.cancel());
+    unawaited(_usbDacAttachSubscription?.cancel());
+    cancelSleepTimer();
+    _notificationService.hideNotification();
+    _floatingPlayerService.hide();
+    if (_usingRustBackend) {
+      if (Uac2PreferencesService.isKillIsochronousUsbOnQuitSync) {
+        unawaited(_rustAudioService.stop());
+      }
+    }
+
+    final player = _justAudioPlayer;
+    if (player != null) {
+      unawaited(IosLocalAudioPlayers.dispose(player));
+      _justAudioPlayer = null;
+    }
+    _playbackStateSubscription?.cancel();
+    unawaited(_playbackManager.dispose());
+    selectedPlaybackModeNotifier.removeListener(
+      _updateBitPerfectProcessingLocked,
+    );
+    Uac2PreferencesService.selectedAudioEngineNotifier.removeListener(
+      _updateBitPerfectProcessingLocked,
+    );
+    initializedPlaybackModeNotifier.removeListener(
+      _updateBitPerfectProcessingLocked,
+    );
+    _uac2Service.bitPerfectEnabledNotifier.removeListener(
+      _updateBitPerfectProcessingLocked,
+    );
+    _uac2Service.dapBitPerfectEnabledNotifier.removeListener(
+      _updateBitPerfectProcessingLocked,
+    );
+    Uac2PreferencesService.tuning432HzNotifier.removeListener(
+      _on432HzTuningChanged,
+    );
+    if (_bitPerfectLockedListener != null) {
+      bitPerfectProcessingLockedNotifier.removeListener(
+        _bitPerfectLockedListener!,
+      );
+    }
+    _sessionManager.dispose();
+    audioOutputDiagnosticsNotifier.dispose();
+    bitPerfectProcessingLockedNotifier.dispose();
+
+    currentSongNotifier.dispose();
+    isPlayingNotifier.dispose();
+    isBufferingNotifier.dispose();
+    onlinePlaybackError.dispose();
+    positionNotifier.dispose();
+    durationNotifier.dispose();
+    bufferedPositionNotifier.dispose();
+    isNetworkLoadingNotifier.dispose();
+    onlinePreparationTitleNotifier.dispose();
+    playbackSpeedNotifier.dispose();
+    pitchSemitonesNotifier.dispose();
+    sleepTimerRemainingNotifier.dispose();
+
+    for (final stagedPath in _stagedPlaybackPathCache.values) {
+      unawaited(_deleteTemporaryPlaybackFile(stagedPath));
+    }
+    // Converted WAVs in _convertedPlaybackPathCache all live in the persistent
+    // wav_cache (manifest-tracked) since 0.21.0; deleting them here silently
+    // defeated persistence. Size is bounded by enforceCacheCap instead.
+  }
+
+  Future<T> _runWithSuppressedSequenceStateUpdates<T>(
+    Future<T> Function() action,
+  ) async {
+    final previousValue = _suppressSequenceStateUpdates;
+    _suppressSequenceStateUpdates = true;
+    try {
+      return await action();
+    } finally {
+      _suppressSequenceStateUpdates = previousValue;
+    }
+  }
+
+  Future<void> _deleteTemporaryPlaybackFile(String path) async {
+    try {
+      final file = File(path);
+      if (await file.exists()) {
+        await file.delete();
+      }
+    } catch (e) {
+      _debugLog('Failed to delete temporary playback file: $e');
+    }
+  }
+
+  // ─── Playback Context ──────────────────────────────────────────────
+
+  void setPlaybackContext(PlaybackContext context) {
+    _playbackContext = context;
+    playbackContextNotifier.value = context;
+    if (context.sourceId != null &&
+        context.source != PlaybackSource.unknown &&
+        context.source != PlaybackSource.allSongs) {
+      _playedCategoryIds.add(context.sourceId!);
+    }
+  }
+
+  // ─── Advance List ──────────────────────────────────────────────────
+
+  void setAdvanceListOrder(AdvanceListOrder order) {
+    _advanceListOrder = order;
+    unawaited(_appPreferencesService.setAdvanceListOrder(order.index));
+  }
+
+  void setWrapAroundQueue(bool value) {
+    wrapAroundQueueNotifier.value = value;
+    unawaited(_appPreferencesService.setWrapAroundQueue(value));
+  }
+
+  void setAutoplayOnQueueEnd(bool value) {
+    autoplayOnQueueEndNotifier.value = value;
+    unawaited(_appPreferencesService.setAutoplayOnQueueEnd(value));
+  }
+
+  // At queue end, use the same recommendations already visible in Queue.
+  // If a skip reached the end before background preparation, resolve a batch
+  // here as a fallback. The remaining recommendations become normal Up Next
+  // entries as soon as playback selects the first.
+  Future<void> _handleQueueEnd() async {
+    final selection = _selectionGeneration;
+    final position = _currentIndex;
+    final selectedTrackId = currentSongNotifier.value?.id;
+    bool stillCurrent() =>
+        selection == _selectionGeneration &&
+        position == _currentIndex &&
+        selectedTrackId == currentSongNotifier.value?.id;
+
+    if (autoplayOnQueueEndNotifier.value && _canPreviewAutoplay) {
+      try {
+        var suggestions = autoplayQueueNotifier.value;
+        if (suggestions.isEmpty) {
+          // Never hold queue completion indefinitely for a network radio
+          // response. Prefer the already-running preview, allow a brief grace
+          // period, then continue with local fallback without a silent gap.
+          final job =
+              _autoplayOnlinePreviewJob ??
+              const OnlineRadioRecommendations().recommend(
+                _playlist.last,
+                count: _autoplayPreviewCount,
+                existing: _playlist,
+              );
+          try {
+            suggestions = await job.timeout(
+              const Duration(milliseconds: 900),
+              onTimeout: () => const <Song>[],
+            );
+          } catch (_) {
+            suggestions = const [];
+          }
+          if (!stillCurrent()) return;
+          if (suggestions.isEmpty) {
+            final library = await _songRepository.getAllSongs();
+            if (!stillCurrent()) return;
+            suggestions = selectAutoplayRecommendations(
+              library: library,
+              excludedIds: {..._playlist.map((song) => song.id)},
+              count: _autoplayPreviewCount,
+            );
+          }
+        }
+        if (!stillCurrent()) return;
+        if (loopModeNotifier.value == LoopMode.all) {
+          if (!isPlayingNotifier.value) await _nextInternal();
+          return;
+        }
+        if (!_canPreviewAutoplay) return;
+        if (suggestions.isNotEmpty) {
+          _autoplayPreviewTimer?.cancel();
+          ++_autoplayPreviewGeneration;
+          autoplayQueueNotifier.value = const [];
+          await _playInternal(suggestions.first, playlist: suggestions);
+          return;
+        }
+      } catch (e) {
+        _debugLog('_handleQueueEnd autoplay error: $e');
+      }
+    }
+    if (!stillCurrent()) return;
+    if (loopModeNotifier.value == LoopMode.all) {
+      if (!isPlayingNotifier.value) await _nextInternal();
+      return;
+    }
+    if (loopModeNotifier.value != LoopMode.off &&
+        !loopModeNotifier.value.isAdvanceMode)
+      return;
+    await _pauseInternal();
+    await seek(Duration.zero);
+  }
+
+  /// Choose a prepared recommendation from Queue rather than recalculating a
+  /// different random song when the user taps a displayed Autoplay result.
+  Future<void> playFromAutoplayIndex(int index) {
+    if (index < 0 || index >= autoplayQueueNotifier.value.length) {
+      return Future<void>.value();
+    }
+    final suggestions = autoplayQueueNotifier.value;
+    final selected = suggestions[index];
+    _cancelPendingPlayback();
+    return play(selected, playlist: suggestions.sublist(index));
+  }
+
+  Future<void> _advanceForMode(LoopMode mode) async {
+    final song = currentSongNotifier.value;
+    if (song == null) {
+      await _handleQueueEnd();
+      return;
+    }
+
+    try {
+      final List<Song>? nextSongs;
+      switch (mode) {
+        case LoopMode.advanceAlbum:
+          nextSongs = await _getNextAlbumSongs(song.album);
+        case LoopMode.advanceArtist:
+          nextSongs = await _getNextArtistSongs(song.artist);
+        case LoopMode.advanceFolder:
+          nextSongs = await _getNextFolderSongs(song.folderUri);
+        case LoopMode.advancePlaylist:
+          nextSongs = await _getNextPlaylistSongs(_playbackContext.sourceId);
+        default:
+          nextSongs = null;
+      }
+
+      if (nextSongs == null || nextSongs.isEmpty) {
+        _debugLog('_advanceForMode($mode): no next category found');
+        await _handleQueueEnd();
+        return;
+      }
+      await _playInternal(nextSongs.first, playlist: nextSongs);
+    } catch (e) {
+      _debugLog('_advanceForMode($mode): error: $e');
+      await _handleQueueEnd();
+    }
+  }
+
+  Future<List<Song>?> _getNextAlbumSongs(String? currentAlbum) async {
+    if (currentAlbum == null) return null;
+    final groups = await _songRepository.getAlbumGroups();
+    if (groups.isEmpty) return null;
+    final sorted = _sortCategories(groups.map((g) => g.albumName).toList());
+    final nextName = _pickNext(sorted, currentAlbum);
+    if (nextName == null) return null;
+    final nextGroup = groups.firstWhere((g) => g.albumName == nextName);
+    setPlaybackContext(
+      PlaybackContext(
+        source: PlaybackSource.album,
+        sourceId: nextName,
+        sourceName: nextName,
+      ),
+    );
+    return nextGroup.songs;
+  }
+
+  Future<List<Song>?> _getNextArtistSongs(String? currentArtist) async {
+    if (currentArtist == null) return null;
+    final artistMap = await _songRepository.getSongsByArtist();
+    if (artistMap.isEmpty) return null;
+    final sorted = _sortCategories(artistMap.keys.toList());
+    final nextName = _pickNext(sorted, currentArtist);
+    if (nextName == null) return null;
+    setPlaybackContext(
+      PlaybackContext(
+        source: PlaybackSource.artist,
+        sourceId: nextName,
+        sourceName: nextName,
+      ),
+    );
+    return artistMap[nextName];
+  }
+
+  Future<List<Song>?> _getNextFolderSongs(String? currentUri) async {
+    if (currentUri == null) return null;
+    final uris = await _songRepository.getUniqueFolderUris();
+    if (uris.isEmpty) return null;
+    final sorted = _sortCategories(uris);
+    final nextUri = _pickNext(sorted, currentUri);
+    if (nextUri == null) return null;
+    final songs = await _songRepository.getSongsByFolder(nextUri);
+    if (songs.isEmpty) return null;
+    final folderName =
+        Uri.tryParse(nextUri)?.pathSegments.lastOrNull ?? nextUri;
+    setPlaybackContext(
+      PlaybackContext(
+        source: PlaybackSource.folder,
+        sourceId: nextUri,
+        sourceName: folderName,
+      ),
+    );
+    return songs;
+  }
+
+  Future<List<Song>?> _getNextPlaylistSongs(String? currentId) async {
+    if (currentId == null) return null;
+    final playlists = await _playlistService.getPlaylists();
+    if (playlists.isEmpty) return null;
+    final sorted = _sortCategories(playlists.map((p) => p.id).toList());
+    final nextId = _pickNext(sorted, currentId);
+    if (nextId == null) return null;
+    final playlist = playlists.firstWhere((p) => p.id == nextId);
+    final allSongs = await _songRepository.getAllSongs();
+    final songIdSet = playlist.songIds.toSet();
+    final songs = allSongs.where((s) => songIdSet.contains(s.id)).toList();
+    if (songs.isEmpty) return null;
+    setPlaybackContext(
+      PlaybackContext(
+        source: PlaybackSource.playlist,
+        sourceId: nextId,
+        sourceName: playlist.name,
+      ),
+    );
+    return songs;
+  }
+
+  List<String> _sortCategories(List<String> items) {
+    switch (_advanceListOrder) {
+      case AdvanceListOrder.alphabetical:
+        return List.of(items)
+          ..sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
+      case AdvanceListOrder.dateAdded:
+        return items;
+      case AdvanceListOrder.random:
+        return List.of(items)..shuffle(math.Random());
+    }
+  }
+
+  String? _pickNext(List<String> sorted, String current) {
+    if (sorted.isEmpty) return null;
+    final idx = sorted.indexOf(current);
+    if (idx == -1) return sorted.first;
+    if (idx >= sorted.length - 1) return null;
+    return sorted[idx + 1];
+  }
+
+  Future<void> _advanceToRandomCategory() async {
+    final ctx = _playbackContext;
+    if (ctx.source == PlaybackSource.unknown ||
+        ctx.source == PlaybackSource.allSongs) {
+      await _handleQueueEnd();
+      return;
+    }
+
+    try {
+      final allIds = await _getAllCategoryIds(ctx.source);
+      var available = allIds
+          .where((id) => !_playedCategoryIds.contains(id))
+          .toList();
+
+      if (available.isEmpty) {
+        if (loopModeNotifier.value == LoopMode.all) {
+          _playedCategoryIds.clear();
+          if (ctx.sourceId != null) _playedCategoryIds.add(ctx.sourceId!);
+          available = allIds
+              .where((id) => !_playedCategoryIds.contains(id))
+              .toList();
+        }
+        if (available.isEmpty) {
+          await _handleQueueEnd();
+          return;
+        }
+      }
+
+      final rng = math.Random();
+      final nextId = available[rng.nextInt(available.length)];
+      final songs = await _getCategorySongsById(ctx.source, nextId);
+      if (songs == null || songs.isEmpty) {
+        await _handleQueueEnd();
+        return;
+      }
+
+      final shouldShuffle =
+          shuffleModeNotifier.value == ShuffleMode.songsAndCategories;
+      final ordered = shouldShuffle
+          ? (List<Song>.of(songs)..shuffle(rng))
+          : songs;
+      await _playInternal(ordered.first, playlist: ordered);
+    } catch (e) {
+      _debugLog('_advanceToRandomCategory error: $e');
+      await _handleQueueEnd();
+    }
+  }
+
+  Future<List<String>> _getAllCategoryIds(PlaybackSource source) async {
+    switch (source) {
+      case PlaybackSource.album:
+        final groups = await _songRepository.getAlbumGroups();
+        return groups.map((g) => g.albumName).toList();
+      case PlaybackSource.artist:
+        final artistMap = await _songRepository.getSongsByArtist();
+        return artistMap.keys.toList();
+      case PlaybackSource.folder:
+        return _songRepository.getUniqueFolderUris();
+      case PlaybackSource.playlist:
+        final playlists = await _playlistService.getPlaylists();
+        return playlists.map((p) => p.id).toList();
+      case PlaybackSource.allSongs:
+      case PlaybackSource.network:
+      case PlaybackSource.unknown:
+        return [];
+    }
+  }
+
+  Future<List<Song>?> _getCategorySongsById(
+    PlaybackSource source,
+    String id,
+  ) async {
+    switch (source) {
+      case PlaybackSource.album:
+        final groups = await _songRepository.getAlbumGroups();
+        final group = groups.where((g) => g.albumName == id).firstOrNull;
+        if (group == null) return null;
+        setPlaybackContext(
+          PlaybackContext(
+            source: PlaybackSource.album,
+            sourceId: id,
+            sourceName: id,
+          ),
+        );
+        return group.songs;
+      case PlaybackSource.artist:
+        final artistMap = await _songRepository.getSongsByArtist();
+        final songs = artistMap[id];
+        if (songs == null) return null;
+        setPlaybackContext(
+          PlaybackContext(
+            source: PlaybackSource.artist,
+            sourceId: id,
+            sourceName: id,
+          ),
+        );
+        return songs;
+      case PlaybackSource.folder:
+        final songs = await _songRepository.getSongsByFolder(id);
+        if (songs.isEmpty) return null;
+        final folderName = Uri.tryParse(id)?.pathSegments.lastOrNull ?? id;
+        setPlaybackContext(
+          PlaybackContext(
+            source: PlaybackSource.folder,
+            sourceId: id,
+            sourceName: folderName,
+          ),
+        );
+        return songs;
+      case PlaybackSource.playlist:
+        final playlist = await _playlistService.getPlaylist(id);
+        if (playlist == null) return null;
+        final allSongs = await _songRepository.getAllSongs();
+        final songIdSet = playlist.songIds.toSet();
+        final songs = allSongs.where((s) => songIdSet.contains(s.id)).toList();
+        if (songs.isEmpty) return null;
+        setPlaybackContext(
+          PlaybackContext(
+            source: PlaybackSource.playlist,
+            sourceId: id,
+            sourceName: playlist.name,
+          ),
+        );
+        return songs;
+      case PlaybackSource.allSongs:
+      case PlaybackSource.network:
+      case PlaybackSource.unknown:
+        return null;
+    }
+  }
+
+  // ─── A-B Repeat ────────────────────────────────────────────────────
+
+  void setAbRepeatA() {
+    abRepeatANotifier.value = positionNotifier.value;
+  }
+
+  void setAbRepeatB() {
+    final b = positionNotifier.value;
+    final a = abRepeatANotifier.value;
+    if (a == null || b <= a) return;
+    abRepeatBNotifier.value = b;
+  }
+
+  void clearAbRepeat() {
+    abRepeatANotifier.value = null;
+    abRepeatBNotifier.value = null;
+  }
+
+  bool get isAbRepeatActive =>
+      abRepeatANotifier.value != null && abRepeatBNotifier.value != null;
+
+  void checkAbRepeatBoundary(Duration position) {
+    final a = abRepeatANotifier.value;
+    final b = abRepeatBNotifier.value;
+    if (a == null || b == null) return;
+    if (position >= b) {
+      seek(a);
+    }
+  }
+}
+
+class _QueueEntry {
+  final int id;
+  final Song song;
+
+  const _QueueEntry({required this.id, required this.song});
+}
+
+class _MutableValueNotifier<T> extends ValueNotifier<T> {
+  _MutableValueNotifier(super.value) : _currentValue = value;
+
+  T _currentValue;
+
+  @override
+  T get value => _currentValue;
+
+  @override
+  set value(T newValue) {
+    if (identical(_currentValue, newValue)) {
+      return;
+    }
+    _currentValue = newValue;
+    notifyListeners();
+  }
+}
+
+class _ShuffleBoolNotifier extends ValueNotifier<bool> {
+  _ShuffleBoolNotifier(this._source) : super(_source.value.isActive) {
+    _source.addListener(_sync);
+  }
+
+  final ValueNotifier<ShuffleMode> _source;
+
+  void _sync() {
+    final active = _source.value.isActive;
+    if (value != active) {
+      value = active;
+    }
+  }
+
+  @override
+  set value(bool newValue) {
+    super.value = newValue;
+    if (newValue && !_source.value.isActive) {
+      _source.value = ShuffleMode.songs;
+    } else if (!newValue && _source.value.isActive) {
+      _source.value = ShuffleMode.off;
+    }
+  }
+
+  @override
+  void dispose() {
+    _source.removeListener(_sync);
+    super.dispose();
+  }
+}

@@ -1,0 +1,35 @@
+group 'com.zarz.mornye.discord'
+version '0.1.0'
+
+apply plugin: 'com.android.library'
+// AGP 9 built-in Kotlin, matching the host application.
+
+def sdkRoot = file('../sdk')
+def sdkEnabled = new File(sdkRoot, 'discord_partner_sdk.aar').isFile()
+if (sdkEnabled && !new File(sdkRoot, 'notices/Discord-License-Notices.txt').isFile()) {
+    throw new GradleException('Discord SDK license notices are missing. Run tool/setup_discord_sdk.py.')
+}
+
+android {
+    namespace 'com.zarz.mornye.discord'
+    compileSdk 37
+    ndkVersion '28.2.13676358'
+    defaultConfig {
+        minSdk 26
+        buildConfigField 'boolean', 'DISCORD_SDK_ENABLED', sdkEnabled.toString()
+        if (sdkEnabled) {
+            externalNativeBuild {
+                cmake { arguments '-DANDROID_STL=c++_static', '-DMORNYE_DISCORD_SDK=ON' }
+            }
+        }
+    }
+    buildFeatures { buildConfig true }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    if (sdkEnabled) sourceSets.main.assets.srcDir('../sdk/notices')
+    if (sdkEnabled) {
+        externalNativeBuild { cmake { path 'CMakeLists.txt'; version '3.22.1' } }
+    }
+}

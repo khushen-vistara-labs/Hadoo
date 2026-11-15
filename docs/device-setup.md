@@ -1,63 +1,40 @@
-# Device setup
+# Install or update Hadoo
 
-## Use your existing patched app's signing identity
+Hadoo's current preview is build **2015**. The Android preview targets ARM64 phones on Android 8.0 (API 26) or later. The iPhone project targets iOS 16 or later. See [platform status](mobile-rewrite.md) for the devices tested.
 
-1. On your phone open **Morphe Manager → Settings → Signing key → Export**.
-2. Save `Morphe.keystore` to Downloads and copy it to your computer.
-3. Run `./hadoo import-key /path/to/Morphe.keystore`.
-4. Keep that original exported file backed up privately. A settings export does
-   not include the keystore.
+Get matching artifacts from [GitHub Releases](https://github.com/khushen-vistara-labs/Hadoo/releases) when available, or follow [Build from source](build.md). A GitHub source ZIP contains code. Choose an APK for Android or an IPA for signing on iPhone.
 
-Hadoo stores the imported copy at `.hadoo-local/signing/morphe.keystore` with
-owner-only file permissions. It refuses to overwrite a different key.
+## Android
 
-For a key with custom credentials, set `HADOO_KEYSTORE_PASSWORD`,
-`HADOO_KEY_PASSWORD`, and `HADOO_KEY_ALIAS` in your local shell before building.
-Do not commit shell exports or include credentials in issue reports. Manager's
-standard exported key normally works without overrides.
+1. Transfer the APK to your phone and open it from Files or Downloads. If Android asks, enable **Allow from this source** for the app opening the file. You can turn the permission off after installation.
+2. Install the APK, open **Hadoo**, and tap **Start listening**. Search for a song to confirm that the installation can reach YouTube Music.
 
-## Copy the original APK over USB
-
-Enable USB debugging in Android developer options, connect the phone, and accept
-its USB debugging authorization. Check `adb devices` for the device.
+For USB installation, enable USB debugging, connect and unlock the phone, and accept the computer's authorization prompt. Add Android Platform Tools to your PATH, then use these commands from the repository root. [Android Platform Tools](https://developer.android.com/tools/releases/platform-tools)
 
 ```sh
-mkdir -p .hadoo-local/input
-adb pull '/sdcard/Download/your-original-youtube-music.apk' .hadoo-local/input/youtube-music.apk
-./hadoo setup
-./hadoo build .hadoo-local/input/youtube-music.apk
-./hadoo install
+adb devices
+adb install -r mobile/build/app/outputs/flutter-apk/app-full-debug.apk
 ```
 
-Use a full APK signed by Google. Hadoo rejects unsupported versions, patched
-inputs, standalone split APKs and unrecognized signing certificates. It accepts
-Google's signing-key rotation while distinguishing the Google Play distribution
-source stamp from APK signing certificates.
+Use a build with the **same package ID and signing key** to keep data in an existing install. Local debug APKs use `com.icemonkey.hadoo.test` and the debug key on the computer that built them. Release builds use `com.icemonkey.hadoo` and the maintainer's release key. If you have an existing preview, use the same build computer and key for subsequent debug updates. See [Android install errors](troubleshooting.md#android-installation) before removing any existing copy.
 
-## Install and check
+## iPhone
 
-`./hadoo install` targets the last verified build, checks its saved checksum, and
-uses `adb install -r`. Add `--serial DEVICE` if more than one phone is connected.
-Android refuses a mismatched signature; Hadoo never resolves this by uninstalling
-an app or clearing its data. Import the matching Manager keystore and rebuild.
+Build 2015 was installed through AltStore Classic, which signs the IPA with your Apple Account for personal use. To build your own IPA, use the [iPhone build and packaging steps](build.md#iphone).
 
-Install **MicroG RE** from [Morphe's official releases](https://github.com/MorpheApp/MicroG-RE/releases)
-and keep it installed. The Hadoo build uses the normal Morphe package identity
-and the companion package `app.revanced.android.gms`. Morphe Manager is not
-required to run a prebuilt Hadoo APK. Sign in separately on each phone to access
-your Google library; an existing MicroG RE installation can be shared with other
-compatible patched apps on the same phone.
+1. Install AltServer on your computer. Plug in your unlocked iPhone, tap **Trust** when prompted, and use **AltServer → Install AltStore** to select the iPhone. [macOS instructions](https://faq.altstore.io/altstore-classic/how-to-install-altstore-macos) · [Windows instructions](https://faq.altstore.io/altstore-classic/how-to-install-altstore-windows)
+2. If prompted, trust the developer account in **Settings → General → VPN & Device Management**. Turn on [Developer Mode](https://developer.apple.com/documentation/xcode/enabling-developer-mode-on-a-device) and confirm it after the phone restarts.
+3. Save the Hadoo IPA to Files. In AltStore, open **My Apps → +**, select the IPA, and wait for Hadoo to appear in My Apps. Use the same Apple Account for AltStore and the Hadoo install.
+4. Launch Hadoo from the Home Screen. You can unplug the phone once the app is installed.
 
-The previous React Native Hadoo app can remain installed until you decide what
-to do with its local playlists and downloads. Its package is separate.
+### Refresh or update on iPhone
 
-Fresh installations include the Hadoo header, Home/Search/Library navigation,
-hidden Samples/Upgrade tabs and audio-only preferences. These defaults are built
-into the APK; no per-phone settings import is needed. Existing saved settings
-survive updates and can be changed in Settings → Hadoo settings (Morphe on older
-builds) or Settings → Data saving for native audio preferences.
+With a free Apple Account, the signature lasts seven days from a successful signing or refresh. In **AltStore → My Apps**, check the countdown and tap **Refresh All** while your iPhone can reach AltServer. For the standard setup, use the same Wi-Fi network or a USB connection to the computer. AltStore can also attempt refreshes in the background. Sign in again if prompted, then verify that the countdown reset. [AltStore Classic refresh guide](https://faq.altstore.io/altstore-classic/your-altstore)
 
-Test songs, next/previous, lock-screen controls, background playback and real
-offline downloads. Retain an older working APK in local storage for troubleshooting.
+If Hadoo expires, keep it installed and refresh it in AltStore. If AltStore also expires, reinstall **AltStore over its existing copy** with AltServer and the same Apple Account, then open it and refresh Hadoo. An expired signature prevents launch. Keeping the existing app and signing identity gives the in-place update access to its saved data. [AltServer recovery guide](https://faq.altstore.io/altstore-classic/altserver)
 
-Reference: [Morphe signing and backup guide](https://github.com/MorpheApp/morphe-manager/blob/main/docs/backup-and-keystore.md).
+To update Hadoo itself, open the newer IPA using **My Apps → +** with the same signing account and base bundle ID. To run a build you built from source directly through Xcode, see [Build from source](build.md#sign-with-xcode).
+
+## Earlier Hadoo installs
+
+The earlier patched APK has a separate identity and private app storage. Account sessions, downloads, and playlists from that app require separate handling. See the [legacy guide](legacy-morphe.md) before changing or removing that installation.

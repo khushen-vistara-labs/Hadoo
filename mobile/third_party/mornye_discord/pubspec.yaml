@@ -1,0 +1,15 @@
+name: mornye_discord
+description: Android Discord Social SDK bridge adapted from Mornye.
+version: 0.1.0
+publish_to: none
+environment:
+  sdk: ^3.13.0
+dependencies:
+  flutter:
+    sdk: flutter
+flutter:
+  plugin:
+    platforms:
+      android:
+        package: com.zarz.mornye.discord
+        pluginClass: DiscordPresencePlugin

@@ -1,0 +1,819 @@
+import 'package:flick/features/search/providers/search_filter_provider.dart';
+
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+
+import 'package:flick/data/entities/song_entity.dart';
+import 'package:flick/features/discovery/discovery_artwork.dart';
+import 'package:flick/features/discovery/discovery_http.dart';
+import 'package:flick/features/discovery/discovery_models.dart';
+import 'package:flick/features/discovery/lastfm_discovery.dart';
+import 'package:flick/features/discovery/youtube_music_account.dart';
+import 'package:flick/features/hadoo/youtube_public_playlist_provider.dart';
+import 'package:flick/features/konnekted/konnekted_discovery.dart';
+import 'package:flick/features/search/library_download.dart';
+import 'package:flick/features/search/widgets/online_search_section.dart';
+import 'package:flick/models/song.dart';
+import 'package:flick/providers/player_provider.dart';
+import 'package:flick/services/queue_pre_resolver.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:http/http.dart' as http;
+import 'package:http/testing.dart';
+import 'package:path/path.dart' as p;
+import 'package:flick/widgets/lokal/lokal_toast.dart';
+
+OnlineSource _source(
+  String id,
+  String name,
+  List<String> titles, {
+  bool atmos = false,
+  String? quality,
+}) => OnlineSource(
+  id: id,
+  name: name,
+  addon: id != 'yt',
+  results: (query) async => [
+    for (final title in titles)
+      OnlineResult(
+        DiscoveryTrack(
+          id: '$id-$title',
+          title: title,
+          artist: 'Artist',
+          source: DiscoverySource.morneye,
+          atmosAvailable: atmos,
+          catalogueQuality: quality,
+        ),
+      ),
+  ],
+  play: (_) async => throw const DiscoveryException('No stream'),
+);
+
+final _nowPlaying = Song(
+  id: 'now',
+  title: 'Now playing',
+  artist: 'Someone',
+  duration: const Duration(minutes: 3),
+  fileType: 'FLAC',
+  filePath: '/library/now.flac',
+);
+
+class _FakePlayer extends PlayerNotifier {
+  _FakePlayer({this.current});
+
+  final Song? current;
+  final queued = <Song>[];
+  final played = <Song>[];
+  final playedPlaylists = <List<Song>>[];
+
+  @override
+  Future<void> play(
+    Song song, {
+    List<Song>? playlist,
+    int? playlistIndex,
+    PlaybackContext? context,
+  }) async {
+    played.add(song);
+    playedPlaylists.add(List<Song>.of(playlist ?? const []));
+  }
+
+  final movedToNext = <int>[];
+
+  @override
+  PlayerState build() => PlayerState(currentSong: current);
+
+  @override
+  Future<int> addToQueue(Song song) async {
+    queued.add(song);
+    return queued.length - 1;
+  }
+
+  @override
+  Future<void> moveQueueItemToNext(int index) async => movedToNext.add(index);
+}
+
+// Layout tests do not start independent network portrait operations.
+class _QuietArtwork extends DiscoveryArtworkResolver {
+  _QuietArtwork()
+    : super(DiscoveryHttp(MockClient((_) async => http.Response('{}', 200))));
+  @override
+  Future<String> resolve(DiscoveryArtworkRequest request) async => '';
+}
+
+final _quietArtwork = [
+  discoveryLocalArtworkProvider.overrideWithValue(DiscoveryLocalArtwork.empty),
+  discoveryArtworkResolverProvider.overrideWithValue(_QuietArtwork()),
+];
+
+Future<void> _pump(
+  WidgetTester tester, {
+  required List<OnlineSource> sources,
+  _FakePlayer? player,
+  Song Function(OnlineSource, DiscoveryTrack)? pendingSong,
+  Future<Song> Function(OnlineSource, DiscoveryTrack, void Function(String))?
+  prepare,
+  LibraryDownloader? downloader,
+  Future<String?> Function(String, Future<void>)? qualityLookup,
+  DiscoveryLocalArtwork? localArtwork,
+  DiscoveryArtworkResolver? artworkResolver,
+}) async {
+  await tester.pumpWidget(
+    ProviderScope(
+      overrides: [
+        konnektedYoutubeMusicAccountProvider.overrideWithValue(null),
+        youtubePublicPlaylistDetailsProvider.overrideWith(
+          (ref, id) async =>
+              const YoutubeMusicPlaylistDetails(tracks: [], editable: false),
+        ),
+        if (localArtwork == null && artworkResolver == null)
+          ..._quietArtwork
+        else ...[
+          discoveryLocalArtworkProvider.overrideWithValue(
+            localArtwork ?? DiscoveryLocalArtwork.empty,
+          ),
+          discoveryArtworkResolverProvider.overrideWithValue(
+            artworkResolver ?? _QuietArtwork(),
+          ),
+        ],
+        if (player != null) playerProvider.overrideWith(() => player),
+      ],
+      child: MaterialApp(
+        home: Scaffold(
+          body: CustomScrollView(
+            slivers: [
+              OnlineSearchSection(
+                query: 'song',
+                sources: (_, _) async => sources,
+                qualityLookup: qualityLookup ?? (_, _) async => null,
+                pendingSong:
+                    pendingSong ??
+                    (source, track) => onlinePendingSong(
+                      source.id,
+                      track,
+                      resolver: QueuePreResolver(),
+                    ),
+                prepare: prepare,
+                downloader: downloader,
+              ),
+            ],
+          ),
+        ),
+      ),
+    ),
+  );
+  await tester.pumpAndSettle();
+}
+
+void main() {
+  testWidgets('typed YouTube results filter and open public playlists', (
+    tester,
+  ) async {
+    final yt = OnlineSource(
+      id: 'yt',
+      name: 'YouTube Music',
+      results: (_) async => [
+        const OnlineResult(
+          DiscoveryTrack(
+            id: 'abcdefghijk',
+            title: 'A song',
+            artist: 'Artist',
+            source: DiscoverySource.youtubeMusic,
+          ),
+        ),
+      ],
+      videos: (_) async => [
+        const OnlineResult(
+          DiscoveryTrack(
+            id: 'lmnopqrstuv',
+            title: 'A video',
+            artist: 'Artist',
+            source: DiscoverySource.youtubeMusic,
+            kind: DiscoveryTrackKind.video,
+          ),
+        ),
+      ],
+      playlists: (_) async => [
+        const LokalDiscoveryMix(id: 'PLexample', title: 'Road trip'),
+      ],
+      play: (_) async => throw StateError('No playback in layout test'),
+    );
+    await _pump(tester, sources: [yt]);
+    expect(find.text('Song · YouTube Music'), findsOneWidget);
+    expect(find.text('Road trip'), findsOneWidget);
+    await tester.longPress(find.text('A song'));
+    await tester.pumpAndSettle();
+    expect(find.text('Play YouTube video'), findsOneWidget);
+    final openYoutube = find.text('Open in YouTube Music');
+    expect(openYoutube, findsOneWidget);
+    Navigator.of(tester.element(openYoutube)).pop();
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Videos'));
+    await tester.pumpAndSettle();
+    expect(find.text('Video · YouTube Music'), findsOneWidget);
+    expect(find.text('A song'), findsNothing);
+    await tester.tap(find.text('Playlists'));
+    await tester.pumpAndSettle();
+    expect(find.text('A video'), findsNothing);
+    await tester.tap(find.text('Road trip'));
+    await tester.pumpAndSettle();
+    expect(find.text('No tracks in this playlist.'), findsOneWidget);
+    expect(find.byTooltip('Playlist options'), findsNothing);
+  });
+  testWidgets(
+    'Search scopes retain online results without redundant library headings',
+    (tester) async {
+      await _pump(
+        tester,
+        sources: [
+          _source('yt', 'YouTube Music', ['Online song']),
+        ],
+      );
+      final container = ProviderScope.containerOf(
+        tester.element(find.byType(OnlineSearchSection)),
+      );
+      expect(find.text('Not in your library'), findsNothing);
+      container.read(searchScopeProvider.notifier).select(SearchScope.online);
+      await tester.pumpAndSettle();
+      expect(find.text('Not in your library'), findsNothing);
+      expect(find.text('In your library'), findsNothing);
+      expect(find.text('Online song'), findsOneWidget);
+      container.read(searchScopeProvider.notifier).select(SearchScope.library);
+      await tester.pumpAndSettle();
+      expect(find.text('Not in your library'), findsNothing);
+      expect(find.text('Online song'), findsOneWidget);
+    },
+  );
+
+  setUp(OnlineSearchSection.resetSourceSelection);
+  tearDown(LokalToast.dismiss);
+  testWidgets(
+    'Atmos action sheet scrolls to its final action on a short screen',
+    (tester) async {
+      tester.view.physicalSize = const Size(390, 320);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      await _pump(
+        tester,
+        sources: [
+          _source('tidal', 'Tidal', ['Short screen'], atmos: true),
+        ],
+      );
+      await tester.longPress(find.text('Short screen'));
+      await tester.pumpAndSettle();
+      await tester.ensureVisible(find.text('Download Dolby Atmos'));
+      await tester.pumpAndSettle();
+      expect(find.text('Download Dolby Atmos').hitTestable(), findsOneWidget);
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets(
+    'YouTube badges display measured audio once inspection completes',
+    (tester) async {
+      await _pump(
+        tester,
+        sources: [
+          _source('yt', 'YouTube Music', ['Measured song']),
+        ],
+        qualityLookup: (_, _) async => 'OPUS · 160 kbps',
+      );
+      expect(find.text('OPUS · 160 kbps'), findsOneWidget);
+      expect(
+        find.byTooltip(
+          'Audio details from a resolved stream, not inferred from search metadata.',
+        ),
+        findsOneWidget,
+      );
+    },
+  );
+
+  testWidgets(
+    'Atmos availability is shown in search without promising playback',
+    (tester) async {
+      await _pump(
+        tester,
+        sources: [
+          _source(
+            'a-tidal',
+            'Tidal',
+            ['Immersive catalogue track'],
+            atmos: true,
+            quality: '24bit/96kHz',
+          ),
+          _source('yt', 'YouTube Music', ['Stereo only']),
+        ],
+      );
+      await tester.tap(find.text('Tidal'));
+      await tester.pumpAndSettle();
+      expect(find.text('Immersive catalogue track'), findsOneWidget);
+      expect(find.text('ATMOS'), findsOneWidget);
+      expect(find.text('24-bit / 96 kHz'), findsOneWidget);
+      await tester.longPress(find.text('Immersive catalogue track'));
+      await tester.pumpAndSettle();
+      expect(find.text('Play Dolby Atmos'), findsOneWidget);
+      expect(find.text('Download Dolby Atmos'), findsOneWidget);
+      tester.state<NavigatorState>(find.byType(Navigator)).pop();
+      await tester.pumpAndSettle();
+      // The Tidal catalogue mode belongs to search metadata. It is not
+      // promoted into a verified playback-quality or output badge.
+      await tester.tap(find.text('YouTube Music'));
+      await tester.pumpAndSettle();
+      expect(find.text('Stereo only'), findsOneWidget);
+      expect(find.text('ATMOS'), findsNothing);
+      await tester.longPress(find.text('Stereo only'));
+      await tester.pumpAndSettle();
+      expect(find.text('Play Dolby Atmos'), findsNothing);
+      expect(find.text('Download Dolby Atmos'), findsNothing);
+    },
+  );
+
+  testWidgets(
+    'Search shows measured quality without inventing badges for unspecified tracks',
+    (tester) async {
+      final httpAddon = OnlineSource(
+        id: 'w-http-quality',
+        name: 'HTTP Audio',
+        addon: true,
+        results: (_) async => [
+          const OnlineResult(
+            DiscoveryTrack(
+              id: 'lossless',
+              title: 'Reported FLAC',
+              artist: 'Artist',
+              source: DiscoverySource.addon,
+              catalogueCodec: 'FLAC',
+              catalogueBitDepth: 24,
+              catalogueSampleRate: 96000,
+            ),
+          ),
+          const OnlineResult(
+            DiscoveryTrack(
+              id: 'unknown',
+              title: 'Unspecified codec',
+              artist: 'Artist',
+              source: DiscoverySource.addon,
+            ),
+          ),
+        ],
+        play: (_) async => throw const DiscoveryException('not needed'),
+      );
+      await _pump(tester, sources: [httpAddon]);
+      expect(find.text('Reported FLAC'), findsOneWidget);
+      expect(find.text('FLAC · 24-bit · 96 kHz'), findsOneWidget);
+      expect(find.text('Quality unknown'), findsNothing);
+    },
+  );
+
+  testWidgets(
+    'YouTube Search does not invent codec or bitrate before stream inspection',
+    (tester) async {
+      final youtube = OnlineSource(
+        id: 'yt',
+        name: 'YouTube Music',
+        results: (_) async => [
+          const OnlineResult(
+            DiscoveryTrack(
+              id: 'yt-song',
+              title: 'YouTube Song',
+              artist: 'Artist',
+              source: DiscoverySource.youtubeMusic,
+            ),
+          ),
+        ],
+        play: (_) async => throw const DiscoveryException('not needed'),
+      );
+      await _pump(tester, sources: [youtube]);
+      expect(find.text('YouTube Song'), findsOneWidget);
+      expect(find.text('AAC / Opus · adaptive'), findsNothing);
+      expect(find.text('Quality unknown'), findsNothing);
+      expect(find.textContaining('kbps'), findsNothing);
+    },
+  );
+
+  testWidgets('tap shows preparation toast before slow provider verification', (
+    tester,
+  ) async {
+    final verified = Completer<bool>();
+    final player = _FakePlayer();
+    final source = OnlineSource(
+      id: 'slow-http',
+      name: 'HTTP Music',
+      addon: true,
+      verify: (_) => verified.future,
+      results: (_) async => [
+        const OnlineResult(
+          DiscoveryTrack(
+            id: 'song',
+            title: 'Preparing now',
+            artist: 'Artist',
+            source: DiscoverySource.addon,
+          ),
+        ),
+      ],
+      play: (_) async => throw StateError('not reached'),
+    );
+    await _pump(tester, sources: [source], player: player);
+    await tester.tap(find.text('Preparing now'));
+    await tester.pump();
+    expect(find.textContaining('Preparing Preparing now'), findsOneWidget);
+    expect(player.played, isEmpty);
+    verified.complete(true);
+    await tester.pumpAndSettle();
+    expect(player.played.single.title, 'Preparing now');
+  });
+
+  testWidgets('add-ons appear as sources and their results play on tap', (
+    tester,
+  ) async {
+    final player = _FakePlayer();
+    final resolver = QueuePreResolver();
+    await _pump(
+      tester,
+      player: player,
+      pendingSong: (source, track) =>
+          onlinePendingSong(source.id, track, resolver: resolver),
+      sources: [
+        _source('yt', 'YouTube Music', ['From YouTube']),
+        _source('a-tidal', 'Tidal', ['From Tidal']),
+      ],
+    );
+    expect(find.text('From YouTube'), findsOneWidget);
+
+    await tester.tap(find.text('Tidal'));
+    await tester.pumpAndSettle();
+    expect(find.text('From Tidal'), findsOneWidget);
+    expect(find.text('From an add-on you installed'), findsNothing);
+
+    await tester.tap(find.text('From Tidal'));
+    await tester.pumpAndSettle();
+    expect(player.played.single.title, 'From Tidal');
+    expect(player.played.single.isPending, isTrue);
+  });
+
+  testWidgets(
+    'LastWave Search local cover is handed to the player immediately',
+    (tester) async {
+      const cover = 'https://covers.example/lastwave-from-library.jpg';
+      final player = _FakePlayer();
+      final local = DiscoveryLocalArtwork([
+        const Song(
+          id: 'owned',
+          title: 'From LastWave',
+          artist: 'Artist',
+          albumArt: cover,
+          fileType: 'FLAC',
+          duration: Duration(minutes: 3),
+        ),
+      ]);
+      final source = OnlineSource(
+        id: 'w-lastwave',
+        name: 'LastWave',
+        addon: true,
+        results: (_) async => [
+          const OnlineResult(
+            DiscoveryTrack(
+              id: 'lastwave-song',
+              title: 'From LastWave',
+              artist: 'Artist',
+              source: DiscoverySource.addon,
+            ),
+          ),
+        ],
+        play: (_) async => throw StateError('not reached'),
+      );
+      await _pump(
+        tester,
+        player: player,
+        sources: [source],
+        localArtwork: local,
+        pendingSong: (source, track) =>
+            onlinePendingSong(source.id, track, resolver: QueuePreResolver()),
+      );
+      await tester.tap(find.text('From LastWave'));
+      await tester.pumpAndSettle();
+      expect(player.played.single.albumArt, cover);
+      expect(player.played.single.isPending, isTrue);
+      expect(player.playedPlaylists.single.single.albumArt, cover);
+    },
+  );
+
+  testWidgets('LastWave Search cached online cover stays on play and queue', (
+    tester,
+  ) async {
+    const cover = 'https://is7-ssl.mzstatic.com/lastwave-600x600bb.jpg';
+    final client = MockClient((request) async {
+      if (request.url.host == 'api.deezer.com')
+        return http.Response('{"data":[]}', 200);
+      if (request.url.host == 'itunes.apple.com') {
+        return http.Response(
+          jsonEncode({
+            'results': [
+              {
+                'trackName': 'From LastWave',
+                'artistName': 'Artist',
+                'artworkUrl100':
+                    'https://is7-ssl.mzstatic.com/lastwave-100x100bb.jpg',
+              },
+            ],
+          }),
+          200,
+        );
+      }
+      fail('Unexpected artwork network request');
+    });
+    addTearDown(client.close);
+    final resolver = DiscoveryArtworkResolver(DiscoveryHttp(client));
+    const request = DiscoveryArtworkRequest(
+      kind: DiscoveryArtworkKind.track,
+      artist: 'Artist',
+      title: 'From LastWave',
+    );
+    expect(await tester.runAsync(() => resolver.resolve(request)), cover);
+    final player = _FakePlayer(current: _nowPlaying);
+    final source = OnlineSource(
+      id: 'w-lastwave',
+      name: 'LastWave',
+      addon: true,
+      results: (_) async => [
+        const OnlineResult(
+          DiscoveryTrack(
+            id: 'lastwave-song',
+            title: 'From LastWave',
+            artist: 'Artist',
+            source: DiscoverySource.addon,
+          ),
+        ),
+      ],
+      play: (_) async => throw StateError('not reached'),
+    );
+    await _pump(
+      tester,
+      player: player,
+      sources: [source],
+      artworkResolver: resolver,
+      pendingSong: (source, track) =>
+          onlinePendingSong(source.id, track, resolver: QueuePreResolver()),
+    );
+    await tester.longPress(find.text('From LastWave'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Play next'));
+    await tester.pumpAndSettle();
+    expect(player.queued.single.albumArt, cover);
+    expect(player.queued.single.isPending, isTrue);
+    LokalToast.dismiss();
+    await tester.pumpWidget(const SizedBox());
+  });
+
+  test(
+    'a queued online track preserves its provider artwork without Search UI',
+    () {
+      const cover = 'https://covers.example/lastwave-provider.jpg';
+      final pending = onlinePendingSong(
+        'w-lastwave',
+        const DiscoveryTrack(
+          id: 'lastwave-song',
+          title: 'From LastWave',
+          artist: 'Artist',
+          source: DiscoverySource.addon,
+          artwork: cover,
+        ),
+        resolver: QueuePreResolver(),
+      );
+      expect(pending.albumArt, cover);
+      expect(pending.isPending, isTrue);
+    },
+  );
+
+  testWidgets(
+    'tapping a middle online result enqueues following search results',
+    (tester) async {
+      final player = _FakePlayer();
+      final resolver = QueuePreResolver();
+      await _pump(
+        tester,
+        player: player,
+        pendingSong: (source, track) =>
+            onlinePendingSong(source.id, track, resolver: resolver),
+        sources: [
+          _source('yt', 'YouTube Music', [
+            'Result one',
+            'Result two',
+            'Result three',
+            'Result four',
+          ]),
+        ],
+      );
+      await tester.tap(find.text('Result two'));
+      await tester.pumpAndSettle();
+      expect(player.played.single.title, 'Result two');
+      final playlist = player.playedPlaylists.single;
+      expect(playlist.map((s) => s.title), [
+        'Result one',
+        'Result two',
+        'Result three',
+        'Result four',
+      ]);
+      expect(playlist.every((song) => song.isPending), true);
+      expect(playlist[2].title, 'Result three');
+    },
+  );
+
+  testWidgets(
+    'a downloaded source awaiting verification stays visible and verifies when selected',
+    (tester) async {
+      var locked = true;
+      var verified = 0, searched = 0;
+      final source = OnlineSource(
+        id: 'locked-addon',
+        name: 'Locked source',
+        addon: true,
+        needsVerification: () => locked,
+        verify: (_) async {
+          verified++;
+          locked = false;
+          return true;
+        },
+        results: (_) async {
+          searched++;
+          return [];
+        },
+        play: (_) async => throw StateError('not used'),
+      );
+      await _pump(
+        tester,
+        sources: [source, _source('yt', 'YouTube Music', [])],
+      );
+      expect(find.text('Locked source'), findsOneWidget);
+      expect(find.text('Verify Locked source to search'), findsOneWidget);
+      expect(searched, 0);
+      await tester.tap(find.text('Locked source'));
+      await tester.pumpAndSettle();
+      expect(verified, 1);
+      expect(searched, 1);
+      expect(find.text('Verify Locked source to search'), findsNothing);
+    },
+  );
+
+  testWidgets('a long press offers play, queue and download actions', (
+    tester,
+  ) async {
+    await _pump(
+      tester,
+      sources: [
+        _source('yt', 'YouTube Music', ['Song A']),
+      ],
+    );
+    await tester.longPress(find.text('Song A'));
+    await tester.pumpAndSettle();
+    for (final label in [
+      'Play',
+      'Play next',
+      'Add to queue',
+      'Download to library',
+    ]) {
+      expect(find.text(label), findsOneWidget);
+    }
+    expect(find.text('Artist · YouTube Music'), findsOneWidget);
+  });
+
+  testWidgets('Play next queues a placeholder that resolves ahead', (
+    tester,
+  ) async {
+    final player = _FakePlayer(current: _nowPlaying);
+    final resolver = QueuePreResolver();
+    await _pump(
+      tester,
+      sources: [
+        _source('yt', 'YouTube Music', ['Song A']),
+      ],
+      player: player,
+      pendingSong: (source, track) =>
+          onlinePendingSong(source.id, track, resolver: resolver),
+    );
+
+    await tester.tap(find.byTooltip('More'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Play next'));
+    await tester.pumpAndSettle();
+
+    final pending = player.queued.single;
+    expect(pending.isPending, isTrue);
+    expect(pending.title, 'Song A');
+    expect(pending.artist, 'Artist');
+    expect(player.movedToNext, [0]);
+    expect(find.text('Song A plays next'), findsOneWidget);
+
+    await tester.longPress(find.text('Song A'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Add to queue'));
+    await tester.pumpAndSettle();
+    expect(player.queued, hasLength(2));
+    expect(player.movedToNext, [0], reason: 'Add to queue goes at the end');
+    expect(find.text('Added Song A to the queue'), findsOneWidget);
+    await tester.pump(const Duration(seconds: 4));
+    await tester.pumpAndSettle();
+  });
+
+  testWidgets('Download to library fetches the song and saves it', (
+    tester,
+  ) async {
+    late Directory root;
+    late File cached;
+    final saved = <SongEntity>[];
+    await tester.runAsync(() async {
+      root = await Directory.systemTemp.createTemp('online_download_test');
+      cached = File(p.join(root.path, 'cache.m4a'))
+        ..writeAsBytesSync(List.filled(16, 1));
+      Directory(p.join(root.path, 'Library')).createSync();
+    });
+    addTearDown(() => root.deleteSync(recursive: true));
+
+    final fetched = <String>[];
+    await _pump(
+      tester,
+      sources: [
+        _source('yt', 'YouTube Music', ['Song A']),
+      ],
+      prepare: (source, track, onStatus) async {
+        fetched.add('${source.id}:${track.id}');
+        return Song(
+          id: 'discovery:1',
+          title: track.title,
+          artist: track.artist,
+          duration: const Duration(minutes: 3),
+          fileType: 'M4A',
+          filePath: cached.path,
+        );
+      },
+      downloader: LibraryDownloader(
+        folders: () async => [
+          LibraryDownloadFolder(
+            uri: 'content://music',
+            name: 'Music',
+            path: p.join(root.path, 'Library'),
+          ),
+        ],
+        fallbackRoot: p.join(root.path, 'Fallback'),
+        registerFolder: (_, _) async {},
+        upsert: (entity) async => saved.add(entity),
+        tag: (_, _, _) async => true,
+        lyricsLookup: (_) async => null,
+        cover: (_, _, _) async {},
+        indexMedia: (_) async {},
+      ),
+    );
+
+    await tester.longPress(find.text('Song A'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Download to library'));
+    // The copy is real file work: let it run between frames.
+    final done = find.textContaining('Saved Song A');
+    for (var i = 0; i < 200 && done.evaluate().isEmpty; i++) {
+      await tester.pump(const Duration(milliseconds: 50));
+      await tester.runAsync(
+        () => Future<void>.delayed(const Duration(milliseconds: 5)),
+      );
+    }
+    await tester.pumpAndSettle();
+
+    expect(fetched, ['yt:yt-Song A']);
+    expect(saved.single.title, 'Song A');
+    expect(
+      saved.single.filePath,
+      p.join(
+        root.path,
+        'Library',
+        'Artist',
+        'Unknown Album',
+        'Artist - Song A.m4a',
+      ),
+    );
+    expect(find.text('Saved Song A to your library (Music).'), findsOneWidget);
+    await tester.pump(const Duration(seconds: 4));
+    await tester.pumpAndSettle();
+  });
+
+  testWidgets('a failed download says why', (tester) async {
+    await _pump(
+      tester,
+      sources: [
+        _source('yt', 'YouTube Music', ['Song A']),
+      ],
+      prepare: (_, _, _) async =>
+          throw const DiscoveryException('Not available here.'),
+    );
+    await tester.longPress(find.text('Song A'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Download to library'));
+    await tester.pumpAndSettle();
+    expect(
+      find.text('Couldn’t save Song A. Not available here.'),
+      findsOneWidget,
+    );
+    await tester.pump(const Duration(seconds: 4));
+    await tester.pumpAndSettle();
+  });
+}

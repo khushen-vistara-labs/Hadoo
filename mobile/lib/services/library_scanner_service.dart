@@ -1,0 +1,3619 @@
+import 'dart:async';
+import 'dart:io';
+
+import 'ios_library_scan_epoch.dart';
+import 'ios_transfer_scan_guard.dart';
+
+import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
+import 'package:path/path.dart' as p;
+import 'package:path_provider/path_provider.dart';
+
+import '../core/utils/audio_metadata_utils.dart';
+import '../core/utils/library_metadata_placeholders.dart';
+import '../data/database.dart';
+import '../data/repositories/song_repository.dart';
+import '../data/repositories/folder_repository.dart';
+import '../services/music_folder_service.dart';
+import '../services/library_scan_preferences_service.dart';
+import '../services/playlist_service.dart';
+import '../services/cue_file_service.dart';
+import '../services/rip_log_service.dart';
+import '../services/fingerprint_cache_service.dart';
+import '../services/uac2_preferences_service.dart';
+import '../services/audio_preload_service.dart';
+import '../services/album_art_service.dart';
+import '../services/album_art_import_service.dart';
+import '../services/apple_music/apple_music_settings.dart';
+import '../services/apple_music/auto_metadata_enricher.dart';
+import '../services/artwork_backfill_tracker.dart';
+import '../src/rust/api/scanner.dart'; // Rust bridge
+
+import 'package:flick/core/utils/dev_log.dart';
+import 'package:flick/l10n/l10n.dart';
+
+/// How thoroughly a scan re-reads the library.
+enum ScanMode {
+  /// Only new/changed files are re-read; the walk still runs so additions
+  /// and deletions are picked up.
+  quick,
+
+  /// Re-read metadata for every file found on disk.
+  full,
+}
+
+/// Live snapshot of a single folder while several folders scan concurrently.
+class FolderScanProgress {
+  final String displayName;
+  final int songsFound;
+  final int totalFiles;
+  final int filesProcessed;
+  final String? currentFile;
+  final String? phase;
+  final int newSongs;
+  final int modifiedSongs;
+  final int deletedSongs;
+  final bool isComplete;
+  final bool unavailable;
+
+  const FolderScanProgress({
+    required this.displayName,
+    this.songsFound = 0,
+    this.totalFiles = 0,
+    this.filesProcessed = 0,
+    this.currentFile,
+    this.phase,
+    this.newSongs = 0,
+    this.modifiedSongs = 0,
+    this.deletedSongs = 0,
+    this.isComplete = false,
+    this.unavailable = false,
+  });
+
+  double get progressFraction =>
+      totalFiles > 0 ? (filesProcessed / totalFiles).clamp(0.0, 1.0) : 0.0;
+}
+
+/// Progress update during library scanning.
+class ScanProgress {
+  final int songsFound;
+  final int totalFiles;
+  final int filesProcessed;
+  final String? currentFile;
+  final String? currentFolder;
+  final String? phase;
+  final String? scanEngine;
+  final int newSongs;
+  final int modifiedSongs;
+  final int deletedSongs;
+  final int? foldersTotal;
+  final int? foldersCompleted;
+
+  /// Per-folder snapshots; non-null only when several folders run at once.
+  final List<FolderScanProgress>? folders;
+  final bool backgroundTasksRunning;
+  final bool isComplete;
+  final bool unavailable;
+
+  ScanProgress({
+    required this.songsFound,
+    required this.totalFiles,
+    this.filesProcessed = 0,
+    this.currentFile,
+    this.currentFolder,
+    this.phase,
+    this.scanEngine,
+    this.newSongs = 0,
+    this.modifiedSongs = 0,
+    this.deletedSongs = 0,
+    this.foldersTotal,
+    this.foldersCompleted,
+    this.folders,
+    this.backgroundTasksRunning = false,
+    this.isComplete = false,
+    this.unavailable = false,
+  });
+
+  double get progressFraction =>
+      totalFiles > 0 ? (filesProcessed / totalFiles).clamp(0.0, 1.0) : 0.0;
+
+  ScanProgress copyWith({
+    int? songsFound,
+    int? totalFiles,
+    int? filesProcessed,
+    String? currentFile,
+    String? currentFolder,
+    String? phase,
+    String? scanEngine,
+    int? newSongs,
+    int? modifiedSongs,
+    int? deletedSongs,
+    int? foldersTotal,
+    int? foldersCompleted,
+    List<FolderScanProgress>? folders,
+    bool? backgroundTasksRunning,
+    bool? isComplete,
+    bool? unavailable,
+  }) {
+    return ScanProgress(
+      songsFound: songsFound ?? this.songsFound,
+      totalFiles: totalFiles ?? this.totalFiles,
+      filesProcessed: filesProcessed ?? this.filesProcessed,
+      currentFile: currentFile ?? this.currentFile,
+      currentFolder: currentFolder ?? this.currentFolder,
+      phase: phase ?? this.phase,
+      scanEngine: scanEngine ?? this.scanEngine,
+      newSongs: newSongs ?? this.newSongs,
+      modifiedSongs: modifiedSongs ?? this.modifiedSongs,
+      deletedSongs: deletedSongs ?? this.deletedSongs,
+      foldersTotal: foldersTotal ?? this.foldersTotal,
+      foldersCompleted: foldersCompleted ?? this.foldersCompleted,
+      folders: folders ?? this.folders,
+      backgroundTasksRunning:
+          backgroundTasksRunning ?? this.backgroundTasksRunning,
+      isComplete: isComplete ?? this.isComplete,
+      unavailable: unavailable ?? this.unavailable,
+    );
+  }
+}
+
+/// Service for scanning music folders and indexing songs in the database.
+class LibraryScannerService {
+  final SongRepository _songRepository;
+  final FolderRepository _folderRepository;
+  final MusicFolderService _musicFolderService;
+  final LibraryScanPreferencesService _scanPreferencesService;
+  final PlaylistService _playlistService;
+  final FileFingerprintCache _fingerprintCache = FileFingerprintCache();
+
+  bool _isCancelled = false;
+  final Set<String> _currentlyScanning = {};
+  final Map<String, Future<void>> _folderFinalization = {};
+  final ArtworkBackfillTracker _artworkBackfill = ArtworkBackfillTracker();
+
+  /// Aggregate progress of post-scan artwork backfill; null when idle.
+  ValueListenable<ArtworkBackfillProgress?> get artworkBackfillProgress =>
+      _artworkBackfill.progress;
+
+  /// Resolves when artwork backfill for [folderUri] has finished (immediately
+  /// when no backfill is pending for it).
+  Future<void> awaitArtworkBackfill(String folderUri) =>
+      _artworkBackfill.awaitFolder(normalizeFolderIdentifier(folderUri));
+
+  /// Resolves when every currently pending artwork backfill has finished.
+  Future<void> awaitAllArtworkBackfill() => _artworkBackfill.awaitAll();
+
+  void _trackFinalization(String folderUri, Future<void> task) {
+    _folderFinalization[folderUri] = task;
+    unawaited(
+      task.whenComplete(() {
+        if (identical(_folderFinalization[folderUri], task)) {
+          _folderFinalization.remove(folderUri);
+        }
+      }),
+    );
+  }
+
+  static const MethodChannel _storageChannel = MethodChannel(
+    'com.mossapps.flick/storage',
+  );
+
+  LibraryScannerService({
+    SongRepository? songRepository,
+    FolderRepository? folderRepository,
+    MusicFolderService? musicFolderService,
+    LibraryScanPreferencesService? scanPreferencesService,
+    PlaylistService? playlistService,
+  }) : _songRepository = songRepository ?? SongRepository(),
+       _folderRepository = folderRepository ?? FolderRepository(),
+       _musicFolderService = musicFolderService ?? MusicFolderService(),
+       _scanPreferencesService =
+           scanPreferencesService ?? LibraryScanPreferencesService(),
+       _playlistService = playlistService ?? PlaylistService();
+
+  void cancelScan() {
+    _isCancelled = true;
+    // A detached preload pass outlives the scan stream; stop it too or it
+    // keeps decoding (and holding the artwork gate) against the next scan.
+    AudioPreloadService.instance.cancel();
+  }
+
+  /// Backfill volume metadata onto a folder entity resolved before this
+  /// feature shipped. Best-effort: failure just leaves the folder unannotated.
+  Future<void> _backfillFolderStorageInfo(
+    FolderEntity entity,
+    StorageVolumeInfo storageInfo,
+  ) async {
+    try {
+      await _folderRepository.updateFolderVolumeInfo(
+        uri: entity.uri,
+        isRemovable: storageInfo.isRemovable,
+        mediaStoreVolume: storageInfo.mediaStoreVolume,
+        state: storageInfo.state,
+      );
+    } catch (e) {
+      devLog('Volume-info backfill failed for ${entity.displayName}: $e');
+    }
+  }
+
+  /// Scan engine routing decision (pure; unit-tested).
+  static String chooseAndroidScanEngine({
+    required bool allFilesAccess,
+    required bool hasReadableFsPath,
+    required bool useDeepScan,
+    required bool isRemovable,
+    bool isAppOwned = false,
+  }) {
+    if ((allFilesAccess || isAppOwned) && hasReadableFsPath) return 'rust';
+    if (useDeepScan) {
+      if (isRemovable) {
+        return hasReadableFsPath ? 'mediaStore' : 'saf';
+      }
+      return hasReadableFsPath ? 'rust' : 'saf';
+    }
+    return hasReadableFsPath ? 'mediaStore' : 'saf';
+  }
+
+  /// Private downloads are readable by this app and absent from MediaStore.
+  /// A sibling directory with the same prefix is not part of app storage.
+  @visibleForTesting
+  static bool isAppOwnedScanRoot(String root, String documents) {
+    final directory = p.normalize(documents);
+    final candidate = p.normalize(root);
+    return p.equals(candidate, directory) || p.isWithin(directory, candidate);
+  }
+
+  static const _safDocumentsPrefix =
+      'content://com.android.externalstorage.documents';
+
+  /// Songs keyed by a SAF document URI belong to the SAF engine's URI space;
+  /// raw-path engines (MediaStore DATA, Rust walk) can neither match nor
+  /// confirm them and must not report them as deleted.
+  bool _isSafUri(String filePath) => filePath.startsWith(_safDocumentsPrefix);
+
+  /// Maps a SAF document URI
+  /// (content://com.android.externalstorage.documents/tree/.../document/
+  /// primary%3AMusic%2Ftrack.dsf) to its raw filesystem path
+  /// (/storage/emulated/0/Music/track.dsf), or null when unmappable.
+  /// Pure; unit-tested.
+  static String? rawPathFromSafUri(String uriString) {
+    if (!uriString.startsWith('$_safDocumentsPrefix/')) return null;
+    final uri = Uri.tryParse(uriString);
+    if (uri == null) return null;
+    final segments = uri.pathSegments;
+    String? docId;
+    for (var i = 0; i + 1 < segments.length; i++) {
+      if (segments[i] == 'document') docId = segments[i + 1];
+    }
+    if (docId == null) return null;
+    final colon = docId.indexOf(':');
+    if (colon <= 0 || colon == docId.length - 1) return null;
+    final volume = docId.substring(0, colon);
+    final relative = docId.substring(colon + 1);
+    final volumeRoot = volume == 'primary'
+        ? '/storage/emulated/0'
+        : '/storage/$volume';
+    return '$volumeRoot/$relative';
+  }
+
+  /// Maps a `file://` URI (or passes through a plain absolute path) to its
+  /// raw filesystem path, or null for anything else. Synthesized fallback
+  /// rows are keyed `file:///storage/...`; the Rust parser needs raw paths.
+  /// Pure; unit-tested.
+  static String? rawPathFromFileUri(String uriString) {
+    if (uriString.startsWith('file://')) {
+      return Uri.tryParse(uriString)?.toFilePath();
+    }
+    if (uriString.startsWith('/')) return uriString;
+    return null;
+  }
+
+  /// Scan a single folder using appropriate method for platform.
+  Stream<ScanProgress> scanFolder(
+    String folderUri,
+    String displayName, {
+    ScanMode mode = ScanMode.quick,
+  }) => Platform.isIOS
+      ? IosLibraryScanEpoch.bind(
+          () => _scanFolderEntry(folderUri, displayName, mode: mode),
+        )
+      : _scanFolderEntry(folderUri, displayName, mode: mode);
+
+  Stream<ScanProgress> _scanFolderEntry(
+    String folderUri,
+    String displayName, {
+    ScanMode mode = ScanMode.quick,
+  }) async* {
+    // Cancellation is sticky for the whole operation; only entry points may
+    // clear it, so a Stop can't be wiped by a folder scan that starts late.
+    _isCancelled = false;
+    yield* _scanFolderInternal(folderUri, displayName, mode: mode);
+  }
+
+  Stream<ScanProgress> _scanFolderInternal(
+    String folderUri,
+    String displayName, {
+    ScanMode mode = ScanMode.quick,
+    bool forceDeepScan = false,
+  }) async* {
+    final scanStopwatch = Stopwatch()..start();
+    final scanKey = normalizeFolderIdentifier(folderUri);
+    final scanPreferences = await _scanPreferencesService.getPreferences();
+
+    if (_currentlyScanning.contains(scanKey)) {
+      devLog('Folder $displayName is already being scanned, skipping...');
+      return;
+    }
+
+    _currentlyScanning.add(scanKey);
+    final artworkBackfillToken = _artworkBackfill.begin(scanKey);
+    try {
+      if (Platform.isAndroid) {
+        final storageInfo = await _musicFolderService.resolveStorageInfo(
+          folderUri,
+        );
+        final resolvedScanRoot = storageInfo.fsPath;
+
+        final folderEntity = await _folderRepository.getFolderByUri(folderUri);
+        final useDeepScan =
+            forceDeepScan ||
+            (folderEntity?.useDeepScan ?? scanPreferences.useDeepScan);
+
+        // Lazy migration: backfill volume metadata for pre-feature folders.
+        if (folderEntity != null && folderEntity.mediaStoreVolume == null) {
+          await _backfillFolderStorageInfo(folderEntity, storageInfo);
+        }
+
+        // Unplugged removable storage: retain songs, mark unavailable, skip scan.
+        if (storageInfo.isRemovable && !storageInfo.isMounted) {
+          devLog(
+            'Skipping scan for $displayName: removable storage not mounted '
+            '("${storageInfo.state}"), songs retained',
+          );
+          if (folderEntity != null) {
+            await _folderRepository.updateFolderVolumeState(
+              folderUri,
+              storageInfo.state,
+            );
+          }
+          _logScanTiming(
+            displayName,
+            'scan folder (unavailable: ${storageInfo.state})',
+            scanStopwatch.elapsed,
+          );
+          yield ScanProgress(
+            songsFound: 0,
+            totalFiles: 0,
+            currentFolder: displayName,
+            isComplete: true,
+            unavailable: true,
+          );
+          return;
+        }
+
+        // All Files Access: raw filesystem walk covers every volume and every
+        // format the OEM's MediaScanner may have skipped (DSD/DSF/WV). This is
+        // the UAPP/Neutron parity path and collapses the deep/normal split.
+        final hasReadableFsPath =
+            resolvedScanRoot != null && resolvedScanRoot.isNotEmpty;
+        final appOwned =
+            hasReadableFsPath &&
+            isAppOwnedScanRoot(
+              resolvedScanRoot,
+              (await getApplicationDocumentsDirectory()).path,
+            );
+        final scanEngineChoice = chooseAndroidScanEngine(
+          allFilesAccess: storageInfo.allFilesAccess,
+          hasReadableFsPath: hasReadableFsPath,
+          useDeepScan: useDeepScan,
+          isRemovable: storageInfo.isRemovable,
+          isAppOwned: appOwned,
+        );
+        // The null re-check is required for Dart promotion even though the
+        // all-files 'rust' choice implies hasReadableFsPath.
+        if (scanEngineChoice == 'rust' &&
+            (storageInfo.allFilesAccess || appOwned) &&
+            resolvedScanRoot != null) {
+          try {
+            yield* _scanFolderRust(
+              resolvedScanRoot,
+              folderUri,
+              displayName,
+              scanPreferences,
+              mode: mode,
+            );
+            _logScanTiming(
+              displayName,
+              'scan folder (Rust, all-files access)',
+              scanStopwatch.elapsed,
+            );
+            return;
+          } catch (e) {
+            // MediaStore cannot see private files. Falling back to it would
+            // misclassify every saved download as deleted.
+            if (appOwned) rethrow;
+            devLog(
+              'All-files scan failed for $displayName at $resolvedScanRoot: '
+              '$e, falling back to MediaStore/SAF',
+            );
+          }
+        }
+
+        if (useDeepScan) {
+          // Rust can't open scoped removable paths. MediaStore indexes the
+          // volume and works; SAF DocumentsContract tree walk often returns 0
+          // files on SD/USB, so prefer MediaStore there before SAF fallback.
+          if (storageInfo.isRemovable) {
+            if (resolvedScanRoot != null && resolvedScanRoot.isNotEmpty) {
+              try {
+                yield* _scanFolderMediaStore(
+                  resolvedScanRoot,
+                  folderUri,
+                  displayName,
+                  scanPreferences,
+                  volumeName: storageInfo.mediaStoreVolume,
+                  mode: mode,
+                );
+                _logScanTiming(
+                  displayName,
+                  'scan folder (MediaStore, removable deep)',
+                  scanStopwatch.elapsed,
+                );
+                return;
+              } catch (e) {
+                devLog(
+                  'MediaStore scan failed for removable $displayName at '
+                  '$resolvedScanRoot: $e, falling back to SAF',
+                );
+              }
+            } else {
+              devLog(
+                'Deep scan on removable $displayName: no fs path, using SAF',
+              );
+            }
+          } else if (resolvedScanRoot != null && resolvedScanRoot.isNotEmpty) {
+            try {
+              yield* _scanFolderRust(
+                resolvedScanRoot,
+                folderUri,
+                displayName,
+                scanPreferences,
+                mode: mode,
+              );
+              _logScanTiming(
+                displayName,
+                'scan folder (Rust deep scan)',
+                scanStopwatch.elapsed,
+              );
+              return;
+            } catch (e) {
+              devLog(
+                'Rust deep scan failed for $displayName at $resolvedScanRoot: $e, '
+                'falling back to SAF',
+              );
+            }
+          } else {
+            devLog(
+              'Deep scan requested for $displayName but no filesystem path '
+              'resolvable, falling back to SAF',
+            );
+          }
+
+          yield* _scanFolderAndroid(
+            folderUri,
+            displayName,
+            scanPreferences,
+            mode: mode,
+          );
+          _logScanTiming(
+            displayName,
+            'scan folder (SAF)',
+            scanStopwatch.elapsed,
+          );
+        } else {
+          if (resolvedScanRoot != null && resolvedScanRoot.isNotEmpty) {
+            try {
+              yield* _scanFolderMediaStore(
+                resolvedScanRoot,
+                folderUri,
+                displayName,
+                scanPreferences,
+                volumeName: storageInfo.mediaStoreVolume,
+              );
+              _logScanTiming(
+                displayName,
+                'scan folder (MediaStore)',
+                scanStopwatch.elapsed,
+              );
+              return;
+            } catch (e) {
+              devLog(
+                'MediaStore scan failed for $displayName at $resolvedScanRoot: $e, '
+                'falling back to SAF',
+              );
+            }
+          }
+
+          yield* _scanFolderAndroid(
+            folderUri,
+            displayName,
+            scanPreferences,
+            deferMetadata: true,
+            mode: mode,
+          );
+          _logScanTiming(
+            displayName,
+            'scan folder (SAF)',
+            scanStopwatch.elapsed,
+          );
+        }
+      } else {
+        yield* _scanFolderRust(
+          folderUri,
+          folderUri,
+          displayName,
+          scanPreferences,
+          mode: mode,
+        );
+        _logScanTiming(
+          displayName,
+          'scan folder (Rust)',
+          scanStopwatch.elapsed,
+        );
+      }
+    } finally {
+      _currentlyScanning.remove(scanKey);
+      if (_isCancelled) {
+        // Cancelled: no backfill will run, so release anyone awaiting covers.
+        _artworkBackfill.finish(scanKey, artworkBackfillToken);
+      } else {
+        // Detached artwork backfill: resolve covers the lazy tile path hasn't
+        // reached yet, so art persists after the scan instead of appearing
+        // only when tiles are tapped. Runs unpaused — tiles may resolve
+        // concurrently; _inFlightResolutions dedupes. The tracker lets the
+        // manual scan session wait for covers before reporting "done".
+        final task = _runDetachedScanTask(
+          displayName,
+          'artwork resolve',
+          () async {
+            // CUE/log finalization upserts entities it loaded before artwork
+            // existed; wait for it so it cannot clobber freshly resolved art
+            // and so CUE-created tracks get resolved too.
+            final pending = _folderFinalization[folderUri];
+            if (pending != null) {
+              await pending;
+            }
+            final songs = await _songRepository.getSongEntitiesByFolder(
+              folderUri,
+            );
+            await AlbumArtService.instance.resolveMissingArtwork(
+              songs,
+              onProgress: (completed, total) => _artworkBackfill.setProgress(
+                scanKey,
+                artworkBackfillToken,
+                completed,
+                total,
+              ),
+            );
+            try {
+              if (await AppleMusicSettings().autoEnrichEnabled()) {
+                final models = await _songRepository.getSongsByFolder(
+                  folderUri,
+                );
+                await AutoMetadataEnricher.instance.enrichMissing(models);
+              }
+            } catch (error) {
+              devLog('Auto metadata enrichment failed for $folderUri: $error');
+            }
+          },
+        );
+        unawaited(
+          task.whenComplete(
+            () => _artworkBackfill.finish(scanKey, artworkBackfillToken),
+          ),
+        );
+      }
+    }
+  }
+
+  Stream<ScanProgress> _scanFolderMediaStore(
+    String folderPath,
+    String folderUri,
+    String displayName,
+    LibraryScanPreferences scanPreferences, {
+    String? volumeName,
+    ScanMode mode = ScanMode.quick,
+  }) async* {
+    if (_isCancelled) return;
+    final totalStopwatch = Stopwatch()..start();
+    const scanEngine = 'MediaStore';
+    var newSongs = 0;
+    var modifiedSongs = 0;
+    var deletedSongs = 0;
+    yield ScanProgress(
+      songsFound: 0,
+      totalFiles: 0,
+      currentFolder: displayName,
+      scanEngine: scanEngine,
+      phase: 'Querying filesystem',
+      isComplete: false,
+    );
+
+    final List<AudioFileInfo> mediaStoreFiles;
+    try {
+      final stopwatch = Stopwatch()..start();
+      mediaStoreFiles = await _musicFolderService.queryMediaStoreAudio([
+        folderPath,
+      ], volumeName: volumeName);
+      _logScanTiming(displayName, 'MediaStore audio query', stopwatch.elapsed);
+    } catch (e) {
+      devLog("MediaStore audio query failed for $displayName: $e");
+      return;
+    }
+
+    if (_isCancelled) return;
+
+    // ponytail: MediaStore returns an empty-but-successful list when the
+    // folder isn't indexed yet (Android 15 scoped storage; no MediaScan is
+    // ever triggered). Fall back to SAF before the diff logic wipes
+    // existing songs and silently reports an empty library.
+    if (mediaStoreFiles.isEmpty) {
+      devLog(
+        'MediaStore returned 0 files for $displayName at $folderPath; '
+        'falling back to SAF',
+      );
+      yield* _scanFolderAndroid(
+        folderUri,
+        displayName,
+        scanPreferences,
+        deferMetadata: true,
+        mode: mode,
+      );
+      return;
+    }
+
+    final dbLoadStopwatch = Stopwatch()..start();
+    final existingSongs = await _songRepository.getSongEntitiesByFolder(
+      folderUri,
+    );
+    _logScanTiming(displayName, 'existing DB load', dbLoadStopwatch.elapsed);
+
+    final filteredExistingSongs = await _purgeExistingSongsFilteredByRules(
+      existingSongs,
+      scanPreferences,
+    );
+
+    final rawExistingMap = <String, SongEntity>{};
+    final existingByContentUri = <String, SongEntity>{};
+    final safKeyedSongs = <SongEntity>[];
+    for (var s in existingSongs) {
+      if (s.startOffsetMs == null) {
+        rawExistingMap[s.filePath] = s;
+        if (_isSafUri(s.filePath)) safKeyedSongs.add(s);
+      }
+      if (s.filePath.startsWith('content://')) {
+        existingByContentUri[s.filePath] = s;
+      }
+      final mediaStoreUri = s.mediaStoreUri;
+      if (mediaStoreUri != null && mediaStoreUri.isNotEmpty) {
+        existingByContentUri[mediaStoreUri] = s;
+      }
+    }
+    for (final song in filteredExistingSongs) {
+      existingByContentUri.remove(song.filePath);
+      existingByContentUri.remove(song.mediaStoreUri);
+      rawExistingMap.remove(song.filePath);
+    }
+
+    final scannedByPath = <String, AudioFileInfo>{};
+    final scannedByUri = <String, AudioFileInfo>{};
+    for (final f in mediaStoreFiles) {
+      if (f.filePath != null) scannedByPath[f.filePath!] = f;
+      scannedByUri[f.uri] = f;
+    }
+
+    final allScannedPaths = scannedByPath.keys.toSet();
+    final allScannedUris = scannedByUri.keys.toSet();
+    final allKnownPaths = allScannedPaths.union(allScannedUris);
+
+    final filteredSongIds = filteredExistingSongs
+        .map((song) => song.id)
+        .toSet();
+    final idsToDelete = <int>[];
+    for (final song in existingSongs) {
+      if (filteredSongIds.contains(song.id)) continue;
+
+      // SAF-keyed songs live in a URI space MediaStore results can't speak
+      // for; they're superseded below instead of reported as deleted.
+      if (_isSafUri(song.filePath)) continue;
+
+      final mediaStoreUri = song.mediaStoreUri;
+      final isKnown =
+          allKnownPaths.contains(song.filePath) ||
+          (mediaStoreUri != null && allKnownPaths.contains(mediaStoreUri));
+      if (!isKnown) idsToDelete.add(song.id);
+    }
+
+    if (idsToDelete.isNotEmpty) {
+      await _songRepository.deleteScannedSongsByIds(idsToDelete);
+    }
+    deletedSongs += idsToDelete.length;
+
+    final urisNeedingSparseMetadata = <String>[];
+    final batch = <SongEntity>[];
+    final idsToDeleteInline = <int>[];
+    final diffStopwatch = Stopwatch()..start();
+
+    for (final file in mediaStoreFiles) {
+      final lookupKey = file.filePath ?? file.uri;
+      final existing =
+          rawExistingMap[lookupKey] ?? existingByContentUri[file.uri];
+
+      if (existing != null) {
+        final existingTime = existing.lastModified?.millisecondsSinceEpoch ?? 0;
+        // Rows without a sample rate are re-extracted: the sparse pass marks
+        // them complete after one attempt, but the Rust fallback may only
+        // succeed on a later scan (retriever failures on hi-res files).
+        if (mode == ScanMode.quick &&
+            file.lastModified == existingTime &&
+            existing.metadataComplete &&
+            existing.sampleRate != null) {
+          continue;
+        }
+      }
+
+      final looksLikeAudio =
+          _looksLikeSupportedAudioExtension(file.extension) ||
+          (file.mimeType?.toLowerCase().startsWith('audio/') ?? false) ||
+          (file.duration ?? 0) > 0;
+      if (!looksLikeAudio) continue;
+
+      if (_shouldIgnoreDiscoveredTrack(
+        fileSizeBytes: file.size,
+        durationMs: file.duration,
+        scanPreferences: scanPreferences,
+      )) {
+        if (existing != null) idsToDeleteInline.add(existing.id);
+        continue;
+      }
+
+      final needsSparseMetadata =
+          mode == ScanMode.full ||
+          existing == null ||
+          existing.sampleRate == null ||
+          existing.bitDepth == null ||
+          existing.discNumber == null ||
+          isUnknownLibraryArtist(existing.artist) ||
+          isUnknownLibraryAlbum(existing.album);
+
+      final artist = (file.artist?.trim().isNotEmpty ?? false)
+          ? file.artist!.trim()
+          : l10n.unknownArtist;
+      final song = SongEntity()
+        ..filePath = file.filePath ?? file.uri
+        ..mediaStoreUri = file.uri
+        ..title = (file.title?.trim().isNotEmpty ?? false)
+            ? file.title!.trim()
+            : _extractTitleFromFilename(file.name)
+        ..artist = artist
+        ..album = (file.album?.trim().isNotEmpty ?? false)
+            ? file.album!.trim()
+            : l10n.unknownAlbum
+        ..albumArtist = (file.albumArtist?.trim().isNotEmpty ?? false)
+            ? file.albumArtist!.trim()
+            : artist
+        ..trackNumber = file.trackNumber ?? 0
+        ..discNumber = file.discNumber ?? 1
+        ..durationMs = file.duration ?? 0
+        ..fileType = file.extension.toUpperCase()
+        ..dateAdded =
+            existing?.dateAdded ??
+            (file.dateAdded != null
+                ? DateTime.fromMillisecondsSinceEpoch(file.dateAdded!)
+                : DateTime.now())
+        ..lastModified = DateTime.fromMillisecondsSinceEpoch(file.lastModified)
+        ..folderUri = folderUri
+        ..fileSize = file.size
+        ..albumArtPath = _carriedArtworkPath(
+          existing,
+          lastModified: DateTime.fromMillisecondsSinceEpoch(file.lastModified),
+          fileSize: file.size,
+        )
+        ..bitrate = file.bitrate != null
+            ? AudioMetadataUtils.bitrateFromBitsPerSecond(
+                int.tryParse(file.bitrate!),
+              )
+            : null
+        ..bitDepth = file.bitDepth ?? existing?.bitDepth
+        ..sampleRate = file.sampleRate ?? existing?.sampleRate
+        ..genre = (file.genre?.trim().isNotEmpty ?? false)
+            ? file.genre!.trim()
+            : existing?.genre
+        ..year = file.year ?? existing?.year
+        ..ripper = existing?.ripper
+        ..readMode = existing?.readMode
+        ..accurateRip = existing?.accurateRip
+        ..metadataComplete =
+            (existing?.metadataComplete ?? false) || !needsSparseMetadata;
+
+      if (existing != null) {
+        song.id = existing.id;
+        _preserveLocalEdits(song, existing);
+        modifiedSongs++;
+      } else {
+        newSongs++;
+      }
+
+      batch.add(song);
+
+      if (needsSparseMetadata) {
+        urisNeedingSparseMetadata.add(file.uri);
+      }
+    }
+    _logScanTiming(displayName, 'diff/build entities', diffStopwatch.elapsed);
+
+    if (idsToDeleteInline.isNotEmpty) {
+      await _songRepository.deleteScannedSongsByIds(idsToDeleteInline);
+    }
+    deletedSongs += idsToDeleteInline.length;
+
+    if (batch.isNotEmpty) {
+      final stopwatch = Stopwatch()..start();
+      await _songRepository.upsertScannedSongs(batch);
+      _logScanTiming(
+        displayName,
+        'upsert ${batch.length} songs',
+        stopwatch.elapsed,
+      );
+    }
+
+    // SAF-scanned rows superseded by the raw-path rows just upserted; drop
+    // the old URI-keyed rows only when the replacement actually exists.
+    if (safKeyedSongs.isNotEmpty) {
+      final supersededIds = safKeyedSongs
+          .where((s) {
+            final raw = rawPathFromSafUri(s.filePath);
+            return raw != null && scannedByPath.containsKey(raw);
+          })
+          .map((s) => s.id)
+          .toList();
+      if (supersededIds.isNotEmpty) {
+        await _songRepository.deleteScannedSongsByIds(supersededIds);
+        deletedSongs += supersededIds.length;
+      }
+    }
+
+    yield ScanProgress(
+      songsFound: mediaStoreFiles.length,
+      totalFiles: mediaStoreFiles.length,
+      filesProcessed: mediaStoreFiles.length,
+      currentFolder: displayName,
+      scanEngine: scanEngine,
+      phase: 'Finishing up',
+      newSongs: newSongs,
+      modifiedSongs: modifiedSongs,
+      deletedSongs: deletedSongs,
+      isComplete: false,
+    );
+
+    final detachedTasks = <Future<void>>[];
+    if (urisNeedingSparseMetadata.isNotEmpty) {
+      detachedTasks.add(
+        _runDetachedScanTask(
+          displayName,
+          'sparse metadata',
+          () => _extractSparseMetadataInBackground(
+            urisNeedingSparseMetadata,
+            folderUri,
+            displayName,
+          ),
+        ),
+      );
+    }
+
+    final finalCount = await _songRepository.countSongsInFolder(folderUri);
+    await _folderRepository.updateFolderScanInfo(folderUri, finalCount);
+
+    detachedTasks.add(
+      _runDetachedScanTask(
+        displayName,
+        'sidecar metadata',
+        () => _enrichMediaStoreSidecarsInBackground(
+          folderPath: folderPath,
+          folderUri: folderUri,
+          displayName: displayName,
+          mediaStoreFiles: mediaStoreFiles,
+          scanPreferences: scanPreferences,
+          volumeName: volumeName,
+        ),
+      ),
+    );
+    detachedTasks.add(
+      _runDetachedScanTask(
+        displayName,
+        'playlist sync',
+        () => _syncPlaylistSourcesForFolder(
+          folderUri,
+          scanPreferences,
+          scanRootPath: folderPath,
+        ),
+      ),
+    );
+    _schedulePreloadAfterScan(
+      folderUri: folderUri,
+      displayName: displayName,
+      after: Future.wait(detachedTasks),
+    );
+
+    _logScanTiming(
+      displayName,
+      'foreground scan total',
+      totalStopwatch.elapsed,
+    );
+
+    yield ScanProgress(
+      songsFound: finalCount,
+      totalFiles: mediaStoreFiles.length,
+      filesProcessed: mediaStoreFiles.length,
+      currentFolder: displayName,
+      scanEngine: scanEngine,
+      newSongs: newSongs,
+      modifiedSongs: modifiedSongs,
+      deletedSongs: deletedSongs,
+      isComplete: true,
+    );
+  }
+
+  Future<void> _extractSparseMetadataInBackground(
+    List<String> contentUris,
+    String folderUri,
+    String displayName,
+  ) async {
+    final metadataBatchSize = _recommendedMetadataBatchSize(contentUris.length);
+    final metadataChunks = _chunkList(contentUris, metadataBatchSize);
+    final songsByUri = await _songRepository.getSongEntitiesByFolder(folderUri);
+    final pathMap = <String, SongEntity>{};
+    // MediaStore content URIs carry no filesystem path the Rust fallback
+    // could use; hand it the row's raw path so retries read the file
+    // directly instead of staging a full copy through the cache.
+    final rawPathByUri = <String, String>{};
+    for (final s in songsByUri) {
+      pathMap[s.filePath] = s;
+      final mediaStoreUri = s.mediaStoreUri;
+      if (mediaStoreUri != null && mediaStoreUri.isNotEmpty) {
+        pathMap[mediaStoreUri] = s;
+        final raw = rawPathFromFileUri(s.filePath);
+        if (raw != null && mediaStoreUri.startsWith('content://')) {
+          rawPathByUri[mediaStoreUri] = raw;
+        }
+      }
+    }
+
+    for (final chunkUris in metadataChunks) {
+      if (_isCancelled) break;
+
+      final stopwatch = Stopwatch()..start();
+      final metadataList = await _fetchMetadataChunk(
+        chunkUris,
+        rawPathByUri: rawPathByUri,
+      );
+      _logScanTiming(
+        displayName,
+        'sparse metadata chunk ${chunkUris.length}',
+        stopwatch.elapsed,
+      );
+      if (metadataList == null) continue;
+
+      final updateBatch = <SongEntity>[];
+
+      for (final meta in metadataList) {
+        final existing = pathMap[meta.uri];
+        if (existing == null) continue;
+
+        existing.sampleRate = meta.sampleRate ?? existing.sampleRate;
+        existing.bitDepth = meta.bitDepth ?? existing.bitDepth;
+        if ((existing.durationMs ?? 0) <= 0) {
+          existing.durationMs = meta.duration ?? existing.durationMs;
+        }
+        if (existing.bitrate == null && meta.bitrate != null) {
+          existing.bitrate = AudioMetadataUtils.bitrateFromBitsPerSecond(
+            int.tryParse(meta.bitrate!),
+          );
+        }
+        if (!existing.hasLocalEdits) {
+          existing.discNumber = meta.discNumber ?? existing.discNumber;
+          existing.albumArtist = (meta.albumArtist?.trim().isNotEmpty ?? false)
+              ? meta.albumArtist!.trim()
+              : existing.albumArtist;
+          // Filename-derived placeholders can survive earlier scans even
+          // after their audio properties were marked complete. Replace only
+          // unedited placeholders with real embedded tags, not custom titles.
+          if ((existing.title.trim().isEmpty ||
+                  (isUnknownLibraryArtist(existing.artist) &&
+                      isUnknownLibraryAlbum(existing.album))) &&
+              (meta.title?.trim().isNotEmpty ?? false)) {
+            existing.title = meta.title!.trim();
+          }
+          if ((existing.artist.trim().isEmpty ||
+                  isUnknownLibraryArtist(existing.artist)) &&
+              (meta.artist?.trim().isNotEmpty ?? false)) {
+            existing.artist = meta.artist!.trim();
+          }
+          if (((existing.album ?? '').trim().isEmpty ||
+                  isUnknownLibraryAlbum(existing.album)) &&
+              (meta.album?.trim().isNotEmpty ?? false)) {
+            existing.album = meta.album!.trim();
+          }
+          existing.trackNumber = meta.trackNumber ?? existing.trackNumber;
+          existing.genre = (meta.genre?.trim().isNotEmpty ?? false)
+              ? meta.genre!.trim()
+              : existing.genre;
+          existing.year = meta.year ?? existing.year;
+        }
+        existing.metadataComplete = true;
+        updateBatch.add(existing);
+      }
+
+      if (updateBatch.isNotEmpty) {
+        await _songRepository.upsertScannedSongs(updateBatch);
+      }
+    }
+  }
+
+  Future<void> _enrichMediaStoreSidecarsInBackground({
+    required String folderPath,
+    required String folderUri,
+    required String displayName,
+    required List<AudioFileInfo> mediaStoreFiles,
+    required LibraryScanPreferences scanPreferences,
+    String? volumeName,
+  }) async {
+    if (_isCancelled || mediaStoreFiles.isEmpty) return;
+
+    List<Map<String, dynamic>> nonAudioFiles;
+    try {
+      final stopwatch = Stopwatch()..start();
+      nonAudioFiles = await _musicFolderService.queryMediaStoreNonAudio([
+        folderPath,
+      ], volumeName: volumeName);
+      _logScanTiming(
+        displayName,
+        'MediaStore non-audio query',
+        stopwatch.elapsed,
+      );
+    } catch (e) {
+      devLog('MediaStore non-audio query failed for $displayName: $e');
+      return;
+    }
+
+    if (_isCancelled || nonAudioFiles.isEmpty) return;
+
+    final scannedByPath = <String, AudioFileInfo>{};
+    final scannedByUri = <String, AudioFileInfo>{};
+    for (final file in mediaStoreFiles) {
+      if (file.filePath != null) scannedByPath[file.filePath!] = file;
+      scannedByUri[file.uri] = file;
+    }
+
+    final cueFilesForParsing = nonAudioFiles
+        .where((f) => (f['extension'] as String?)?.toLowerCase() == 'cue')
+        .map(_audioInfoFromNonAudioMap)
+        .toList();
+    final logFilesForParsing = nonAudioFiles
+        .where((f) {
+          final ext = (f['extension'] as String?)?.toLowerCase() ?? '';
+          return ext == 'log' || ext == 'txt';
+        })
+        .map(_audioInfoFromNonAudioMap)
+        .toList();
+
+    final sidecarStopwatch = Stopwatch()..start();
+    final cueMap = cueFilesForParsing.isNotEmpty
+        ? await _parseCueFilesAndroid(cueFilesForParsing, scannedByPath)
+        : <String, CueSheet>{};
+    final logMap = logFilesForParsing.isNotEmpty
+        ? await _parseLogFilesAndroid(logFilesForParsing, scannedByPath)
+        : <String, RipLog>{};
+    _logScanTiming(displayName, 'CUE/log parse', sidecarStopwatch.elapsed);
+
+    if (_isCancelled || (cueMap.isEmpty && logMap.isEmpty)) return;
+
+    final existingSongs = await _songRepository.getSongEntitiesByFolder(
+      folderUri,
+    );
+    final rawExistingMap = <String, SongEntity>{};
+    for (final song in existingSongs) {
+      if (song.startOffsetMs == null) {
+        rawExistingMap[song.filePath] = song;
+      }
+    }
+
+    final allScannedPaths = scannedByPath.keys.toSet();
+    final audioFilesWithCue = cueMap.keys.toSet();
+    final existingCuePaths = existingSongs
+        .where((s) => s.startOffsetMs != null)
+        .map((s) => s.filePath)
+        .toSet();
+    final orphanedCuePaths = existingCuePaths
+        .where(
+          (p) => allScannedPaths.contains(p) && !audioFilesWithCue.contains(p),
+        )
+        .toList();
+    if (orphanedCuePaths.isNotEmpty) {
+      await _songRepository.deleteScannedCueTracksByPath(orphanedCuePaths);
+    }
+
+    final idsToDelete = <int>[];
+    final entitiesToUpsert = <SongEntity>[];
+
+    for (final entry in cueMap.entries) {
+      if (_isCancelled) break;
+
+      final audioPath = entry.key;
+      final file = scannedByPath[audioPath] ?? scannedByUri[audioPath];
+      if (file == null) continue;
+
+      final rawExisting = rawExistingMap[audioPath];
+      if (rawExisting != null) idsToDelete.add(rawExisting.id);
+
+      final cueExistingMap = <String, SongEntity>{};
+      final cueTracksInDb = existingSongs.where(
+        (s) => s.filePath == audioPath && s.startOffsetMs != null,
+      );
+      for (final song in cueTracksInDb) {
+        cueExistingMap['${song.filePath}#${song.startOffsetMs}'] = song;
+      }
+
+      final cueEntities = _buildCueTrackEntities(
+        audioUri: audioPath,
+        cueSheet: entry.value,
+        meta: file,
+        folderUri: folderUri,
+        existingMap: cueExistingMap,
+        ripLog: logMap[audioPath],
+        lastModified: DateTime.fromMillisecondsSinceEpoch(file.lastModified),
+        relativeFolderPath: file.relativeFolderPath,
+      );
+
+      for (final entity in cueEntities) {
+        if (_shouldIgnoreDiscoveredTrack(
+          fileSizeBytes: entity.fileSize,
+          durationMs: entity.durationMs,
+          scanPreferences: scanPreferences,
+        )) {
+          continue;
+        }
+        entitiesToUpsert.add(entity);
+      }
+    }
+
+    for (final entry in logMap.entries) {
+      if (cueMap.containsKey(entry.key)) continue;
+      final existing = rawExistingMap[entry.key];
+      if (existing == null || existing.startOffsetMs != null) continue;
+
+      existing.ripper = entry.value.ripper;
+      existing.readMode = entry.value.readMode;
+      existing.accurateRip = entry.value.accurateRipEnabled;
+      entitiesToUpsert.add(existing);
+    }
+
+    if (idsToDelete.isNotEmpty) {
+      await _songRepository.deleteScannedSongsByIds(idsToDelete);
+    }
+    if (entitiesToUpsert.isNotEmpty) {
+      await _songRepository.upsertScannedSongs(entitiesToUpsert);
+    }
+
+    final finalCount = await _songRepository.countSongsInFolder(folderUri);
+    await _folderRepository.updateFolderScanInfo(folderUri, finalCount);
+  }
+
+  /// Instant SAF path: surfaces new files immediately with filename-derived
+  /// metadata, then defers accurate retrieval to the background. Used for
+  /// non-deep scans where appearing fast matters more than perfect metadata.
+  Stream<ScanProgress> _scanFolderAndroidInstant({
+    required String folderUri,
+    required String displayName,
+    required Map<String, AudioFileInfo> fastScanMap,
+    required Map<String, SongEntity> existingMap,
+    required List<String> urisToProcess,
+    required int initialSongCount,
+    required int totalFiles,
+    required Stopwatch totalStopwatch,
+    required LibraryScanPreferences scanPreferences,
+  }) async* {
+    final newBatch = <SongEntity>[];
+    for (final uri in urisToProcess) {
+      if (existingMap.containsKey(uri)) continue; // already visible
+      final basic = fastScanMap[uri];
+      if (basic == null) continue;
+      if (!_looksLikeSupportedAudioExtension(basic.extension)) continue;
+      if (_shouldIgnoreDiscoveredTrack(
+        fileSizeBytes: basic.size,
+        durationMs: null, // duration unknown until background enrichment
+        scanPreferences: scanPreferences,
+      )) {
+        continue;
+      }
+      newBatch.add(
+        SongEntity()
+          ..filePath = basic.uri
+          ..mediaStoreUri = basic.uri.startsWith('content://')
+              ? basic.uri
+              : null
+          ..title = _extractTitleFromFilename(basic.name)
+          ..artist = l10n.unknownArtist
+          ..album = l10n.unknownAlbum
+          ..albumArtist = l10n.unknownArtist
+          ..trackNumber = 0
+          ..discNumber = 1
+          ..durationMs = 0
+          ..fileType = basic.extension.toUpperCase()
+          ..dateAdded = DateTime.now()
+          ..lastModified = DateTime.fromMillisecondsSinceEpoch(
+            basic.lastModified,
+          )
+          ..folderUri = folderUri
+          ..relativeFolderPath = basic.relativeFolderPath
+          ..fileSize = basic.size
+          ..metadataComplete = false,
+      );
+    }
+
+    if (newBatch.isNotEmpty) {
+      await _songRepository.upsertScannedSongs(newBatch);
+    }
+
+    const scanEngine = 'SAF (instant)';
+    final newSongs = newBatch.length;
+    yield ScanProgress(
+      songsFound: initialSongCount + newBatch.length,
+      totalFiles: totalFiles,
+      filesProcessed: totalFiles,
+      currentFolder: displayName,
+      scanEngine: scanEngine,
+      phase: 'Upserting songs',
+      newSongs: newSongs,
+      isComplete: false,
+    );
+
+    final detachedTasks = <Future<void>>[];
+    detachedTasks.add(
+      _runDetachedScanTask(
+        displayName,
+        'deferred metadata',
+        () => _enrichSafMetadataInBackground(
+          uris: urisToProcess,
+          folderUri: folderUri,
+          displayName: displayName,
+          scanPreferences: scanPreferences,
+        ),
+      ),
+    );
+
+    final finalCount = await _songRepository.countSongsInFolder(folderUri);
+    await _folderRepository.updateFolderScanInfo(folderUri, finalCount);
+
+    detachedTasks.add(
+      _runDetachedScanTask(
+        displayName,
+        'SAF playlist sync',
+        () => _syncPlaylistSourcesForFolder(folderUri, scanPreferences),
+      ),
+    );
+
+    _logScanTiming(displayName, 'SAF scan total', totalStopwatch.elapsed);
+
+    yield ScanProgress(
+      songsFound: finalCount,
+      totalFiles: totalFiles,
+      filesProcessed: totalFiles,
+      currentFolder: displayName,
+      scanEngine: scanEngine,
+      newSongs: newSongs,
+      isComplete: true,
+    );
+  }
+
+  /// Background enrichment for the instant SAF path. Fetches real metadata
+  /// via MediaMetadataRetriever and fills the placeholder fields left by the
+  /// filename-derived basic entities.
+  Future<void> _enrichSafMetadataInBackground({
+    required List<String> uris,
+    required String folderUri,
+    required String displayName,
+    required LibraryScanPreferences scanPreferences,
+  }) async {
+    if (uris.isEmpty) return;
+
+    final metadataBatchSize = _recommendedMetadataBatchSize(uris.length);
+    final metadataChunks = _chunkList(uris, metadataBatchSize);
+
+    final songsByUri = await _songRepository.getSongEntitiesByFolder(folderUri);
+    final pathMap = <String, SongEntity>{};
+    for (final s in songsByUri) {
+      if (s.startOffsetMs == null) pathMap[s.filePath] = s;
+    }
+
+    for (final chunkUris in metadataChunks) {
+      if (_isCancelled) break;
+
+      final stopwatch = Stopwatch()..start();
+      final metadataList = await _fetchMetadataChunk(chunkUris);
+      _logScanTiming(
+        displayName,
+        'deferred metadata chunk ${chunkUris.length}',
+        stopwatch.elapsed,
+      );
+      if (metadataList == null) continue;
+
+      final metadataByUri = {for (final m in metadataList) m.uri: m};
+      final updateBatch = <SongEntity>[];
+      final idsToDelete = <int>[];
+
+      for (final uri in chunkUris) {
+        final meta = metadataByUri[uri];
+        if (meta == null) continue;
+        final existing = pathMap[uri];
+        if (existing == null) continue;
+
+        // Duration is now known: apply the full ignore filter.
+        if (_shouldIgnoreDiscoveredTrack(
+          fileSizeBytes: existing.fileSize,
+          durationMs: meta.duration,
+          scanPreferences: scanPreferences,
+        )) {
+          idsToDelete.add(existing.id);
+          continue;
+        }
+
+        // Technical fields are never user-edited; always refresh.
+        existing.durationMs = meta.duration ?? existing.durationMs;
+        existing.bitrate = meta.bitrate != null
+            ? AudioMetadataUtils.bitrateFromBitsPerSecond(
+                int.tryParse(meta.bitrate!),
+              )
+            : existing.bitrate;
+        existing.bitDepth = meta.bitDepth ?? existing.bitDepth;
+        existing.sampleRate = meta.sampleRate ?? existing.sampleRate;
+        existing.metadataComplete =
+            existing.metadataComplete ||
+            (meta.sampleRate != null && meta.bitDepth != null);
+
+        // Text fields respect manual edits.
+        if (!existing.hasLocalEdits) {
+          if (meta.title?.trim().isNotEmpty ?? false) {
+            existing.title = meta.title!.trim();
+          }
+          if (meta.artist?.trim().isNotEmpty ?? false) {
+            existing.artist = meta.artist!.trim();
+          }
+          if (meta.album?.trim().isNotEmpty ?? false) {
+            existing.album = meta.album!.trim();
+          }
+          existing.albumArtist = (meta.albumArtist?.trim().isNotEmpty ?? false)
+              ? meta.albumArtist!.trim()
+              : existing.artist;
+          existing.trackNumber = meta.trackNumber ?? existing.trackNumber;
+          existing.discNumber = meta.discNumber ?? existing.discNumber;
+          existing.genre = (meta.genre?.trim().isNotEmpty ?? false)
+              ? meta.genre!.trim()
+              : existing.genre;
+          existing.year = meta.year ?? existing.year;
+        }
+
+        updateBatch.add(existing);
+      }
+
+      if (idsToDelete.isNotEmpty) {
+        await _songRepository.deleteScannedSongsByIds(idsToDelete);
+      }
+      if (updateBatch.isNotEmpty) {
+        await _songRepository.upsertScannedSongs(updateBatch);
+      }
+    }
+
+    final finalCount = await _songRepository.countSongsInFolder(folderUri);
+    await _folderRepository.updateFolderScanInfo(folderUri, finalCount);
+  }
+
+  Stream<ScanProgress> _scanFolderAndroid(
+    String folderUri,
+    String displayName,
+    LibraryScanPreferences scanPreferences, {
+    bool deferMetadata = false,
+    ScanMode mode = ScanMode.quick,
+  }) async* {
+    if (_isCancelled) return;
+    final totalStopwatch = Stopwatch()..start();
+    const scanEngine = 'SAF';
+    var newSongs = 0;
+    var modifiedSongs = 0;
+    var deletedSongs = 0;
+    yield ScanProgress(
+      songsFound: 0,
+      totalFiles: 0,
+      currentFolder: displayName,
+      scanEngine: scanEngine,
+      phase: 'Querying filesystem',
+      isComplete: false,
+    );
+
+    // 1. Fast Scan: Get all files with basic info only
+    List<AudioFileInfo> fastScanFiles = [];
+    try {
+      final stopwatch = Stopwatch()..start();
+      fastScanFiles = await _musicFolderService.scanFolder(
+        folderUri,
+        filterNonMusicFilesAndFolders:
+            scanPreferences.filterNonMusicFilesAndFolders,
+      );
+      _logScanTiming(
+        displayName,
+        'SAF fast scan (${fastScanFiles.length} files)',
+        stopwatch.elapsed,
+      );
+    } catch (e) {
+      devLog("Error scanning Android folder: $e");
+      return;
+    }
+
+    if (_isCancelled) return;
+
+    // 2. Diff Logic
+    final existingSongs = await _songRepository.getSongEntitiesByFolder(
+      folderUri,
+    );
+    final filteredExistingSongs = await _purgeExistingSongsFilteredByRules(
+      existingSongs,
+      scanPreferences,
+    );
+    // Build two maps: one for raw entities (no startOffsetMs), one for
+    // file-existence checks. The old collapsible map lost raw entities
+    // when CUE tracks shared the same filePath, keeping stale raw rows.
+    final rawExistingMap = <String, SongEntity>{};
+    final existingMap = <String, SongEntity>{};
+    for (var s in existingSongs) {
+      if (s.startOffsetMs == null) {
+        rawExistingMap[s.filePath] = s;
+      }
+      existingMap[s.filePath] = s;
+    }
+    for (final song in filteredExistingSongs) {
+      existingMap.remove(song.filePath);
+      rawExistingMap.remove(song.filePath);
+    }
+    final fastScanMap = {for (var f in fastScanFiles) f.uri: f};
+
+    // 2b. Parse CUE and log files
+    final cueFiles = fastScanFiles
+        .where((f) => f.extension.toLowerCase() == 'cue')
+        .toList();
+    final logFiles = fastScanFiles.where((f) {
+      final ext = f.extension.toLowerCase();
+      return ext == 'log' || ext == 'txt';
+    }).toList();
+
+    final sidecarStopwatch = Stopwatch()..start();
+    final cueMap = cueFiles.isNotEmpty
+        ? await _parseCueFilesAndroid(cueFiles, fastScanMap)
+        : <String, CueSheet>{};
+    final logMap = logFiles.isNotEmpty
+        ? await _parseLogFilesAndroid(logFiles, fastScanMap)
+        : <String, RipLog>{};
+    _logScanTiming(displayName, 'SAF CUE/log parse', sidecarStopwatch.elapsed);
+
+    // Calculate variations
+    final scannedUris = fastScanMap.keys.toSet();
+
+    // Deletions: in DB but not in scan. Raw-path songs belong to filesystem
+    // engines (MediaStore DATA / Rust walk) whose URI space the SAF walk can't
+    // see — they're superseded below rather than reported as deleted.
+    final urisToDelete = existingMap.keys
+        .where(
+          (uri) => !scannedUris.contains(uri) && uri.startsWith('content://'),
+        )
+        .toList();
+
+    // Raw-path rows whose files this SAF scan also found are superseded (the
+    // scan re-adds them keyed by SAF URI); drop the stale raw rows.
+    final scannedRawPaths = fastScanFiles
+        .map((f) => rawPathFromSafUri(f.uri))
+        .whereType<String>()
+        .toSet();
+    final supersededRawIds = existingSongs
+        .where(
+          (s) =>
+              s.startOffsetMs == null &&
+              !s.filePath.startsWith('content://') &&
+              scannedRawPaths.contains(s.filePath),
+        )
+        .map((s) => s.id)
+        .toList();
+    if (supersededRawIds.isNotEmpty) {
+      await _songRepository.deleteScannedSongsByIds(supersededRawIds);
+    }
+    deletedSongs += supersededRawIds.length;
+
+    if (urisToDelete.isNotEmpty) {
+      final idsToDelete = urisToDelete
+          .map((uri) => existingMap[uri]?.id)
+          .whereType<int>()
+          .toList();
+      if (idsToDelete.isNotEmpty) {
+        await _songRepository.deleteScannedSongsByIds(idsToDelete);
+      } else {
+        await _songRepository.deleteScannedSongsByPath(urisToDelete);
+      }
+      deletedSongs += urisToDelete.length;
+    }
+
+    // Delete orphaned CUE tracks (audio file in scan but no CUE file)
+    final audioFilesWithCue = cueMap.keys.toSet();
+    final existingCuePaths = existingSongs
+        .where((s) => s.startOffsetMs != null)
+        .map((s) => s.filePath)
+        .toSet();
+    final orphanedCuePaths = existingCuePaths
+        .where((p) => scannedUris.contains(p) && !audioFilesWithCue.contains(p))
+        .toList();
+    if (orphanedCuePaths.isNotEmpty) {
+      await _songRepository.deleteScannedCueTracksByPath(orphanedCuePaths);
+    }
+
+    // Updates: New files or Modified files
+    final urisToProcess = <String>[];
+    for (final file in fastScanFiles) {
+      final existing = existingMap[file.uri];
+      if (existing == null) {
+        // New file
+        urisToProcess.add(file.uri);
+      } else {
+        // Check modification time (DB stores DateTime, File has int timestamp)
+        // DateTime.millisecondsSinceEpoch == file.lastModified (if file.lastModified is ms)
+        // Wait, MusicFolderService parses lastModified as int.
+        // Android DocumentFile.lastModified() returns MS.
+        // SongEntity.lastModified is DateTime.
+
+        final existingTime = existing.lastModified?.millisecondsSinceEpoch ?? 0;
+
+        // Check for modification OR missing text/audio properties.
+        final currentFileType = file.extension.trim().toUpperCase();
+        final storedFileType = existing.fileType?.trim().toUpperCase();
+        final fileTypeMismatch =
+            currentFileType.isNotEmpty &&
+            (storedFileType == null || storedFileType != currentFileType);
+        final missingTags =
+            existing.artist.trim().isEmpty ||
+            isUnknownLibraryArtist(existing.artist) ||
+            (existing.album ?? '').trim().isEmpty ||
+            isUnknownLibraryAlbum(existing.album);
+        final missingMetadata =
+            !existing.metadataComplete ||
+            existing.bitrate == null ||
+            existing.sampleRate == null ||
+            fileTypeMismatch ||
+            missingTags;
+
+        if (mode == ScanMode.full ||
+            file.lastModified != existingTime ||
+            missingMetadata) {
+          urisToProcess.add(file.uri);
+        }
+      }
+    }
+
+    // Ensure audio files referenced by CUE sheets are processed
+    for (final audioUri in cueMap.keys) {
+      if (!urisToProcess.contains(audioUri)) {
+        urisToProcess.add(audioUri);
+      }
+    }
+
+    // 3. Process Metadata in Chunks
+    int processed = 0;
+
+    // UX Metric: Total files found in filesystem
+    int totalFiles = fastScanFiles.length;
+
+    // UX Metric: Initial "Songs Found" = Existing - Deleted
+    int initialSongCount = existingMap.length - urisToDelete.length;
+
+    // Unchanged files are already accounted for on the progress bar; the
+    // metadata loop below adds the ones that actually get re-read.
+    final initiallyAccounted = (totalFiles - urisToProcess.length).clamp(
+      0,
+      totalFiles,
+    );
+
+    // Report initial state after diff
+    yield ScanProgress(
+      songsFound: initialSongCount,
+      totalFiles: totalFiles,
+      filesProcessed: initiallyAccounted,
+      currentFolder: displayName,
+      scanEngine: scanEngine,
+      phase: 'Reading metadata',
+      deletedSongs: deletedSongs,
+      isComplete: false,
+    );
+
+    if (deferMetadata) {
+      yield* _scanFolderAndroidInstant(
+        folderUri: folderUri,
+        displayName: displayName,
+        fastScanMap: fastScanMap,
+        existingMap: existingMap,
+        urisToProcess: urisToProcess,
+        initialSongCount: initialSongCount,
+        totalFiles: totalFiles,
+        totalStopwatch: totalStopwatch,
+        scanPreferences: scanPreferences,
+      );
+      return;
+    }
+
+    final metadataBatchSize = _recommendedMetadataBatchSize(
+      urisToProcess.length,
+    );
+    final metadataChunks = _chunkList(urisToProcess, metadataBatchSize);
+
+    for (final chunkUris in metadataChunks) {
+      if (_isCancelled) break;
+
+      final chunkStopwatch = Stopwatch()..start();
+      final metadataList = await _fetchMetadataChunk(chunkUris);
+      _logScanTiming(
+        displayName,
+        'SAF metadata chunk ${chunkUris.length}',
+        chunkStopwatch.elapsed,
+      );
+      if (metadataList == null) {
+        continue;
+      }
+
+      final batch = <SongEntity>[];
+      final idsToDelete = <int>[];
+      final metadataByUri = <String, AudioFileInfo>{
+        for (final meta in metadataList) meta.uri: meta,
+      };
+
+      for (final uri in chunkUris) {
+        final basic = fastScanMap[uri];
+        if (basic == null) continue;
+
+        final meta = metadataByUri[uri];
+        final existing = existingMap[basic.uri];
+        final looksLikeAudio =
+            _looksLikeSupportedAudioExtension(basic.extension) ||
+            (meta?.mimeType?.toLowerCase().startsWith('audio/') ?? false) ||
+            ((meta?.duration ?? 0) > 0);
+        if (!looksLikeAudio) {
+          continue;
+        }
+
+        final cueSheet = cueMap[basic.uri];
+        final ripLog = logMap[basic.uri];
+
+        if (cueSheet != null) {
+          // Delete raw entity for this audio file if present
+          final rawExisting = rawExistingMap[basic.uri];
+          if (rawExisting != null) {
+            idsToDelete.add(rawExisting.id);
+          }
+
+          // Build composite-key map so _buildCueTrackEntities can
+          // preserve IDs of existing CUE tracks across rescans.
+          final cueExistingMap = <String, SongEntity>{};
+          final cueTracksInDb = existingSongs.where(
+            (s) => s.filePath == basic.uri && s.startOffsetMs != null,
+          );
+          for (final s in cueTracksInDb) {
+            cueExistingMap['${s.filePath}#${s.startOffsetMs}'] = s;
+          }
+
+          final cueEntities = _buildCueTrackEntities(
+            audioUri: basic.uri,
+            cueSheet: cueSheet,
+            meta: meta ?? basic,
+            folderUri: folderUri,
+            existingMap: cueExistingMap,
+            ripLog: ripLog,
+            lastModified: DateTime.fromMillisecondsSinceEpoch(
+              basic.lastModified,
+            ),
+            relativeFolderPath: basic.relativeFolderPath,
+          );
+
+          for (final entity in cueEntities) {
+            if (_shouldIgnoreDiscoveredTrack(
+              fileSizeBytes: entity.fileSize,
+              durationMs: entity.durationMs,
+              scanPreferences: scanPreferences,
+            )) {
+              continue;
+            }
+            batch.add(entity);
+          }
+          continue;
+        }
+
+        final artist = (meta?.artist?.trim().isNotEmpty ?? false)
+            ? meta!.artist!.trim()
+            : l10n.unknownArtist;
+        final song = SongEntity()
+          ..filePath = basic.uri
+          ..mediaStoreUri = basic.uri.startsWith('content://')
+              ? basic.uri
+              : null
+          ..title = (meta?.title?.trim().isNotEmpty ?? false)
+              ? meta!.title!.trim()
+              : _extractTitleFromFilename(basic.name)
+          ..artist = artist
+          ..album = (meta?.album?.trim().isNotEmpty ?? false)
+              ? meta!.album!.trim()
+              : l10n.unknownAlbum
+          ..albumArtist = (meta?.albumArtist?.trim().isNotEmpty ?? false)
+              ? meta!.albumArtist!.trim()
+              : artist
+          ..trackNumber = meta?.trackNumber ?? 0
+          ..discNumber = meta?.discNumber ?? 1
+          ..durationMs = meta?.duration ?? 0
+          ..fileType = basic.extension.toUpperCase()
+          ..dateAdded = existingMap[basic.uri]?.dateAdded ?? DateTime.now()
+          ..lastModified = DateTime.fromMillisecondsSinceEpoch(
+            basic.lastModified,
+          )
+          ..folderUri = folderUri
+          ..relativeFolderPath = basic.relativeFolderPath
+          ..fileSize = basic.size
+          ..albumArtPath = _carriedArtworkPath(
+            existing,
+            lastModified: DateTime.fromMillisecondsSinceEpoch(
+              basic.lastModified,
+            ),
+            fileSize: basic.size,
+          )
+          ..bitrate = meta?.bitrate != null
+              ? AudioMetadataUtils.bitrateFromBitsPerSecond(
+                  int.tryParse(meta!.bitrate!),
+                )
+              : null
+          ..bitDepth = meta?.bitDepth
+          ..sampleRate = meta?.sampleRate
+          ..genre = (meta?.genre?.trim().isNotEmpty ?? false)
+              ? meta!.genre!.trim()
+              : existing?.genre
+          ..year = meta?.year ?? existing?.year
+          ..ripper = ripLog?.ripper
+          ..readMode = ripLog?.readMode
+          ..accurateRip = ripLog?.accurateRipEnabled
+          // ponytail: mark complete on any successful parse. sampleRate/bitDepth
+          // are API 31+ only, so requiring them kept this false on older devices
+          // and forced a full re-extract every rescan.
+          ..metadataComplete = (meta?.duration ?? 0) > 0;
+
+        if (existing != null) {
+          song.id = existing.id;
+          _preserveLocalEdits(song, existing);
+          modifiedSongs++;
+        } else {
+          newSongs++;
+        }
+
+        if (_shouldIgnoreDiscoveredTrack(
+          fileSizeBytes: basic.size,
+          durationMs: song.durationMs,
+          scanPreferences: scanPreferences,
+        )) {
+          if (existing != null) {
+            idsToDelete.add(existing.id);
+          }
+          continue;
+        }
+
+        batch.add(song);
+      }
+
+      if (idsToDelete.isNotEmpty) {
+        await _songRepository.deleteScannedSongsByIds(idsToDelete);
+      }
+      deletedSongs += idsToDelete.length;
+
+      if (batch.isNotEmpty) {
+        await _songRepository.upsertScannedSongs(batch);
+      }
+
+      processed += chunkUris.length;
+
+      yield ScanProgress(
+        songsFound: initialSongCount + processed,
+        totalFiles: totalFiles,
+        filesProcessed: initiallyAccounted + processed,
+        currentFile: batch.isNotEmpty ? batch.last.title : null,
+        currentFolder: displayName,
+        scanEngine: scanEngine,
+        phase: 'Reading metadata',
+        newSongs: newSongs,
+        modifiedSongs: modifiedSongs,
+        deletedSongs: deletedSongs,
+        isComplete: false,
+      );
+    }
+
+    if (_isCancelled) return;
+
+    final finalCount = await _songRepository.countSongsInFolder(folderUri);
+    _logScanTiming(displayName, 'SAF scan total', totalStopwatch.elapsed);
+
+    // Metadata is written; report completion now so the UI can close. Folder
+    // stats and playlist sync are bookkeeping and run detached so they cannot
+    // hold the completion event back.
+    yield ScanProgress(
+      songsFound: finalCount,
+      totalFiles: totalFiles,
+      filesProcessed: totalFiles,
+      currentFolder: displayName,
+      scanEngine: scanEngine,
+      newSongs: newSongs,
+      modifiedSongs: modifiedSongs,
+      deletedSongs: deletedSongs,
+      phase: 'Finishing up',
+      isComplete: false,
+    );
+
+    final finalization = _runDetachedScanTask(
+      displayName,
+      'scan finalization',
+      () async {
+        if (_isCancelled) return;
+        await _folderRepository.updateFolderScanInfo(folderUri, finalCount);
+        await _syncPlaylistSourcesForFolder(folderUri, scanPreferences);
+      },
+    );
+    _trackFinalization(folderUri, finalization);
+    _schedulePreloadAfterScan(
+      folderUri: folderUri,
+      displayName: displayName,
+      after: finalization,
+    );
+
+    yield ScanProgress(
+      songsFound: finalCount,
+      totalFiles: totalFiles,
+      filesProcessed: totalFiles,
+      currentFolder: displayName,
+      scanEngine: scanEngine,
+      newSongs: newSongs,
+      modifiedSongs: modifiedSongs,
+      deletedSongs: deletedSongs,
+      isComplete: true,
+    );
+  }
+
+  Stream<ScanProgress> _scanFolderRust(
+    String scanRootPath,
+    String folderUri,
+    String displayName,
+    LibraryScanPreferences scanPreferences, {
+    ScanMode mode = ScanMode.quick,
+  }) async* {
+    if (_isCancelled) return;
+    final totalStopwatch = Stopwatch()..start();
+    const scanEngine = 'Rust deep scan';
+    var newSongs = 0;
+    var modifiedSongs = 0;
+    var deletedSongs = 0;
+    final preloadCandidates = <SongEntity>[];
+
+    yield ScanProgress(
+      songsFound: 0,
+      totalFiles: 0,
+      currentFolder: displayName,
+      scanEngine: scanEngine,
+      phase: 'Loading existing entries',
+      isComplete: false,
+    );
+
+    // 1. Fetch existing file state from DB
+    final dbLoadStopwatch = Stopwatch()..start();
+    final existingSongs = await _songRepository.getSongEntitiesByFolder(
+      folderUri,
+    );
+    _logScanTiming(displayName, 'existing DB load', dbLoadStopwatch.elapsed);
+    final filteredExistingSongs = await _purgeExistingSongsFilteredByRules(
+      existingSongs,
+      scanPreferences,
+    );
+    final knownFiles = <String, int>{};
+    final existingMap = <String, SongEntity>{};
+    final newOrModifiedFingerprints = <String, int>{};
+    final deletedPaths = <String>[];
+    final safKeyedSongs = <SongEntity>[];
+
+    // Full mode re-reads every file and skips the fingerprint shortcuts,
+    // including the CUE/log unchanged checks below.
+    final forceFull = mode == ScanMode.full;
+
+    // Load fingerprint cache — supplements DB with faster lookup
+    final cachedFingerprints = forceFull
+        ? null
+        : await _fingerprintCache.load(folderUri);
+
+    for (var song in existingSongs) {
+      if (filteredExistingSongs.contains(song)) {
+        continue;
+      }
+      // SAF document-URI songs live in a URI space the raw-path walker can't
+      // see; passing them as known files would make Rust report them all as
+      // deleted. They're superseded explicitly after a successful scan.
+      if (song.filePath.startsWith('content://')) {
+        if (song.startOffsetMs == null) safKeyedSongs.add(song);
+        continue;
+      }
+      existingMap[song.filePath] = song;
+      if (song.lastModified != null &&
+          canReuseAlbumScanFingerprint(song, isIOS: Platform.isIOS)) {
+        knownFiles[song.filePath] = song.lastModified!.millisecondsSinceEpoch;
+      }
+    }
+
+    // Merge fingerprint cache: only entries that correspond to an existing DB
+    // song are trusted. An orphaned cache (e.g. restored after reinstall while
+    // the DB was wiped) must not mark files as "known", or the scanner skips
+    // every file and the library ends up empty.
+    if (cachedFingerprints != null) {
+      for (final entry in cachedFingerprints.entries) {
+        final existing = existingMap[entry.key];
+        if (existing != null &&
+            canReuseAlbumScanFingerprint(existing, isIOS: Platform.isIOS)) {
+          knownFiles[entry.key] = entry.value;
+        }
+      }
+    }
+
+    // 2. Stream scan batches from Rust
+    int processed = 0;
+    int filesAccounted = 0;
+    int totalFiles = 0;
+    int initialSongCount = existingMap.length;
+    bool initialProgressSent = false;
+    final rustScanStopwatch = Stopwatch()..start();
+
+    await for (final chunk in scanMusicLibrary(
+      rootPath: scanRootPath,
+      knownFiles: knownFiles,
+      scanOptions: ScanOptions(
+        filterNonMusicFilesAndFolders:
+            scanPreferences.filterNonMusicFilesAndFolders,
+        forceFullRescan: forceFull,
+      ),
+    )) {
+      if (_isCancelled) {
+        break;
+      }
+
+      // Walk-phase heartbeat: the directory walk is still running, so there
+      // is no file total yet. filesWalked drives the "checking" counter.
+      if (chunk.totalFiles == 0 && chunk.filesWalked > 0 && !chunk.isComplete) {
+        yield ScanProgress(
+          songsFound: initialSongCount,
+          totalFiles: 0,
+          filesProcessed: chunk.filesWalked,
+          currentFolder: displayName,
+          scanEngine: scanEngine,
+          phase: 'Checking for changes',
+          deletedSongs: deletedSongs,
+          isComplete: false,
+        );
+        continue;
+      }
+
+      totalFiles = chunk.totalFiles;
+      // Unchanged files (and deletions) are accounted for up front, so the
+      // bar reflects checked files instead of only re-read ones.
+      filesAccounted = chunk.filesProcessed;
+
+      if (!initialProgressSent) {
+        // Deletions are collected here and applied only after the walk
+        // finishes: an interrupted or failed scan must never leave the
+        // folder emptied (files are re-verified by the next scan).
+        deletedPaths.addAll(chunk.deletedPaths);
+        initialSongCount = existingMap.length - chunk.deletedPaths.length;
+        deletedSongs += chunk.deletedPaths.length;
+        initialProgressSent = true;
+      }
+
+      SongEntity? lastProcessed;
+      if (chunk.newOrModified.isNotEmpty) {
+        final batch = <SongEntity>[];
+        final idsToDelete = <int>[];
+
+        for (final metadata in chunk.newOrModified) {
+          final existing = existingMap[metadata.path];
+          final artist = (metadata.artist?.trim().isNotEmpty ?? false)
+              ? metadata.artist!.trim()
+              : l10n.unknownArtist;
+          final priorAlbumArtist = existing?.albumArtist?.trim();
+          final song = SongEntity()
+            ..filePath = metadata.path
+            ..title = (metadata.title?.trim().isNotEmpty ?? false)
+                ? metadata.title!.trim()
+                : _extractTitleFromFilename(metadata.path.split('/').last)
+            ..artist = artist
+            ..album = (metadata.album?.trim().isNotEmpty ?? false)
+                ? metadata.album!.trim()
+                : l10n.unknownAlbum
+            ..albumArtist =
+                Platform.isIOS &&
+                    (metadata.albumArtist?.trim().isNotEmpty ?? false)
+                ? metadata.albumArtist!.trim()
+                : Platform.isIOS
+                ? (priorAlbumArtist?.isNotEmpty == true
+                      ? priorAlbumArtist
+                      : artist)
+                : existing?.albumArtist ?? artist
+            ..trackNumber = metadata.trackNumber ?? existing?.trackNumber ?? 0
+            ..discNumber = metadata.discNumber ?? existing?.discNumber ?? 1
+            ..durationMs = metadata.durationMs?.toInt() ?? 0
+            ..fileType = metadata.format.toUpperCase()
+            ..dateAdded = existing?.dateAdded ?? DateTime.now()
+            ..lastModified = DateTime.fromMillisecondsSinceEpoch(
+              metadata.lastModified,
+            )
+            ..folderUri = folderUri
+            ..fileSize = metadata.fileSize.toInt()
+            ..albumArtPath = _carriedArtworkPath(
+              existing,
+              lastModified: DateTime.fromMillisecondsSinceEpoch(
+                metadata.lastModified,
+              ),
+              fileSize: metadata.fileSize.toInt(),
+            )
+            ..bitrate = AudioMetadataUtils.normalizeStoredBitrateKbps(
+              metadata.bitrate,
+              sampleRate: metadata.sampleRate,
+              bitDepth: metadata.bitDepth,
+            )
+            ..bitDepth = metadata.bitDepth
+            ..sampleRate = metadata.sampleRate
+            ..replaygainTrackGain = metadata.replaygainTrackGain
+            ..replaygainTrackPeak = metadata.replaygainTrackPeak
+            ..replaygainAlbumGain = metadata.replaygainAlbumGain
+            ..replaygainAlbumPeak = metadata.replaygainAlbumPeak
+            ..metadataComplete = true;
+
+          if (existing != null) {
+            song.id = existing.id;
+            _preserveLocalEdits(song, existing);
+            modifiedSongs++;
+          } else {
+            newSongs++;
+          }
+
+          if (_shouldIgnoreDiscoveredTrack(
+            fileSizeBytes: metadata.fileSize.toInt(),
+            durationMs: song.durationMs,
+            scanPreferences: scanPreferences,
+          )) {
+            if (existing != null) {
+              idsToDelete.add(existing.id);
+            }
+            continue;
+          }
+
+          batch.add(song);
+          newOrModifiedFingerprints[metadata.path] = metadata.lastModified;
+        }
+
+        if (idsToDelete.isNotEmpty) {
+          await _songRepository.deleteScannedSongsByIds(idsToDelete);
+        }
+        deletedSongs += idsToDelete.length;
+
+        if (batch.isNotEmpty) {
+          await _songRepository.upsertScannedSongs(batch);
+          preloadCandidates.addAll(batch.where((song) => song.id > 0));
+        }
+        processed += batch.length;
+        lastProcessed = batch.isNotEmpty ? batch.last : null;
+      }
+
+      yield ScanProgress(
+        songsFound: initialSongCount + processed,
+        totalFiles: totalFiles,
+        filesProcessed: filesAccounted,
+        currentFile: lastProcessed?.title,
+        currentFolder: displayName,
+        scanEngine: scanEngine,
+        phase: 'Reading metadata',
+        newSongs: newSongs,
+        modifiedSongs: modifiedSongs,
+        deletedSongs: deletedSongs,
+        isComplete: false,
+      );
+    }
+    _logScanTiming(displayName, 'Rust scan stream', rustScanStopwatch.elapsed);
+
+    // Stopped mid-scan: skip deletions, sidecars, playlist/cache sync and the
+    // detached preload, so a cancelled scan can't keep mutating state.
+    if (_isCancelled) return;
+
+    // Apply deletions only now that the walk completed successfully.
+    if (!_isCancelled && deletedPaths.isNotEmpty) {
+      final idsToDelete = deletedPaths
+          .map((path) => existingMap[path]?.id)
+          .whereType<int>()
+          .toList();
+      if (idsToDelete.isNotEmpty) {
+        await _songRepository.deleteScannedSongsByIds(idsToDelete);
+      } else {
+        await _songRepository.deleteScannedSongsByPath(deletedPaths);
+      }
+    }
+
+    // SAF-scanned rows the walker re-added with raw paths are superseded;
+    // drop the old URI-keyed rows only when the replacement actually exists.
+    if (!_isCancelled && safKeyedSongs.isNotEmpty) {
+      final rawPathsNow =
+          (await _songRepository.getSongEntitiesByFolder(folderUri))
+              .where((s) => !s.filePath.startsWith('content://'))
+              .map((s) => s.filePath)
+              .toSet();
+      final supersededIds = safKeyedSongs
+          .where((s) {
+            final raw = rawPathFromSafUri(s.filePath);
+            return raw != null && rawPathsNow.contains(raw);
+          })
+          .map((s) => s.id)
+          .toList();
+      if (supersededIds.isNotEmpty) {
+        await _songRepository.deleteScannedSongsByIds(supersededIds);
+        deletedSongs += supersededIds.length;
+      }
+    }
+
+    final finalCount = await _songRepository.countSongsInFolder(folderUri);
+    await _folderRepository.updateFolderScanInfo(folderUri, finalCount);
+
+    _logScanTiming(displayName, 'Rust scan total', totalStopwatch.elapsed);
+
+    // The scan itself is done. Anything left (CUE/log sidecars, playlist and
+    // fingerprint caches, the optional preload) is bookkeeping the UI should
+    // not have to wait on, so announce the "finishing up" state and then run
+    // it as one detached task before reporting completion.
+    yield ScanProgress(
+      songsFound: finalCount,
+      totalFiles: totalFiles,
+      filesProcessed: totalFiles,
+      currentFolder: displayName,
+      scanEngine: scanEngine,
+      newSongs: newSongs,
+      modifiedSongs: modifiedSongs,
+      deletedSongs: deletedSongs,
+      phase: 'Finishing up',
+      isComplete: false,
+    );
+
+    final finalization = _runDetachedScanTask(displayName, 'scan finalization', () async {
+      if (_isCancelled) return;
+
+      // Post-process CUE and log files (single walk, both collected in one pass)
+      if (!_isCancelled) {
+        final sidecarStopwatch = Stopwatch()..start();
+        final (:cueMap, :logMap) = await _parseCueAndLogFilesRust(scanRootPath);
+        _logScanTiming(
+          displayName,
+          'Rust CUE/log parse',
+          sidecarStopwatch.elapsed,
+        );
+
+        if (cueMap.isNotEmpty || logMap.isNotEmpty || Platform.isIOS) {
+          final existingSongsAfterScan = await _songRepository
+              .getSongEntitiesByFolder(folderUri);
+          // Separate raw entities from CUE tracks — the old collapsible map
+          // (keyed only by filePath) lost raw entities when CUE tracks shared
+          // the same path, causing raw entities to survive alongside CUE tracks.
+          final rawEntitiesByPath = <String, SongEntity>{};
+          final logExistingByPath = <String, SongEntity>{};
+          for (var s in existingSongsAfterScan) {
+            if (s.startOffsetMs == null) {
+              rawEntitiesByPath[s.filePath] = s;
+            }
+            logExistingByPath[s.filePath] = s;
+          }
+
+          // Delete orphaned CUE tracks
+          final existingCuePaths = existingSongsAfterScan
+              .where((s) => s.startOffsetMs != null)
+              .map((s) => s.filePath)
+              .toSet();
+          final orphanedCuePaths = existingCuePaths
+              .where((p) => !cueMap.containsKey(p))
+              .toList();
+          final ordinaryOrphans = <String>[];
+          for (final audioPath in orphanedCuePaths) {
+            if (Platform.isIOS &&
+                iosTransferOperationKeyForPath(audioPath) != null) {
+              // A CUE track's duration describes a range, never the full file.
+              // Re-read the actual file before replacing any of its rows.
+              final metadata = await _extractRustMetadataForUri(
+                audioPath,
+                rawPath: audioPath,
+              );
+              if (metadata == null || _isCancelled) continue;
+              final expected = existingSongsAfterScan
+                  .where((row) => row.filePath == audioPath)
+                  .toList();
+              final fallback = expected.firstOrNull;
+              if (fallback == null) continue;
+              final modified = DateTime.fromMillisecondsSinceEpoch(
+                metadata.lastModified,
+              );
+              final replacement = SongEntity()
+                ..filePath = audioPath
+                ..title = (metadata.title?.trim().isNotEmpty ?? false)
+                    ? metadata.title!.trim()
+                    : _extractTitleFromFilename(audioPath.split('/').last)
+                ..artist = (metadata.artist?.trim().isNotEmpty ?? false)
+                    ? metadata.artist!.trim()
+                    : l10n.unknownArtist
+                ..album = metadata.album
+                ..albumArtist = metadata.albumArtist
+                ..genre = metadata.genre
+                ..year = metadata.year
+                ..trackNumber = metadata.trackNumber
+                ..discNumber = metadata.discNumber
+                ..durationMs = metadata.durationMs?.toInt()
+                ..fileType = metadata.format.toUpperCase()
+                ..fileSize = metadata.fileSize.toInt()
+                ..lastModified = modified
+                ..folderUri = folderUri
+                ..relativeFolderPath = fallback.relativeFolderPath
+                ..albumArtPath = _carriedArtworkPath(
+                  fallback,
+                  lastModified: modified,
+                  fileSize: metadata.fileSize.toInt(),
+                )
+                ..bitrate = AudioMetadataUtils.normalizeStoredBitrateKbps(
+                  metadata.bitrate,
+                  sampleRate: metadata.sampleRate,
+                  bitDepth: metadata.bitDepth,
+                )
+                ..sampleRate = metadata.sampleRate
+                ..bitDepth = metadata.bitDepth
+                ..channels = fallback.channels
+                ..replaygainTrackGain = metadata.replaygainTrackGain
+                ..replaygainTrackPeak = metadata.replaygainTrackPeak
+                ..replaygainAlbumGain = metadata.replaygainAlbumGain
+                ..replaygainAlbumPeak = metadata.replaygainAlbumPeak
+                ..metadataComplete = true;
+              if ((replacement.durationMs ?? 0) <= 0 ||
+                  (replacement.fileSize ?? 0) <= 0 ||
+                  replacement.fileType!.isEmpty)
+                continue;
+              final mapped = await _songRepository.replaceImportedCueTracks(
+                audioPath,
+                [replacement],
+                expected: expected,
+              );
+              if (!mapped) ordinaryOrphans.add(audioPath);
+            } else {
+              ordinaryOrphans.add(audioPath);
+            }
+          }
+          // Preserve ordinary/Android cleanup's existing sidecar condition.
+          // Native groups are removed only by accepted atomic replacement.
+          if ((cueMap.isNotEmpty || logMap.isNotEmpty) &&
+              ordinaryOrphans.isNotEmpty) {
+            await _songRepository.deleteScannedCueTracksByPath(ordinaryOrphans);
+          }
+
+          // Process CUE files
+          for (final entry in cueMap.entries) {
+            final audioPath = entry.key;
+            final cueSheet = entry.value;
+
+            // Skip if audio file unchanged since last scan and CUE tracks
+            // already exist in DB — avoids redundant re-parsing.
+            final cachedTs = cachedFingerprints?[audioPath];
+            if (cachedTs != null &&
+                !(Platform.isIOS &&
+                    iosTransferOperationKeyForPath(audioPath) != null)) {
+              final existingCueCount = existingSongsAfterScan
+                  .where(
+                    (s) => s.filePath == audioPath && s.startOffsetMs != null,
+                  )
+                  .length;
+              if (existingCueCount > 0) {
+                try {
+                  final stat = FileStat.statSync(audioPath);
+                  if (stat.type != FileSystemEntityType.notFound &&
+                      stat.modified.millisecondsSinceEpoch == cachedTs) {
+                    continue;
+                  }
+                } catch (_) {}
+              }
+            }
+
+            final rawEntity = rawEntitiesByPath[audioPath];
+
+            // Re-fetch existing CUE tracks for this path to preserve IDs
+            final cueExistingMap = <String, SongEntity>{};
+            final cueTracksInDb = existingSongsAfterScan.where(
+              (s) => s.filePath == audioPath && s.startOffsetMs != null,
+            );
+            for (final s in cueTracksInDb) {
+              cueExistingMap['${s.filePath}#${s.startOffsetMs}'] = s;
+            }
+
+            // Build fallback metadata — prefer raw entity (fresh audio tags),
+            // then fall back to existing CUE tracks (preserve across rescans
+            // when the raw entity was already deleted).
+            SongEntity? fallbackSource = rawEntity;
+            fallbackSource ??= cueTracksInDb.isNotEmpty
+                ? cueTracksInDb.first
+                : null;
+            final AudioFileInfo? fallbackMeta = fallbackSource != null
+                ? AudioFileInfo(
+                    uri: audioPath,
+                    name: audioPath.split('/').last,
+                    size: fallbackSource.fileSize ?? 0,
+                    lastModified:
+                        fallbackSource.lastModified?.millisecondsSinceEpoch ??
+                        0,
+                    extension: audioPath.split('.').last,
+                    title: fallbackSource.title,
+                    artist: fallbackSource.artist,
+                    album: fallbackSource.album,
+                    albumArtist: fallbackSource.albumArtist,
+                    trackNumber: fallbackSource.trackNumber,
+                    discNumber: fallbackSource.discNumber,
+                    duration: fallbackSource.durationMs,
+                    albumArtPath: fallbackSource.albumArtPath,
+                    bitrate: fallbackSource.bitrate?.toString(),
+                    bitDepth: fallbackSource.bitDepth,
+                    sampleRate: fallbackSource.sampleRate,
+                  )
+                : null;
+
+            // Preserve the existing Android scanner's deletion ordering.
+            if (!Platform.isIOS && rawEntity != null) {
+              await _songRepository.deleteScannedSongsByIds([rawEntity.id]);
+            }
+            final ripLog = logMap[audioPath];
+            final lastModified =
+                rawEntity?.lastModified ??
+                fallbackSource?.lastModified ??
+                DateTime.fromMillisecondsSinceEpoch(
+                  DateTime.now().millisecondsSinceEpoch,
+                );
+
+            final entities = _buildCueTrackEntities(
+              audioUri: audioPath,
+              cueSheet: cueSheet,
+              meta: fallbackMeta,
+              folderUri: folderUri,
+              existingMap: cueExistingMap,
+              ripLog: ripLog,
+              lastModified: lastModified,
+              relativeFolderPath: fallbackSource?.relativeFolderPath,
+            );
+
+            if (entities.isNotEmpty) {
+              final mapped = await _songRepository.replaceImportedCueTracks(
+                audioPath,
+                entities,
+                expected: existingSongsAfterScan
+                    .where((row) => row.filePath == audioPath)
+                    .toList(),
+              );
+              if (!mapped) {
+                if (Platform.isIOS && rawEntity != null) {
+                  await _songRepository.deleteScannedSongsByIds([rawEntity.id]);
+                }
+                await _songRepository.upsertScannedSongs(entities);
+              }
+            }
+          }
+
+          // Apply log metadata to raw audio files without CUE
+          for (final entry in logMap.entries) {
+            final audioPath = entry.key;
+            if (cueMap.containsKey(audioPath)) continue;
+
+            // Skip if audio file unchanged since last scan and already
+            // has log metadata — avoids redundant re-parsing.
+            final cachedTs = cachedFingerprints?[audioPath];
+            final existing = logExistingByPath[audioPath];
+            if (cachedTs != null &&
+                existing != null &&
+                existing.ripper != null) {
+              try {
+                final stat = FileStat.statSync(audioPath);
+                if (stat.type != FileSystemEntityType.notFound &&
+                    stat.modified.millisecondsSinceEpoch == cachedTs) {
+                  continue;
+                }
+              } catch (_) {}
+            }
+
+            if (existing == null) continue;
+            existing.ripper = entry.value.ripper;
+            existing.readMode = entry.value.readMode;
+            existing.accurateRip = entry.value.accurateRipEnabled;
+            await _songRepository.upsertScannedSong(existing);
+          }
+        }
+      }
+
+      final playlistStopwatch = Stopwatch()..start();
+      await _syncPlaylistSourcesForFolder(
+        folderUri,
+        scanPreferences,
+        scanRootPath: scanRootPath,
+      );
+      _logScanTiming(
+        displayName,
+        'Rust playlist sync',
+        playlistStopwatch.elapsed,
+      );
+
+      final fingerprintStopwatch = Stopwatch()..start();
+      await _fingerprintCache.sync(
+        folderUri,
+        newOrModifiedFingerprints,
+        deletedPaths,
+      );
+      _logScanTiming(
+        displayName,
+        'Rust fingerprint sync',
+        fingerprintStopwatch.elapsed,
+      );
+
+      _logScanTiming(displayName, 'Rust scan total', totalStopwatch.elapsed);
+    });
+    _trackFinalization(folderUri, finalization);
+
+    // Audio preload runs after finalization (CUE/log upserts must exist first)
+    // but detached from the artwork wait, so cover resolution is not delayed
+    // by the decode pass — which holds the artwork gate for its whole run.
+    unawaited(
+      _runDetachedScanTask(displayName, 'scan preload', () async {
+        await finalization;
+        // Re-read the pref at spawn time so a mid-scan toggle is honored
+        // instead of using the snapshot captured at scan start.
+        final currentPrefs = await _scanPreferencesService.getPreferences();
+        if (_isCancelled) return;
+        if (currentPrefs.preloadAudioData && preloadCandidates.isNotEmpty) {
+          await _preloadAudioData(preloadCandidates);
+        }
+      }),
+    );
+
+    yield ScanProgress(
+      songsFound: finalCount,
+      totalFiles: totalFiles,
+      filesProcessed: totalFiles,
+      currentFolder: displayName,
+      scanEngine: scanEngine,
+      newSongs: newSongs,
+      modifiedSongs: modifiedSongs,
+      deletedSongs: deletedSongs,
+      isComplete: true,
+    );
+  }
+
+  /// Scans every saved folder concurrently.
+  ///
+  /// [forceDeepScan] reads every folder directly from storage for this run
+  /// (Android), whatever each folder's deep-scan setting says.
+  Stream<ScanProgress> scanAllFolders({
+    ScanMode mode = ScanMode.quick,
+    bool forceDeepScan = false,
+  }) => Platform.isIOS
+      ? IosLibraryScanEpoch.bind(
+          () => _scanAllFoldersEntry(mode: mode, forceDeepScan: forceDeepScan),
+        )
+      : _scanAllFoldersEntry(mode: mode, forceDeepScan: forceDeepScan);
+
+  Stream<ScanProgress> _scanAllFoldersEntry({
+    ScanMode mode = ScanMode.quick,
+    bool forceDeepScan = false,
+  }) async* {
+    _isCancelled = false;
+    final totalStopwatch = Stopwatch()..start();
+    final folders = await _folderRepository.getAllFolders();
+    final scanPlan = _deduplicateFoldersForScan(folders);
+    if (scanPlan.isEmpty) return;
+
+    final foldersTotal = scanPlan.length;
+
+    // Scan all deduplicated folders concurrently, but publish one aggregated
+    // progress event per folder update so the UI never bounces between
+    // per-folder counters.
+    final controller = StreamController<ScanProgress>();
+    final folderStates = <String, FolderScanProgress>{};
+    var started = 0;
+    var completed = 0;
+    String? aggScanEngine;
+    String? lastPhase;
+    String? lastCurrentFile;
+
+    int sumOf(int Function(FolderScanProgress) pick) =>
+        folderStates.values.fold(0, (sum, state) => sum + pick(state));
+
+    void emitAggregate() {
+      if (controller.isClosed) return;
+      final snapshots = folderStates.values.toList(growable: false);
+      var totalFiles = 0;
+      var filesProcessed = 0;
+      var songsFound = 0;
+      for (final snapshot in snapshots) {
+        totalFiles += snapshot.totalFiles;
+        filesProcessed += snapshot.filesProcessed;
+        songsFound += snapshot.songsFound;
+      }
+      controller.add(
+        ScanProgress(
+          songsFound: songsFound,
+          totalFiles: totalFiles,
+          filesProcessed: filesProcessed,
+          currentFile: lastCurrentFile,
+          currentFolder: snapshots.length == 1
+              ? snapshots.first.displayName
+              : null,
+          phase: lastPhase,
+          scanEngine: aggScanEngine,
+          newSongs: sumOf((s) => s.newSongs),
+          modifiedSongs: sumOf((s) => s.modifiedSongs),
+          deletedSongs: sumOf((s) => s.deletedSongs),
+          foldersTotal: foldersTotal,
+          foldersCompleted: completed,
+          folders: snapshots,
+          isComplete: false,
+        ),
+      );
+    }
+
+    for (final folder in scanPlan) {
+      if (_isCancelled) break;
+      started++;
+
+      _scanFolderInternal(
+        folder.uri,
+        folder.displayName,
+        mode: mode,
+        forceDeepScan: forceDeepScan,
+      ).listen(
+        (progress) {
+          folderStates[folder.uri] = FolderScanProgress(
+            displayName: folder.displayName,
+            songsFound: progress.songsFound,
+            totalFiles: progress.totalFiles,
+            filesProcessed: progress.filesProcessed,
+            currentFile: progress.currentFile,
+            phase: progress.phase,
+            newSongs: progress.newSongs,
+            modifiedSongs: progress.modifiedSongs,
+            deletedSongs: progress.deletedSongs,
+            isComplete: progress.isComplete,
+            unavailable: progress.unavailable,
+          );
+          aggScanEngine ??= progress.scanEngine;
+          lastPhase = progress.phase;
+          lastCurrentFile = progress.currentFile;
+          emitAggregate();
+        },
+        onDone: () {
+          completed++;
+          final state = folderStates[folder.uri];
+          if (state != null && state.totalFiles > 0) {
+            folderStates[folder.uri] = FolderScanProgress(
+              displayName: state.displayName,
+              songsFound: state.songsFound,
+              totalFiles: state.totalFiles,
+              filesProcessed: state.totalFiles,
+              phase: state.phase,
+              newSongs: state.newSongs,
+              modifiedSongs: state.modifiedSongs,
+              deletedSongs: state.deletedSongs,
+              isComplete: true,
+              unavailable: state.unavailable,
+            );
+          }
+          emitAggregate();
+          // Close only when every attached folder stream finished; `started`
+          // (not `running`) keeps a fast first folder from closing early.
+          if (completed == started && !controller.isClosed) {
+            controller.close();
+          }
+        },
+        onError: (e) {
+          if (!controller.isClosed) controller.addError(e);
+        },
+        cancelOnError: false,
+      );
+    }
+
+    yield* controller.stream;
+
+    if (!_isCancelled) {
+      final finalCount = await _songRepository.getSongCount();
+      _logScanTiming('all folders', 'scan all total', totalStopwatch.elapsed);
+      yield ScanProgress(
+        songsFound: finalCount,
+        totalFiles: 0,
+        scanEngine: aggScanEngine,
+        newSongs: sumOf((s) => s.newSongs),
+        modifiedSongs: sumOf((s) => s.modifiedSongs),
+        deletedSongs: sumOf((s) => s.deletedSongs),
+        foldersTotal: foldersTotal,
+        foldersCompleted: foldersTotal,
+        isComplete: true,
+      );
+    }
+  }
+
+  /// Efficiently check for externally deleted files across all folders.
+  /// Only removes songs whose file paths no longer exist on disk.
+  Future<void> refreshDeletions() => Platform.isIOS
+      ? IosLibraryScanEpoch.run(_refreshDeletionsEntry)
+      : _refreshDeletionsEntry();
+
+  Future<void> _refreshDeletionsEntry() async {
+    final stopwatch = Stopwatch()..start();
+    final folders = await _folderRepository.getAllFolders();
+    if (folders.isEmpty) return;
+
+    final scanPreferences = await _scanPreferencesService.getPreferences();
+
+    for (final folder in folders) {
+      try {
+        await _refreshDeletionsForFolder(
+          folder.uri,
+          folder.displayName,
+          scanPreferences,
+        );
+      } catch (e) {
+        devLog('Deletion refresh failed for ${folder.displayName}: $e');
+      }
+    }
+
+    _logScanTiming('all folders', 'deletion refresh total', stopwatch.elapsed);
+  }
+
+  Future<int> _refreshDeletionsForFolder(
+    String folderUri,
+    String displayName,
+    LibraryScanPreferences scanPreferences,
+  ) async {
+    final stopwatch = Stopwatch()..start();
+    final existingSongs = await _songRepository.getSongEntitiesByFolder(
+      folderUri,
+    );
+    if (existingSongs.isEmpty) return 0;
+
+    final hasContentUris = existingSongs.any(
+      (s) => s.filePath.startsWith('content://'),
+    );
+
+    List<String> deletedPaths;
+
+    if (hasContentUris) {
+      deletedPaths = await _checkDeletedPathsSaf(
+        folderUri,
+        existingSongs,
+        scanPreferences,
+      );
+    } else if (Platform.isAndroid) {
+      final resolvedScanRoot = await _musicFolderService.resolveFilesystemPath(
+        folderUri,
+      );
+      if (resolvedScanRoot != null && resolvedScanRoot.isNotEmpty) {
+        deletedPaths = await _checkDeletedPathsRust(
+          resolvedScanRoot,
+          existingSongs,
+          scanPreferences,
+        );
+      } else {
+        devLog(
+          'Skipping deletion check for $displayName: '
+          'cannot resolve filesystem path',
+        );
+        return 0;
+      }
+    } else {
+      deletedPaths = await _checkDeletedPathsRust(
+        folderUri,
+        existingSongs,
+        scanPreferences,
+      );
+    }
+
+    if (deletedPaths.isNotEmpty) {
+      final existingMap = {for (final s in existingSongs) s.filePath: s};
+      final idsToDelete = deletedPaths
+          .map((path) => existingMap[path]?.id)
+          .whereType<int>()
+          .toList();
+
+      if (idsToDelete.isNotEmpty) {
+        await _songRepository.deleteScannedSongsByIds(idsToDelete);
+      } else {
+        await _songRepository.deleteScannedSongsByPath(deletedPaths);
+      }
+
+      devLog('Deleted ${deletedPaths.length} missing songs from $displayName');
+    }
+
+    // Update folder stats
+    final finalCount = await _songRepository.countSongsInFolder(folderUri);
+    await _folderRepository.updateFolderScanInfo(folderUri, finalCount);
+
+    _logScanTiming(
+      displayName,
+      'deletion refresh (${deletedPaths.length} removed)',
+      stopwatch.elapsed,
+    );
+
+    return deletedPaths.length;
+  }
+
+  Future<List<String>> _checkDeletedPathsSaf(
+    String folderUri,
+    List<SongEntity> existingSongs,
+    LibraryScanPreferences scanPreferences,
+  ) async {
+    final filePaths = existingSongs
+        .where((s) => s.filePath.startsWith('/'))
+        .map((s) => s.filePath)
+        .toList();
+
+    if (filePaths.isNotEmpty && Platform.isAndroid) {
+      try {
+        final stopwatch = Stopwatch()..start();
+        final result = await _musicFolderService.queryMediaStoreDeletions(
+          filePaths,
+        );
+        if (Uac2PreferencesService.isDeveloperModeEnabledSync) {
+          devLog(
+            '[LibraryScanner] MediaStore deletion check (${filePaths.length} paths): '
+            '${stopwatch.elapsed.inMilliseconds}ms, ${result.length} deleted',
+          );
+        }
+        return result;
+      } catch (e) {
+        devLog('MediaStore deletion check failed, falling back to SAF: $e');
+      }
+    }
+
+    final fastScanFiles = await _musicFolderService.scanFolder(
+      folderUri,
+      filterNonMusicFilesAndFolders:
+          scanPreferences.filterNonMusicFilesAndFolders,
+    );
+    final scannedUris = fastScanFiles.map((f) => f.uri).toSet();
+    // The SAF walk only speaks in SAF document URIs, so it can only vouch
+    // for rows keyed the same way. Raw-path rows belong to the filesystem
+    // engines and must not be judged here.
+    return existingSongs
+        .where((s) => _isSafUri(s.filePath))
+        .where((s) => !scannedUris.contains(s.filePath))
+        .map((s) => s.filePath)
+        .toList();
+  }
+
+  Future<List<String>> _checkDeletedPathsRust(
+    String rootPath,
+    List<SongEntity> existingSongs,
+    LibraryScanPreferences scanPreferences,
+  ) async {
+    final knownFiles = <String, int>{};
+    for (final song in existingSongs) {
+      // SAF-keyed rows live in a URI space the Rust walker cannot see;
+      // handing them over would mark every one of them as deleted.
+      if (song.filePath.startsWith('content://')) {
+        continue;
+      }
+      if (song.lastModified != null) {
+        knownFiles[song.filePath] = song.lastModified!.millisecondsSinceEpoch;
+      }
+    }
+
+    final stopwatch = Stopwatch()..start();
+    final result = await checkDeletedPaths(
+      rootPath: rootPath,
+      knownFiles: knownFiles,
+      scanOptions: ScanOptions(
+        filterNonMusicFilesAndFolders:
+            scanPreferences.filterNonMusicFilesAndFolders,
+        forceFullRescan: false,
+      ),
+    );
+    if (Uac2PreferencesService.isDeveloperModeEnabledSync) {
+      devLog(
+        '[LibraryScanner] Rust deletion check (${knownFiles.length} known): '
+        '${stopwatch.elapsed.inMilliseconds}ms, ${result.length} deleted',
+      );
+    }
+    return result;
+  }
+
+  List<FolderEntity> _deduplicateFoldersForScan(List<FolderEntity> folders) {
+    final sortedFolders = List<FolderEntity>.from(folders)
+      ..sort((a, b) {
+        final normalizedA = normalizeFolderIdentifier(a.uri);
+        final normalizedB = normalizeFolderIdentifier(b.uri);
+        final lengthCompare = normalizedA.length.compareTo(normalizedB.length);
+        if (lengthCompare != 0) {
+          return lengthCompare;
+        }
+        return normalizedA.compareTo(normalizedB);
+      });
+
+    final scheduledRoots = <String>{};
+    final scanPlan = <FolderEntity>[];
+
+    for (final folder in sortedFolders) {
+      final normalized = normalizeFolderIdentifier(folder.uri);
+      final overlapsExisting = scheduledRoots.any(
+        (root) =>
+            isSameOrDescendantFolder(normalized, root) ||
+            isSameOrDescendantFolder(root, normalized),
+      );
+      if (overlapsExisting) {
+        devLog(
+          'Skipping overlapping scan root ${folder.displayName} (${folder.uri})',
+        );
+        continue;
+      }
+      scheduledRoots.add(normalized);
+      scanPlan.add(folder);
+    }
+
+    return scanPlan;
+  }
+
+  String _extractTitleFromFilename(String filename) {
+    final dotIndex = filename.lastIndexOf('.');
+    String name = dotIndex > 0 ? filename.substring(0, dotIndex) : filename;
+    name = name.replaceFirst(RegExp(r'^\d{1,3}[\s._-]+'), '');
+    name = name.replaceAll('_', ' ');
+    return name.trim().replaceAll(RegExp(r'\s+'), ' ');
+  }
+
+  /// Extensions MediaMetadataRetriever cannot reliably decode (WavPack:
+  /// never, on any device; DSD: most OEM builds). Rows of these types get a
+  /// second chance through the Rust parsers.
+  static const _rustFallbackExtensions = {'wv', 'dsf', 'dff'};
+
+  /// Decides whether a retriever result warrants a Rust parser retry.
+  ///
+  /// WavPack/DSD always retry. Other formats retry when the retriever could
+  /// not establish the core stream layout (missing sample rate or duration) —
+  /// OEM extractors have been seen failing on hi-res FLAC (HiOS, 192 kHz)
+  /// while reporting the container bitrate. Missing bit depth alone is normal
+  /// for lossy codecs and must not trigger a parse. Pure; unit-tested.
+  static bool shouldRustRetryMetadata({
+    required String extension,
+    required bool hasMetadata,
+    required bool hasSampleRate,
+    required bool hasDuration,
+    bool hasBitDepth = true,
+    bool hasBitrate = true,
+  }) {
+    if (_rustFallbackExtensions.contains(extension)) return true;
+    const lossless = {
+      'flac',
+      'wav',
+      'wave',
+      'alac',
+      'aif',
+      'aiff',
+      'ape',
+      'wv',
+    };
+    return !hasMetadata ||
+        !hasSampleRate ||
+        !hasDuration ||
+        !hasBitrate ||
+        (lossless.contains(extension.toLowerCase()) && !hasBitDepth);
+  }
+
+  /// Upper bound for staging a SAF document just to read its tags (256 MB).
+  /// Larger files stay sparse in the SAF tier; playback staging is unaffected.
+  static const _metadataStagingMaxBytes = 256 * 1024 * 1024;
+
+  Future<List<AudioFileInfo>?> _fetchMetadataChunk(
+    List<String> chunkUris, {
+    Map<String, String>? rawPathByUri,
+  }) async {
+    try {
+      final metadataList = await _musicFolderService.fetchMetadata(chunkUris);
+      return await _fillRustMetadataFallback(
+        metadataList,
+        chunkUris,
+        rawPathByUri: rawPathByUri,
+      );
+    } catch (e) {
+      devLog('Error fetching metadata chunk (${chunkUris.length} files): $e');
+      return null;
+    }
+  }
+
+  /// For URIs whose retriever metadata came back unsolved, retry with the
+  /// Rust parser (lofty / dsf-meta / dff-meta). WavPack and DSD always go
+  /// through Rust; other formats escalate when the retriever failed to
+  /// establish the stream layout (missing sample rate or duration). Raw-path
+  /// URIs are read directly; content URIs stage through the shared cache
+  /// with a size cap (or use a caller-supplied raw path when the DB row has
+  /// one). Degrades silently — retriever results stand when Rust also fails.
+  Future<List<AudioFileInfo>> _fillRustMetadataFallback(
+    List<AudioFileInfo> metadataList,
+    List<String> chunkUris, {
+    Map<String, String>? rawPathByUri,
+  }) async {
+    if (chunkUris.isEmpty || !Platform.isAndroid) return metadataList;
+
+    final byUri = {for (final m in metadataList) m.uri: m};
+    var changed = false;
+
+    for (final uri in chunkUris) {
+      if (_isCancelled) break;
+
+      final meta = byUri[uri];
+      final retrieverSolved =
+          meta != null &&
+          meta.duration != null &&
+          meta.sampleRate != null &&
+          meta.bitDepth != null &&
+          meta.bitrate != null &&
+          meta.title?.trim().isNotEmpty == true &&
+          meta.artist?.trim().isNotEmpty == true &&
+          meta.album?.trim().isNotEmpty == true;
+      if (retrieverSolved) continue;
+
+      if (!shouldRustRetryMetadata(
+        extension: _extensionOfUri(uri),
+        hasMetadata: meta != null,
+        hasSampleRate: meta?.sampleRate != null,
+        hasDuration: meta?.duration != null,
+        hasBitDepth: (meta?.bitDepth ?? 0) > 0,
+        hasBitrate: (int.tryParse(meta?.bitrate ?? '') ?? 0) > 0,
+      )) {
+        continue;
+      }
+
+      final rustMeta = await _extractRustMetadataForUri(
+        uri,
+        rawPath: rawPathByUri?[uri],
+      );
+      if (rustMeta == null) continue;
+
+      byUri[uri] = _mergeRustMetadata(meta, uri, rustMeta);
+      changed = true;
+    }
+
+    if (!changed) return metadataList;
+
+    // Preserve the original order; append entries for URIs the retriever
+    // never returned (defensive — Kotlin always emits a row per URI).
+    final result = <AudioFileInfo>[];
+    final seen = <String>{};
+    for (final m in metadataList) {
+      result.add(byUri[m.uri] ?? m);
+      seen.add(m.uri);
+    }
+    for (final uri in chunkUris) {
+      if (!seen.contains(uri) && byUri.containsKey(uri)) {
+        result.add(byUri[uri]!);
+      }
+    }
+    return result;
+  }
+
+  String _extensionOfUri(String uri) {
+    final path = rawPathFromFileUri(uri) ?? rawPathFromSafUri(uri) ?? uri;
+    final dot = path.lastIndexOf('.');
+    if (dot < 0 || dot == path.length - 1) return '';
+    return path.substring(dot + 1).toLowerCase();
+  }
+
+  Future<AudioFileMetadata?> _extractRustMetadataForUri(
+    String uri, {
+    String? rawPath,
+  }) async {
+    var path = rawPathFromFileUri(uri) ?? rawPathFromSafUri(uri) ?? rawPath;
+    if (path == null && uri.startsWith('content://')) {
+      path = await _musicFolderService.cacheUriForPlayback(
+        uri,
+        extensionHint: _extensionOfUri(uri),
+        maxSizeBytes: _metadataStagingMaxBytes,
+      );
+    }
+    if (path == null) return null;
+    try {
+      return await extractFileMetadata(path: path);
+    } catch (e) {
+      devLog('Rust metadata fallback failed for $uri: $e');
+      return null;
+    }
+  }
+
+  AudioFileInfo _mergeRustMetadata(
+    AudioFileInfo? base,
+    String uri,
+    AudioFileMetadata rust,
+  ) {
+    return AudioFileInfo(
+      uri: uri,
+      name: base?.name ?? '',
+      size: base?.size ?? rust.fileSize.toInt(),
+      lastModified: base?.lastModified ?? rust.lastModified.toInt(),
+      mimeType: base?.mimeType,
+      extension: base?.extension ?? rust.format,
+      title: base?.title ?? rust.title,
+      artist: base?.artist ?? rust.artist,
+      album: base?.album ?? rust.album,
+      albumArtist:
+          base?.albumArtist ?? (Platform.isIOS ? rust.albumArtist : null),
+      trackNumber: base?.trackNumber ?? rust.trackNumber,
+      discNumber: base?.discNumber ?? rust.discNumber,
+      genre: base?.genre ?? rust.genre,
+      duration: base?.duration ?? rust.durationMs?.toInt(),
+      albumArtPath: base?.albumArtPath,
+      // Call sites parse this as bits-per-second (retriever convention);
+      // Lofty reports kbps, so convert to the retriever convention here.
+      bitrate:
+          base?.bitrate ??
+          (rust.bitrate == null ? null : (rust.bitrate! * 1000).toString()),
+      // Lofty reports plain-u32 rates for MP4, where a failed ALAC cookie
+      // parse yields 0 — treat that as unsolved rather than "0 kHz".
+      bitDepth:
+          _positiveOrNull(base?.bitDepth) ?? _positiveOrNull(rust.bitDepth),
+      sampleRate:
+          _positiveOrNull(base?.sampleRate) ?? _positiveOrNull(rust.sampleRate),
+      filePath: base?.filePath,
+      year: base?.year ?? rust.year,
+      dateAdded: base?.dateAdded,
+    );
+  }
+
+  static int? _positiveOrNull(int? value) =>
+      value != null && value > 0 ? value : null;
+
+  /// Older iPhone downloads were marked complete without importing album
+  /// tags. Read those files once despite unchanged timestamps/fingerprints.
+  /// The scan supplies a real album artist or its normal artist fallback,
+  /// so legitimately absent tags do not cause perpetual full rescans.
+  @visibleForTesting
+  static bool canReuseAlbumScanFingerprint(
+    SongEntity song, {
+    required bool isIOS,
+  }) =>
+      !isIOS ||
+      song.hasLocalEdits ||
+      song.albumArtist?.trim().isNotEmpty == true;
+
+  Future<void> _runDetachedScanTask(
+    String displayName,
+    String label,
+    Future<void> Function() task,
+  ) {
+    final future = () async {
+      final stopwatch = Stopwatch()..start();
+      try {
+        await task();
+      } catch (e) {
+        devLog('[LibraryScanner] $label failed for $displayName: $e');
+      } finally {
+        _logScanTiming(displayName, label, stopwatch.elapsed);
+      }
+    }();
+    unawaited(future);
+    return future;
+  }
+
+  void _logScanTiming(String displayName, String label, Duration elapsed) {
+    if (!Uac2PreferencesService.isDeveloperModeEnabledSync) return;
+    devLog('[LibraryScanner] $displayName $label: ${elapsed.inMilliseconds}ms');
+  }
+
+  /// Queues newly scanned songs onto the shared auto preload pass.
+  Future<void> _preloadAudioData(List<SongEntity> songs) async {
+    await AudioPreloadService.instance.enqueueAutoPreload(songs);
+  }
+
+  /// Starts the preference-controlled preload pass for every Android scan
+  /// engine. The Rust path historically supplied its changed rows directly,
+  /// while MediaStore and SAF only wired the setting to the manual button.
+  /// Re-read the preference and database after the scan's bookkeeping so the
+  /// normal scoped-storage paths get the same behavior without keeping stale
+  /// entity instances from the scan stream alive.
+  void _schedulePreloadAfterScan({
+    required String folderUri,
+    required String displayName,
+    required Future<void> after,
+  }) {
+    unawaited(
+      _runDetachedScanTask(displayName, 'scan preload', () async {
+        await after;
+        final currentPrefs = await _scanPreferencesService.getPreferences();
+        if (_isCancelled || !currentPrefs.preloadAudioData) return;
+        final songs = await _songRepository.getSongEntitiesByFolder(folderUri);
+        if (songs.isNotEmpty) await _preloadAudioData(songs);
+      }),
+    );
+  }
+
+  AudioFileInfo _audioInfoFromNonAudioMap(Map<String, dynamic> map) {
+    return AudioFileInfo(
+      uri: map['filePath'] as String? ?? '',
+      name: map['name'] as String? ?? '',
+      size: (map['size'] as num?)?.toInt() ?? 0,
+      lastModified: (map['lastModified'] as num?)?.toInt() ?? 0,
+      extension: map['extension'] as String? ?? '',
+    );
+  }
+
+  int _recommendedMetadataBatchSize(int pendingFiles) {
+    return 100;
+  }
+
+  List<List<T>> _chunkList<T>(List<T> items, int chunkSize) {
+    final chunks = <List<T>>[];
+    for (var i = 0; i < items.length; i += chunkSize) {
+      final end = (i + chunkSize < items.length) ? i + chunkSize : items.length;
+      chunks.add(items.sublist(i, end));
+    }
+    return chunks;
+  }
+
+  Future<List<SongEntity>> _purgeExistingSongsFilteredByRules(
+    List<SongEntity> existingSongs,
+    LibraryScanPreferences scanPreferences,
+  ) async {
+    final filtered = existingSongs
+        .where((song) => _shouldIgnoreStoredSong(song, scanPreferences))
+        .toList();
+
+    final ids = filtered.map((song) => song.id).toList();
+    if (ids.isNotEmpty) {
+      await _songRepository.deleteScannedSongsByIds(ids);
+    }
+
+    return filtered;
+  }
+
+  bool _shouldIgnoreStoredSong(
+    SongEntity song,
+    LibraryScanPreferences scanPreferences,
+  ) {
+    return _shouldIgnoreDiscoveredTrack(
+      fileSizeBytes: song.fileSize,
+      durationMs: song.durationMs,
+      scanPreferences: scanPreferences,
+    );
+  }
+
+  bool _shouldIgnoreDiscoveredTrack({
+    required int? fileSizeBytes,
+    required int? durationMs,
+    required LibraryScanPreferences scanPreferences,
+  }) {
+    if (scanPreferences.ignoreTracksSmallerThan500Kb &&
+        fileSizeBytes != null &&
+        fileSizeBytes > 0 &&
+        fileSizeBytes < kIgnoredTrackMinSizeBytes) {
+      return true;
+    }
+
+    if (scanPreferences.ignoreTracksShorterThan60Seconds &&
+        durationMs != null &&
+        durationMs > 0 &&
+        durationMs < kIgnoredTrackMinDurationMs) {
+      return true;
+    }
+
+    return false;
+  }
+
+  bool _looksLikeSupportedAudioExtension(String extension) {
+    const supportedExtensions = {
+      'mp3',
+      'flac',
+      'ogg',
+      'oga',
+      'ogx',
+      'opus',
+      'webm',
+      'm4a',
+      'wav',
+      'aif',
+      'aiff',
+      'alac',
+      'aac',
+      'wma',
+      'dsf',
+      'dff',
+      'wv',
+    };
+
+    return supportedExtensions.contains(extension.trim().toLowerCase());
+  }
+
+  Future<void> _syncPlaylistSourcesForFolder(
+    String folderUri,
+    LibraryScanPreferences scanPreferences, {
+    String? scanRootPath,
+  }) async {
+    if (_isCancelled || !scanPreferences.createPlaylistsFromM3uFiles) {
+      return;
+    }
+
+    try {
+      final sources = scanRootPath != null && scanRootPath.isNotEmpty
+          ? await _discoverRustPlaylistSources(
+              scanRootPath,
+              folderUri,
+              scanPreferences,
+            )
+          : Platform.isAndroid
+          ? await _discoverAndroidPlaylistSources(folderUri, scanPreferences)
+          : await _discoverRustPlaylistSources(
+              folderUri,
+              folderUri,
+              scanPreferences,
+            );
+      if (sources.isEmpty) {
+        return;
+      }
+
+      await _playlistService.syncPlaylistsFromSources(sources);
+    } catch (e) {
+      devLog('Failed to sync playlists from $folderUri: $e');
+    }
+  }
+
+  Future<List<PlaylistSourceFile>> _discoverAndroidPlaylistSources(
+    String folderUri,
+    LibraryScanPreferences scanPreferences,
+  ) async {
+    final files = await _musicFolderService.scanPlaylistFiles(
+      folderUri,
+      filterNonMusicFilesAndFolders:
+          scanPreferences.filterNonMusicFilesAndFolders,
+    );
+
+    return files
+        .map(
+          (file) =>
+              PlaylistSourceFile(sourcePath: file.uri, displayName: file.name),
+        )
+        .toList();
+  }
+
+  Future<List<PlaylistSourceFile>> _discoverRustPlaylistSources(
+    String scanRootPath,
+    String folderUri,
+    LibraryScanPreferences scanPreferences,
+  ) async {
+    final files = await discoverPlaylistFiles(
+      rootPath: scanRootPath,
+      scanOptions: ScanOptions(
+        filterNonMusicFilesAndFolders:
+            scanPreferences.filterNonMusicFilesAndFolders,
+        forceFullRescan: false,
+      ),
+    );
+
+    return files.map((path) => PlaylistSourceFile(sourcePath: path)).toList();
+  }
+
+  // ── CUE / Log helpers ──────────────────────────────────────────────
+
+  Future<String?> _readTextFile(String uri) async {
+    try {
+      if (uri.startsWith('/') && File(uri).existsSync()) {
+        return await File(uri).readAsString();
+      }
+      return await _storageChannel.invokeMethod<String>('readTextDocument', {
+        'uri': uri,
+      });
+    } catch (e) {
+      devLog('[LibraryScanner] Failed to read text file $uri: $e');
+      return null;
+    }
+  }
+
+  String? _resolveAudioUriFromCue(
+    String cueUri,
+    String audioFileName,
+    Map<String, AudioFileInfo> fastScanMap,
+  ) {
+    final target = audioFileName.toLowerCase();
+    for (final entry in fastScanMap.values) {
+      if (entry.name.toLowerCase() == target) {
+        return entry.filePath ?? entry.uri;
+      }
+    }
+    return null;
+  }
+
+  Future<Map<String, CueSheet>> _parseCueFilesAndroid(
+    List<AudioFileInfo> cueFiles,
+    Map<String, AudioFileInfo> fastScanMap,
+  ) async {
+    final cueService = CueFileService();
+    final result = <String, CueSheet>{};
+    for (final cue in cueFiles) {
+      final content = await _readTextFile(cue.uri);
+      if (content == null || content.isEmpty) continue;
+      final sheet = cueService.parseCueSheet(content, cueFilePath: cue.uri);
+      if (sheet == null) continue;
+      final audioUri = _resolveAudioUriFromCue(
+        cue.uri,
+        sheet.audioFile,
+        fastScanMap,
+      );
+      if (audioUri != null) {
+        result[audioUri] = sheet;
+      }
+    }
+    return result;
+  }
+
+  Future<Map<String, RipLog>> _parseLogFilesAndroid(
+    List<AudioFileInfo> logFiles,
+    Map<String, AudioFileInfo> fastScanMap,
+  ) async {
+    final logService = RipLogService();
+    final result = <String, RipLog>{};
+    for (final log in logFiles) {
+      final content = await _readTextFile(log.uri);
+      if (content == null || content.isEmpty) continue;
+      final ripLog = logService.parseLog(content);
+      if (ripLog == null) continue;
+      final logStem = _fileStem(log.name).toLowerCase();
+      for (final entry in fastScanMap.values) {
+        if (_looksLikeSupportedAudioExtension(entry.extension)) {
+          final audioStem = _fileStem(entry.name).toLowerCase();
+          if (audioStem == logStem) {
+            result[entry.filePath ?? entry.uri] = ripLog;
+            break;
+          }
+        }
+      }
+    }
+    return result;
+  }
+
+  Future<({Map<String, CueSheet> cueMap, Map<String, RipLog> logMap})>
+  _parseCueAndLogFilesRust(String scanRootPath) async {
+    final cueService = CueFileService();
+    final logService = RipLogService();
+    final cueMap = <String, CueSheet>{};
+    final result = <String, RipLog>{};
+    try {
+      final dir = Directory(scanRootPath);
+      if (!dir.existsSync()) return (cueMap: cueMap, logMap: result);
+
+      // Single walk — collect audio stems, cue files, log files simultaneously
+      final cueFiles = <String>[];
+      final logFiles = <String>[];
+      final audioStems = <String, String>{};
+
+      await for (final entity in dir.list(
+        recursive: true,
+        followLinks: false,
+      )) {
+        if (_isCancelled) break;
+        if (entity is! File) continue;
+        final path = entity.path;
+        final ext = path.split('.').last.toLowerCase();
+        final name = path.split('/').last;
+
+        if (_looksLikeSupportedAudioExtension(ext)) {
+          audioStems[_fileStem(name).toLowerCase()] = path;
+        } else if (ext == 'cue') {
+          cueFiles.add(path);
+        } else if (ext == 'log' || ext == 'txt') {
+          logFiles.add(path);
+        }
+      }
+
+      // Parse CUE files
+      for (final path in cueFiles) {
+        if (_isCancelled) break;
+        final content = await File(path).readAsString().catchError((_) => '');
+        if (content.isEmpty) continue;
+        final sheet = cueService.parseCueSheet(content, cueFilePath: path);
+        if (sheet == null) continue;
+        final audioPath = cueService.resolveAudioFilePath(
+          path,
+          sheet.audioFile,
+        );
+        cueMap[audioPath] = sheet;
+      }
+
+      // Parse log files
+      for (final path in logFiles) {
+        if (_isCancelled) break;
+        final content = await File(path).readAsString().catchError((_) => '');
+        if (content.isEmpty) continue;
+        final ripLog = logService.parseLog(content);
+        if (ripLog == null) continue;
+        final stem = _fileStem(path.split('/').last).toLowerCase();
+        final audioPath = audioStems[stem];
+        if (audioPath != null) {
+          result[audioPath] = ripLog;
+        }
+      }
+    } catch (e) {
+      devLog('[LibraryScanner] Error scanning for CUE/log files: $e');
+    }
+    return (cueMap: cueMap, logMap: result);
+  }
+
+  String _fileStem(String fileName) {
+    final lastDot = fileName.lastIndexOf('.');
+    if (lastDot <= 0) return fileName;
+    return fileName.substring(0, lastDot);
+  }
+
+  /// When an existing song has `hasLocalEdits == true`, preserve its text
+  /// metadata fields instead of overwriting them with scanned file tags.
+  void _preserveLocalEdits(SongEntity song, SongEntity? existing) {
+    if (existing == null || !existing.hasLocalEdits) return;
+    song.title = existing.title;
+    song.artist = existing.artist;
+    song.album = existing.album;
+    song.albumArtist = existing.albumArtist;
+    song.genre = existing.genre;
+    song.year = existing.year;
+    song.trackNumber = existing.trackNumber;
+    song.discNumber = existing.discNumber;
+    song.hasLocalEdits = true;
+  }
+
+  /// Whether an existing artwork pointer can safely move to a rebuilt row.
+  /// User-picked overrides always survive; auto-resolved art only while the
+  /// source file is unchanged, so a re-tagged file drops the pointer and the
+  /// post-scan backfill re-derives its cover from the current tags.
+  @visibleForTesting
+  static bool canCarryArtworkPointer({
+    required String? albumArtPath,
+    required bool isCustom,
+    required DateTime? existingLastModified,
+    required int? existingFileSize,
+    required DateTime? lastModified,
+    required int? fileSize,
+  }) {
+    if (albumArtPath == null || albumArtPath.isEmpty) return false;
+    if (isCustom) return true;
+    final sameTimestamp = existingLastModified == lastModified;
+    final sameSize = fileSize == null || existingFileSize == fileSize;
+    return sameTimestamp && sameSize;
+  }
+
+  String? _carriedArtworkPath(
+    SongEntity? existing, {
+    required DateTime? lastModified,
+    required int? fileSize,
+  }) {
+    final path = existing?.albumArtPath;
+    if (existing == null || path == null || path.isEmpty) return null;
+    final carried = canCarryArtworkPointer(
+      albumArtPath: path,
+      isCustom: AlbumArtImportService.instance.isCustomArtworkPath(path),
+      existingLastModified: existing.lastModified,
+      existingFileSize: existing.fileSize,
+      lastModified: lastModified,
+      fileSize: fileSize,
+    );
+    if (!carried) {
+      devLog(
+        '[LibraryScanner] dropped stale artwork pointer for '
+        '${existing.filePath}',
+      );
+    }
+    return carried ? path : null;
+  }
+
+  List<SongEntity> _buildCueTrackEntities({
+    required String audioUri,
+    required CueSheet cueSheet,
+    required AudioFileInfo? meta,
+    required String folderUri,
+    required Map<String, SongEntity> existingMap,
+    required RipLog? ripLog,
+    required DateTime lastModified,
+    String? relativeFolderPath,
+  }) {
+    final entities = <SongEntity>[];
+    for (final track in cueSheet.tracks) {
+      final artist = track.performer.trim().isNotEmpty
+          ? track.performer.trim()
+          : (cueSheet.performer?.trim().isNotEmpty ?? false)
+          ? cueSheet.performer!.trim()
+          : (meta?.artist?.trim().isNotEmpty ?? false)
+          ? meta!.artist!.trim()
+          : l10n.unknownArtist;
+      final existing = existingMap['$audioUri#${track.startOffsetMs}'];
+      final trackLog = ripLog?.tracks.firstWhere(
+        (t) => t.trackNumber == track.trackNumber,
+        orElse: () => const RipLogTrack(trackNumber: -1),
+      );
+      final entity = SongEntity()
+        ..filePath = audioUri
+        ..mediaStoreUri = meta?.uri.startsWith('content://') == true
+            ? meta!.uri
+            : null
+        ..startOffsetMs = track.startOffsetMs
+        ..endOffsetMs = track.endOffsetMs
+        ..title = track.title.trim().isNotEmpty
+            ? track.title.trim()
+            : _extractTitleFromFilename(
+                meta?.name ?? 'Track ${track.trackNumber}',
+              )
+        ..artist = artist
+        ..album = cueSheet.title?.trim().isNotEmpty ?? false
+            ? cueSheet.title!.trim()
+            : (meta?.album?.trim().isNotEmpty ?? false)
+            ? meta!.album!.trim()
+            : l10n.unknownAlbum
+        ..albumArtist = cueSheet.performer?.trim().isNotEmpty ?? false
+            ? cueSheet.performer!.trim()
+            : artist
+        ..trackNumber = track.trackNumber
+        ..discNumber = meta?.discNumber ?? 1
+        ..durationMs = track.endOffsetMs != null
+            ? track.endOffsetMs! - track.startOffsetMs
+            : (meta?.duration ?? 0)
+        ..fileType = meta?.extension.toUpperCase() ?? 'UNKNOWN'
+        ..dateAdded = existing?.dateAdded ?? DateTime.now()
+        ..lastModified = lastModified
+        ..folderUri = folderUri
+        ..relativeFolderPath = relativeFolderPath
+        ..fileSize = meta?.size ?? 0
+        ..albumArtPath = _carriedArtworkPath(
+          existing,
+          lastModified: lastModified,
+          fileSize: meta?.size,
+        )
+        ..bitrate = meta?.bitrate != null
+            ? AudioMetadataUtils.bitrateFromBitsPerSecond(
+                int.tryParse(meta!.bitrate!),
+              )
+            : null
+        ..bitDepth = meta?.bitDepth
+        ..sampleRate = meta?.sampleRate
+        ..genre = (cueSheet.genre?.trim().isNotEmpty ?? false)
+            ? cueSheet.genre!.trim()
+            : (meta?.genre?.trim().isNotEmpty ?? false)
+            ? meta!.genre!.trim()
+            : null
+        ..year = int.tryParse(cueSheet.date ?? '') ?? meta?.year
+        ..ripper = ripLog?.ripper
+        ..readMode = ripLog?.readMode
+        ..accurateRip = trackLog?.trackNumber == track.trackNumber
+            ? trackLog?.accurate
+            : null
+        ..testCrc = trackLog?.trackNumber == track.trackNumber
+            ? trackLog?.testCrc
+            : null
+        ..copyCrc = trackLog?.trackNumber == track.trackNumber
+            ? trackLog?.copyCrc
+            : null
+        ..metadataComplete = meta?.sampleRate != null && meta?.bitDepth != null;
+
+      if (existing != null) {
+        entity.id = existing.id;
+      }
+      entities.add(entity);
+    }
+    return entities;
+  }
+}

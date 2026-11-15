@@ -1,0 +1,636 @@
+import 'dart:async';
+
+import 'package:flutter/foundation.dart';
+import 'package:flick/models/audio_engine_type.dart';
+import 'package:flick/services/android_audio_device_service.dart';
+import 'package:flick/services/eq_engine_hint.dart';
+import 'package:flick/services/uac2_preferences_service.dart';
+import 'package:flick/services/uac2_service.dart';
+import 'package:flick/src/rust/api/audio_api.dart' as rust_audio;
+import 'package:flick/core/utils/app_log.dart';
+import 'package:flick/core/utils/dev_log.dart';
+import 'package:flick/services/local_audio_lifecycle.dart';
+
+typedef AudioSessionSwitchHandler = Future<void> Function({
+  required AudioEngineType? from,
+  required AudioEngineType to,
+  required bool initializeNewEngine,
+  required String reason,
+});
+typedef AudioSessionPlaybackActiveReader = bool Function();
+
+/// Android may report cosmetic/temporary route changes while a Rust direct
+/// USB stream exclusively owns the device. Only the explicit device failure
+/// and user-preference paths should replace that live engine.
+@visibleForTesting
+bool shouldDeferDirectUsbRouteProbe({
+  required String reason,
+  required AudioEngineType selectedMode,
+  required AudioEngineType? initializedMode,
+  required bool playbackActive,
+  required bool directUsbSessionActive,
+}) =>
+    reason == 'audio route change' &&
+    selectedMode == AudioEngineType.usbDacExperimental &&
+    initializedMode == AudioEngineType.usbDacExperimental &&
+    playbackActive &&
+    directUsbSessionActive;
+
+/// A device notification may begin probing before the direct USB session is
+/// claimed. Discard only that outdated, incidental result if USB ownership
+/// became active while the platform queries were pending.
+@visibleForTesting
+bool shouldDiscardStaleDirectUsbRouteProbe({
+  required String reason,
+  required bool directUsbSessionWasActive,
+  required AudioEngineType selectedMode,
+  required AudioEngineType? initializedMode,
+  required bool playbackActive,
+  required bool directUsbSessionActive,
+}) =>
+    !directUsbSessionWasActive &&
+    shouldDeferDirectUsbRouteProbe(
+      reason: reason,
+      selectedMode: selectedMode,
+      initializedMode: initializedMode,
+      playbackActive: playbackActive,
+      directUsbSessionActive: directUsbSessionActive,
+    );
+
+class AudioSessionManager {
+  AudioSessionManager({
+    AndroidAudioDeviceService? deviceService,
+    Uac2PreferencesService? preferencesService,
+    Uac2Service? uac2Service,
+    required AudioSessionSwitchHandler onSwitchEngine,
+    required AudioSessionPlaybackActiveReader isPlaybackActive,
+  }) : _deviceService = deviceService ?? AndroidAudioDeviceService.instance,
+       _preferencesService = preferencesService ?? Uac2PreferencesService(),
+       _uac2Service = uac2Service ?? Uac2Service.instance,
+       _onSwitchEngine = onSwitchEngine,
+       _isPlaybackActive = isPlaybackActive;
+
+  final AndroidAudioDeviceService _deviceService;
+  final Uac2PreferencesService _preferencesService;
+  final Uac2Service _uac2Service;
+  final AudioSessionSwitchHandler _onSwitchEngine;
+  final AudioSessionPlaybackActiveReader _isPlaybackActive;
+
+  final ValueNotifier<AudioEngineType> selectedModeNotifier = ValueNotifier(
+    defaultTargetPlatform == TargetPlatform.iOS
+        ? AudioEngineType.iosSystem
+        : AudioEngineType.normalAndroid,
+  );
+  final ValueNotifier<AudioEngineType?> initializedModeNotifier = ValueNotifier(
+    null,
+  );
+  final ValueNotifier<String?> fallbackReasonNotifier = ValueNotifier(null);
+  AudioEngineType? _fallbackRequestedMode;
+  final ValueNotifier<rust_audio.AudioCapabilityInfo> capabilityInfoNotifier =
+      ValueNotifier(
+        const rust_audio.AudioCapabilityInfo(
+          capabilities: [rust_audio.AudioCapabilityType.standard],
+          routeType: 'unknown',
+          routeLabel: null,
+          maxSampleRate: null,
+        ),
+      );
+
+  bool _initialized = false;
+  Future<void>? _initializeInFlight;
+  Future<void>? _routeSyncInFlight;
+  int _lifecycleRevision = 0;
+
+  void retireLocalOutput() {
+    _lifecycleRevision++;
+    initializedModeNotifier.value = null;
+  }
+
+  VoidCallback? _deviceInfoListener;
+  String? _lastSelectedUsbDeviceKey;
+  final Map<String, String> _exclusiveUnavailableUsbDeviceReasons =
+      <String, String>{};
+
+  AudioEngineType get selectedMode => selectedModeNotifier.value;
+  AudioEngineType? get initializedMode => initializedModeNotifier.value;
+  String? get fallbackReason => fallbackReasonNotifier.value;
+  AudioEngineType? get fallbackRequestedMode => _fallbackRequestedMode;
+
+  void _debugLog(String message) {
+    devLog(message);
+  }
+
+  /// Mode transitions go to the shareable app log regardless of Developer Mode.
+  void _sessionLog(String message) {
+    debugPrint(message);
+    AppLog.instance.add(message);
+  }
+
+  Future<void> initialize() async {
+    if (_initialized) return;
+
+    final inFlight = _initializeInFlight;
+    if (inFlight != null) {
+      await inFlight;
+      return;
+    }
+
+    final future = _initializeInternal();
+    _initializeInFlight = future;
+    try {
+      await future;
+    } finally {
+      _initializeInFlight = null;
+    }
+  }
+
+  Future<void> switchMode(
+    AudioEngineType mode, {
+    bool initializeNewEngine = false,
+    String reason = 'manual switch',
+  }) async {
+    final revision = _lifecycleRevision;
+    final previousInitialized = initializedMode;
+    final selectedChanged = selectedMode != mode;
+    final needsInitialization =
+        initializeNewEngine && previousInitialized != mode;
+    final needsDisposal =
+        previousInitialized != null && previousInitialized != mode;
+
+    selectedModeNotifier.value = mode;
+
+    if (!selectedChanged && !needsInitialization && !needsDisposal) {
+      return;
+    }
+
+    _sessionLog(
+      '[Session] Switching from ${previousInitialized?.logLabel ?? 'none'} '
+      'to ${mode.logLabel} '
+      '(${initializeNewEngine ? 'initialize' : 'lazy'}) because $reason',
+    );
+
+    if (needsDisposal || needsInitialization) {
+      try {
+        await _onSwitchEngine(
+          from: previousInitialized,
+          to: mode,
+          initializeNewEngine: initializeNewEngine,
+          reason: reason,
+        );
+        if (revision != _lifecycleRevision) {
+          throw const LocalAudioRequestRetired();
+        }
+      } catch (_) {
+        // The outgoing engine may already have been disposed by the handler.
+        // Do not report it as initialized or skip its reinitialization later.
+        if (revision == _lifecycleRevision) {
+          initializedModeNotifier.value = null;
+        }
+        rethrow;
+      }
+    }
+
+    initializedModeNotifier.value = initializeNewEngine
+        ? mode
+        : (previousInitialized == mode ? previousInitialized : null);
+    if (initializeNewEngine && mode == _fallbackRequestedMode) {
+      _fallbackRequestedMode = null;
+      clearFallbackReason();
+    }
+  }
+
+  Future<AudioEngineType> resolvePreferredMode({bool refresh = false}) async {
+    await initialize();
+    return _resolvePreferredMode(refresh: refresh);
+  }
+
+  Future<void> recordFallback({
+    required AudioEngineType requestedMode,
+    required AudioEngineType fallbackMode,
+    required String reason,
+  }) async {
+    _fallbackRequestedMode = requestedMode;
+    fallbackReasonNotifier.value =
+        '${requestedMode.logLabel} -> ${fallbackMode.logLabel}: $reason';
+    if (selectedMode != fallbackMode) {
+      selectedModeNotifier.value = fallbackMode;
+    }
+    _sessionLog('[Session] Fallback: ${fallbackReasonNotifier.value}');
+  }
+
+  Future<void> suppressExperimentalUsbForCurrentDevice({
+    required String reason,
+  }) async {
+    final info = await _deviceService.refresh();
+    // LIBUSB_NO_DEVICE may coincide with Android temporarily losing the
+    // entire route. Retain the last *selected* DAC identity for suppression.
+    final deviceKey =
+        _currentUsbExperimentalDeviceKey(info) ?? _lastSelectedUsbDeviceKey;
+    if (deviceKey == null) return;
+
+    _exclusiveUnavailableUsbDeviceReasons[deviceKey] = reason;
+    if (selectedMode == AudioEngineType.usbDacExperimental) {
+      selectedModeNotifier.value = AudioEngineType.normalAndroid;
+    }
+    _sessionLog(
+      '[Session] Marking USB_DAC_EXPERIMENTAL unavailable for the current '
+      'DAC this session: $reason',
+    );
+  }
+
+  /// Drop the session suppression so the direct USB path can be retried on
+  /// the next route sync (e.g. after a transient busy/EIO startup refusal).
+  Future<void> clearSuppressionForCurrentDevice() async {
+    final info = await _deviceService.refresh();
+    final deviceKey = _currentUsbExperimentalDeviceKey(info);
+    if (deviceKey == null) {
+      return;
+    }
+    if (_exclusiveUnavailableUsbDeviceReasons.remove(deviceKey) != null) {
+      _sessionLog(
+        '[Session] Cleared USB_DAC_EXPERIMENTAL suppression for the current DAC',
+      );
+    }
+    clearFallbackReason();
+  }
+
+  /// Re-arms the direct USB engine for the attached DAC and re-resolves the
+  /// route. Returns true when the direct path is the selected mode again.
+  Future<bool> retryExperimentalUsbForCurrentDevice() async {
+    await clearSuppressionForCurrentDevice();
+    await _syncRouteSelection(reason: 'manual direct USB retry');
+    return selectedMode == AudioEngineType.usbDacExperimental;
+  }
+
+  void clearFallbackReason() {
+    if (fallbackReasonNotifier.value != null) {
+      fallbackReasonNotifier.value = null;
+    }
+  }
+
+  Future<void> setHiFiModeEnabled(bool enabled) async {
+    await _preferencesService.setHiFiModeEnabled(enabled);
+    await _syncRouteSelection(
+      reason: enabled ? 'HiFi Mode enabled' : 'HiFi Mode disabled',
+    );
+  }
+
+  Future<bool> isHiFiModeEnabled() {
+    return _preferencesService.getHiFiModeEnabled();
+  }
+
+  Future<void> _initializeInternal() async {
+    await _preferencesService.initializeDeveloperModeCache();
+    await _preferencesService.initializeKillIsochronousUsbOnQuitCache();
+    await _preferencesService.initialize432HzTuningCache();
+    await _preferencesService.initializeBtFlagsCache();
+    if (defaultTargetPlatform != TargetPlatform.iOS) {
+      await _deviceService.initialize();
+    }
+    selectedModeNotifier.value = await _resolvePreferredMode();
+
+    _deviceInfoListener ??= () {
+      unawaited(_syncRouteSelection(reason: 'audio route change'));
+    };
+    _deviceService.deviceInfoNotifier.addListener(_deviceInfoListener!);
+    _initialized = true;
+  }
+
+  Future<void> syncRouteSelection({required String reason}) async {
+    await _syncRouteSelection(reason: reason);
+  }
+
+  Future<void> _syncRouteSelection({required String reason}) async {
+    final inFlight = _routeSyncInFlight;
+    if (inFlight != null) {
+      await inFlight;
+      return;
+    }
+
+    final future = _syncRouteSelectionInternal(reason: reason);
+    _routeSyncInFlight = future;
+    try {
+      await future;
+    } finally {
+      if (identical(_routeSyncInFlight, future)) {
+        _routeSyncInFlight = null;
+      }
+    }
+  }
+
+  Future<void> _syncRouteSelectionInternal({required String reason}) async {
+    if (shouldDeferDirectUsbRouteProbe(
+      reason: reason,
+      selectedMode: selectedMode,
+      initializedMode: initializedMode,
+      playbackActive: _isPlaybackActive(),
+      directUsbSessionActive:
+          _uac2Service.shouldFreezeAndroidDirectUsbSessionQueries,
+    )) {
+      _debugLog(
+        '[Session] Ignoring transient Android route notification '
+        'while direct USB holds the playback session',
+      );
+      return;
+    }
+    final directUsbSessionWasActive =
+        _uac2Service.shouldFreezeAndroidDirectUsbSessionQueries;
+    final desired = await _resolvePreferredMode(refresh: true);
+    if (shouldDiscardStaleDirectUsbRouteProbe(
+      reason: reason,
+      directUsbSessionWasActive: directUsbSessionWasActive,
+      selectedMode: selectedMode,
+      initializedMode: initializedMode,
+      playbackActive: _isPlaybackActive(),
+      directUsbSessionActive:
+          _uac2Service.shouldFreezeAndroidDirectUsbSessionQueries,
+    )) {
+      _debugLog(
+        '[Session] Discarding outdated Android route probe: '
+        'direct USB became active during resolution',
+      );
+      return;
+    }
+    final previous = selectedMode;
+    if (previous == desired) {
+      return;
+    }
+
+    selectedModeNotifier.value = desired;
+    _sessionLog(
+      '[Session] Route selection changed: ${previous.logLabel} -> '
+      '${desired.logLabel} ($reason)',
+    );
+    if (_isPlaybackActive() && initializedMode != desired) {
+      _sessionLog(
+        '[Session] Route changed to ${desired.logLabel}; '
+        'new engine will attach on the next playback request ($reason)',
+      );
+    }
+  }
+
+  Future<AudioEngineType> _resolvePreferredMode({bool refresh = false}) async {
+    if (defaultTargetPlatform == TargetPlatform.iOS) {
+      return (EqEngineHint.parametricPeqActive ||
+              EqEngineHint.iosDspActive ||
+              EqEngineHint.iosCrossfeedActive ||
+              EqEngineHint.iosPitchActive)
+          ? AudioEngineType.iosRust
+          : AudioEngineType.iosSystem;
+    }
+    final freezeDirectUsbSessionQueries =
+        _uac2Service.shouldFreezeAndroidDirectUsbSessionQueries;
+    final info = refresh && !freezeDirectUsbSessionQueries
+        ? await _deviceService.refresh()
+        : _deviceService.deviceInfoNotifier.value;
+    final bitPerfectEnabled = await _preferencesService.getBitPerfectEnabled();
+    final dapBitPerfectEnabled = await _preferencesService
+        .getDapBitPerfectEnabled();
+    final audioEnginePreference = await _preferencesService
+        .getAudioEnginePreference();
+    final capabilityInfo = await _uac2Service.getAndroidAudioCapabilityInfo();
+    final dapInfo = await _detectedAndroidDapInfo();
+    capabilityInfoNotifier.value = capabilityInfo;
+    final capabilityReportsUsb = capabilityInfo.capabilities.contains(
+      rust_audio.AudioCapabilityType.usbDac,
+    );
+    final looksLikeUsbAudioRoute = info.looksLikeUsbAudioRoute;
+
+    _debugLog(
+      '[Session] Resolve inputs: route=${info.routeLabel ?? info.routeType ?? 'unknown'} '
+      'attachedUac2=${info.hasAttachedUac2Device} audioManagerUsb=${info.hasUsbDac} '
+      'capabilityUsb=$capabilityReportsUsb routeLooksUsb=$looksLikeUsbAudioRoute '
+      'isBt=${info.isBluetoothRoute} btLowLatency=${Uac2PreferencesService.isBtLowLatencyModeSync} '
+      'btHiResDirect=${Uac2PreferencesService.isBtHiResDirectSync} '
+      'bitPerfect=$bitPerfectEnabled dapBitPerfect=$dapBitPerfectEnabled '
+      'enginePref=$audioEnginePreference '
+      'caps=${capabilityInfo.capabilities.map((c) => c.name).toList()} '
+      'detectedDap=${dapInfo.brand ?? 'none'}',
+    );
+
+    if (info.isBluetoothRoute) {
+      // ponytail: dapInternalHighRes is never used on BT (level loss + 5-10s
+      // dropouts on A2DP); both output-mode toggles use the stable shared
+      // Rust Oboe stream. Codec quality stays driven by codec prefs.
+      final outputModeReason = Uac2PreferencesService.isBtLowLatencyModeSync
+          ? 'Low-latency mode'
+          : Uac2PreferencesService.isBtHiResDirectSync
+          ? 'Hi-Res Direct'
+          : null;
+      if (outputModeReason != null) {
+        _debugLog(
+          '[Session] Selected RUST_OBOE for Bluetooth because '
+          '$outputModeReason is enabled '
+          '(${info.routeLabel ?? info.routeType ?? 'unknown'})',
+        );
+        return AudioEngineType.rustOboe;
+      }
+      _debugLog(
+        '[Session] Keeping NORMAL_ANDROID for Bluetooth '
+        '(${info.routeLabel ?? info.routeType ?? 'unknown'})',
+      );
+      return AudioEngineType.normalAndroid;
+    }
+
+    if (info.hasAttachedUac2Device ||
+        info.hasUsbDac ||
+        capabilityReportsUsb ||
+        looksLikeUsbAudioRoute) {
+      if (EqEngineHint.parametricPeqActive && !bitPerfectEnabled) {
+        _debugLog(
+          '[Session] Selected RUST_OBOE because parametric EQ is enabled and '
+          'needs the variable-band DSP chain',
+        );
+        return AudioEngineType.rustOboe;
+      }
+      if (EqEngineHint.parametricPeqActive) {
+        // Bit-perfect asks for a clean direct path and bypasses the DSP chain
+        // anyway, so parametric EQ must not preempt it.
+        _debugLog(
+          '[Session] Bit-perfect (USB DAC) takes precedence over parametric '
+          'EQ; bypassing the DSP chain on the direct USB path',
+        );
+      }
+
+      if (audioEnginePreference == AudioEnginePreference.androidMixerUsb) {
+        // Android retains DAC ownership. The JNI AudioTrack backend checks
+        // mixer attributes, format and USB routing when a stream opens.
+        _debugLog(
+          '[Session] Android 14 USB mixer selected; native verification required',
+        );
+        return AudioEngineType.rustOboe;
+      }
+
+      if (audioEnginePreference == AudioEnginePreference.rustOboe) {
+        _debugLog(
+          '[Session] Selected RUST_OBOE because an external USB DAC is '
+          'attached and the user prefers the Rust Android-managed engine '
+          '(${info.routeLabel ?? info.routeType ?? 'unknown'}; '
+          'attachedUac2=${info.hasAttachedUac2Device}; '
+          'audioManagerUsb=${info.hasUsbDac}; '
+          'capabilityUsb=$capabilityReportsUsb; '
+          'routeLooksUsb=$looksLikeUsbAudioRoute)',
+        );
+        return AudioEngineType.rustOboe;
+      }
+
+      if (audioEnginePreference != AudioEnginePreference.isochronousUsb) {
+        _debugLog(
+          '[Session] Keeping NORMAL_ANDROID because an external USB DAC is '
+          'attached but the user prefers the default Android engine '
+          '(${info.routeLabel ?? info.routeType ?? 'unknown'}; '
+          'attachedUac2=${info.hasAttachedUac2Device}; '
+          'audioManagerUsb=${info.hasUsbDac}; '
+          'capabilityUsb=$capabilityReportsUsb; '
+          'routeLooksUsb=$looksLikeUsbAudioRoute)',
+        );
+        return AudioEngineType.normalAndroid;
+      }
+
+      // ponytail: bit-perfect (USB) off no longer forces the stuttering HAL
+      // path. We keep the direct-USB driver and run the DSP chain over it —
+      // the only click-free route on the Pixel USB audio HAL. bit-perfect on
+      // => Passthrough; off => Dsp (decided in engine.rs direct-USB block).
+      final suppressedReason = _suppressedReasonForCurrentUsbDevice(info);
+      if (suppressedReason != null) {
+        _debugLog(
+          '[Session] Keeping NORMAL_ANDROID because USB_DAC_EXPERIMENTAL is '
+          'unavailable for the current DAC this session ($suppressedReason)',
+        );
+        return AudioEngineType.normalAndroid;
+      }
+      _lastSelectedUsbDeviceKey = _currentUsbExperimentalDeviceKey(info);
+      _debugLog(
+        '[Session] Selected USB_DAC_EXPERIMENTAL because an external USB DAC '
+        'is attached (${info.routeLabel ?? info.routeType ?? 'unknown'}; '
+        'attachedUac2=${info.hasAttachedUac2Device}; '
+        'audioManagerUsb=${info.hasUsbDac}; '
+        'capabilityUsb=$capabilityReportsUsb; '
+        'routeLooksUsb=$looksLikeUsbAudioRoute)',
+      );
+      return AudioEngineType.usbDacExperimental;
+    }
+
+    final supportsHiResInternal =
+        capabilityInfo.capabilities.contains(
+          rust_audio.AudioCapabilityType.hiResInternal,
+        ) ||
+        dapInfo.detected;
+
+    if (supportsHiResInternal) {
+      if (!dapBitPerfectEnabled) {
+        _debugLog(
+          '[Session] Selected RUST_OBOE because Bit-perfect (DAP Internal) is '
+          'disabled. DSP chain will run normally. '
+          '(${capabilityInfo.routeType}/${capabilityInfo.routeLabel ?? 'unknown'}; '
+          'detectedDap=${dapInfo.brand ?? 'none'})',
+        );
+        return AudioEngineType.rustOboe;
+      }
+      _debugLog(
+        '[Session] Selected DAP_INTERNAL_HIGH_RES because Android reports a '
+        'higher-capability internal route '
+        '(${capabilityInfo.routeType}/${capabilityInfo.routeLabel ?? 'unknown'}; '
+        'detectedDap=${dapInfo.brand ?? 'none'})',
+      );
+      return AudioEngineType.dapInternalHighRes;
+    }
+
+    if (audioEnginePreference == AudioEnginePreference.rustOboe) {
+      _debugLog(
+        '[Session] Selected RUST_OBOE because the user prefers the Rust '
+        'Android-managed engine',
+      );
+      return AudioEngineType.rustOboe;
+    }
+
+    _debugLog(
+      '[Session] Defaulting to NORMAL_ANDROID: no USB/DAC/HiRes route '
+      'detected and user engine preference is $audioEnginePreference '
+      '(route=${info.routeLabel ?? info.routeType ?? 'unknown'})',
+    );
+    return AudioEngineType.normalAndroid;
+  }
+
+  Future<({bool detected, String? brand})> _detectedAndroidDapInfo() async {
+    final debugState = await _uac2Service.getAndroidPlaybackDebugState();
+    final rustState = _mapValue(debugState?['rustAudioState']);
+    final deviceProfile = _mapValue(rustState?['device_profile']);
+    final kind = _mapValue(deviceProfile?['kind']);
+    final brand = kind?['Dap'];
+    return (
+      detected: brand is String && brand.isNotEmpty,
+      brand: brand is String ? brand : null,
+    );
+  }
+
+  Map<String, dynamic>? _mapValue(dynamic value) {
+    if (value is Map<String, dynamic>) {
+      return value;
+    }
+    if (value is Map) {
+      return value.map((key, value) => MapEntry(key.toString(), value));
+    }
+    return null;
+  }
+
+  String? _suppressedReasonForCurrentUsbDevice(AndroidPlaybackDeviceInfo info) {
+    final deviceKey = _currentUsbExperimentalDeviceKey(info);
+    if (deviceKey == null) {
+      return null;
+    }
+    return _exclusiveUnavailableUsbDeviceReasons[deviceKey];
+  }
+
+  String? _currentUsbExperimentalDeviceKey(AndroidPlaybackDeviceInfo info) {
+    if (!(info.hasAttachedUac2Device ||
+        info.hasUsbDac ||
+        info.looksLikeUsbAudioRoute)) {
+      return null;
+    }
+
+    final device = _uac2Service.currentDeviceStatus?.device;
+    final vendorId = device?.vendorId ?? 0;
+    final productId = device?.productId ?? 0;
+    if (vendorId != 0 || productId != 0) {
+      return 'vid:$vendorId|pid:$productId';
+    }
+
+    final productName = _normalizeUsbIdentityToken(device?.productName);
+    final manufacturer = _normalizeUsbIdentityToken(device?.manufacturer);
+    if (productName.isNotEmpty || manufacturer.isNotEmpty) {
+      return 'name:$productName|mfg:$manufacturer';
+    }
+
+    final routeSummary = _normalizeUsbIdentityToken(info.routeSummary);
+    if (routeSummary.isNotEmpty) {
+      return 'route:$routeSummary';
+    }
+
+    return null;
+  }
+
+  String _normalizeUsbIdentityToken(String? raw) {
+    if (raw == null) {
+      return '';
+    }
+
+    return raw
+        .trim()
+        .toLowerCase()
+        .replaceFirst(RegExp(r'^usb[- ]audio\s*-\s*'), '')
+        .replaceAll(RegExp(r'\s+'), ' ');
+  }
+
+  void dispose() {
+    final listener = _deviceInfoListener;
+    if (listener != null) {
+      _deviceService.deviceInfoNotifier.removeListener(listener);
+    }
+    _deviceInfoListener = null;
+    selectedModeNotifier.dispose();
+    initializedModeNotifier.dispose();
+    fallbackReasonNotifier.dispose();
+    capabilityInfoNotifier.dispose();
+  }
+}

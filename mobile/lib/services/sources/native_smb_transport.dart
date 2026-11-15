@@ -1,0 +1,236 @@
+import 'dart:io';
+import 'dart:typed_data';
+
+import 'package:dart_smb2/dart_smb2.dart';
+import 'package:synchronized/synchronized.dart';
+
+/// One native libsmb2 connection for a NAS operation. Mornye uses the same
+/// native transport, including SMB 2/3 dialect, signing and encryption support.
+/// Connections are always closed, including on failed scans and downloads.
+typedef NativeSmbEntry = ({String name, String path, int size, bool isDir});
+
+abstract class NativeSmbSession {
+  Future<List<NativeSmbEntry>> list(String directory);
+  Future<List<int>> read(String path);
+  Future<void> download(
+    String path,
+    String destination, {
+    void Function(int received, int total)? onProgress,
+  });
+  Future<void> close();
+}
+
+typedef NativeSmbConnector = Future<NativeSmbSession> Function({
+  required String host,
+  required int port,
+  required String share,
+  required String username,
+  required String password,
+});
+
+/// Serializes native libsmb2 calls across pools: its native context registry
+/// is process-global. Other Dart tasks remain asynchronous.
+class Libsmb2Transport implements NativeSmbSession {
+  Libsmb2Transport._(this._pool);
+
+  static final _native = Lock();
+  final Smb2Pool _pool;
+  bool _closed = false;
+
+  static Future<NativeSmbSession> connect({
+    required String host,
+    required int port,
+    required String share,
+    required String username,
+    required String password,
+  }) async {
+    // DOMAIN\\username is supported without introducing a new setting.
+    final separator = username.indexOf('\\');
+    final domain = separator > 0 ? username.substring(0, separator) : '';
+    final user = separator > 0 ? username.substring(separator + 1) : username;
+    // dart_smb2 0.1.3 supplies no custom-port option to libsmb2.
+    // Appending :port changes the hostname, but does not change port 445.
+    if (port != 445) {
+      throw UnsupportedError(
+        'Native SMB supports port 445 only. Use the NAS SMB port 445.',
+      );
+    }
+    if (user.isNotEmpty && password.isEmpty) {
+      throw const FormatException(
+        'SMB password missing for the named account. Re-enter the password '
+        'instead of connecting as an anonymous guest.',
+      );
+    }
+    final address = host;
+    final pool = await _native.synchronized(
+      () => Smb2Pool.connect(
+        host: address,
+        share: share,
+        user: user,
+        password: password,
+        domain: domain,
+        workers: 1,
+        timeoutSeconds: 20,
+        signing: true,
+        version: Smb2Version.any,
+      ),
+    );
+    return Libsmb2Transport._(pool);
+  }
+
+  @override
+  Future<List<NativeSmbEntry>> list(String directory) async {
+    final rows = await _native.synchronized(
+      () => _pool.listDirectory(directory),
+    );
+    return [
+      for (final row in rows)
+        if (row.name != '.' && row.name != '..')
+          (
+            name: row.name,
+            path: directory.isEmpty ? row.name : '$directory/${row.name}',
+            size: row.size,
+            isDir: row.isDirectory,
+          ),
+    ];
+  }
+
+  /// Artwork must never be loaded as an unbounded native allocation.
+  /// Some NASes expose unexpectedly large scans as cover.jpg.
+  static const int maxArtworkBytes = 12 * 1024 * 1024;
+
+  @override
+  Future<List<int>> read(String path) async {
+    final (handle, size) = await _native.synchronized(
+      () => _pool.openFileWithSize(path),
+    );
+    try {
+      if (size < 0 || size > maxArtworkBytes) {
+        throw const FileSystemException('NAS cover exceeds 12 MiB');
+      }
+      final result = BytesBuilder(copy: false);
+      var offset = 0;
+      while (offset < size) {
+        final chunk = await _native.synchronized(
+          () => _pool.readFromHandle(
+            handle,
+            offset: offset,
+            length: (size - offset).clamp(1, 256 * 1024).toInt(),
+          ),
+        );
+        if (chunk.isEmpty)
+          throw const FileSystemException('NAS cover truncated');
+        result.add(chunk);
+        offset += chunk.length;
+      }
+      return result.takeBytes();
+    } finally {
+      await _native.synchronized(() => _pool.closeHandle(handle));
+    }
+  }
+
+  /// Read at most a small media prefix for embedded album art. Even a
+  /// multi-gigabyte FLAC must never be buffered merely to paint its cover.
+  Future<List<int>> _readPrefixNative(String path, int maxBytes) async {
+    final (handle, size) = await _native.synchronized(
+      () => _pool.openFileWithSize(path),
+    );
+    try {
+      if (size < 0) throw const FileSystemException('Invalid NAS file size');
+      final target = size < maxBytes ? size : maxBytes;
+      final result = BytesBuilder(copy: false);
+      var offset = 0;
+      while (offset < target) {
+        final chunk = await _native.synchronized(
+          () => _pool.readFromHandle(
+            handle,
+            offset: offset,
+            length: (target - offset).clamp(1, 256 * 1024).toInt(),
+          ),
+        );
+        if (chunk.isEmpty) {
+          throw const FileSystemException('NAS artwork prefix truncated');
+        }
+        result.add(chunk);
+        offset += chunk.length;
+      }
+      return result.takeBytes();
+    } finally {
+      await _native.synchronized(() => _pool.closeHandle(handle));
+    }
+  }
+
+  @override
+  Future<void> download(
+    String path,
+    String destination, {
+    void Function(int received, int total)? onProgress,
+  }) async {
+    final partial = File(
+      '$destination.smb-part-${DateTime.now().microsecondsSinceEpoch}',
+    );
+    final file = await partial.open(mode: FileMode.write);
+    var completed = false;
+    try {
+      final (handle, size) = await _native.synchronized(
+        () => _pool.openFileWithSize(path),
+      );
+      try {
+        var offset = 0;
+        while (offset < size) {
+          final chunk = await _native.synchronized(
+            () => _pool.readFromHandle(
+              handle,
+              offset: offset,
+              length: (size - offset).clamp(1, 256 * 1024).toInt(),
+            ),
+          );
+          if (chunk.isEmpty) {
+            throw const FileSystemException('SMB download truncated');
+          }
+          await file.writeFrom(chunk);
+          offset += chunk.length;
+          onProgress?.call(offset, size);
+        }
+      } finally {
+        await _native.synchronized(() => _pool.closeHandle(handle));
+      }
+      await file.flush();
+      await file.close();
+      await partial.rename(destination);
+      completed = true;
+    } finally {
+      if (!completed) {
+        try {
+          await file.close();
+        } catch (_) {}
+        try {
+          await partial.delete();
+        } catch (_) {}
+      }
+    }
+  }
+
+  @override
+  Future<void> close() async {
+    if (_closed) return;
+    _closed = true;
+    await _native.synchronized(() => _pool.disconnect());
+  }
+}
+
+/// Keep the native transport interface compatible with existing SMB fixtures.
+/// The production pool performs a true capped range read; test implementations
+/// can continue to supply an already-small in-memory fixture via read().
+extension NativeSmbPrefixRead on NativeSmbSession {
+  Future<List<int>> readPrefix(String path, {required int maxBytes}) async {
+    if (maxBytes <= 0 || maxBytes > Libsmb2Transport.maxArtworkBytes) {
+      throw ArgumentError.value(maxBytes, 'maxBytes', 'Invalid prefix limit');
+    }
+    if (this is Libsmb2Transport) {
+      return (this as Libsmb2Transport)._readPrefixNative(path, maxBytes);
+    }
+    final bytes = await read(path);
+    return bytes.length <= maxBytes ? bytes : bytes.sublist(0, maxBytes);
+  }
+}

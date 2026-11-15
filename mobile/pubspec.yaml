@@ -1,0 +1,243 @@
+name: flick
+description: "Hadoo — your music, your terminal. Android and iOS."
+# The following line prevents the package from being accidentally published to
+# pub.dev using `flutter pub publish`. This is preferred for private packages.
+publish_to: "none" # Remove this line if you wish to publish to pub.dev
+
+# The following defines the version and build number for your application.
+# A version number is three numbers separated by dots, like 1.2.43
+# followed by an optional build number separated by a +.
+# Both the version and the builder number may be overridden in flutter
+# build by specifying --build-name and --build-number, respectively.
+# In Android, build-name is used as versionName while build-number used as versionCode.
+# Read more about Android versioning at https://developer.android.com/studio/publish/versioning
+# In iOS, build-name is used as CFBundleShortVersionString while build-number is used as CFBundleVersion.
+# Read more about iOS versioning at
+# https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
+# In Windows, build-name is used as the major, minor, and patch parts
+# of the product and file versions while build-number is used as the build suffix.
+version: 2.0.0-dev.16+2015
+
+environment:
+  sdk: ^3.13.0
+  flutter: ">=3.47.0"
+
+# Dependencies specify other packages that your package needs in order to work.
+# To automatically upgrade your package dependencies to the latest versions
+# consider running `flutter pub upgrade --major-versions`. Alternatively,
+# dependencies can be manually updated by changing the version numbers below to
+# the latest version available on pub.dev. To see which dependencies have newer
+# versions available, run `flutter pub outdated`.
+dependencies:
+  archive: ^4.0.9
+  audio_session: ^0.2.4
+  crypto: ^3.0.3
+  # Locally decrypt only hybrid-v1 CENC media for which the addon supplies a key.
+  pointycastle: ^4.0.0
+  # Mornye's native SMB2/3 transport: required for NAS signing/encryption.
+  dart_smb2: 0.1.3
+  connectivity_plus: ^7.0.0
+  cupertino_icons: ^2.0.0
+  fading_marquee_widget: ^1.2.1
+  ffi: ^2.2.0
+  file_picker: ^12.3.0
+  ffmpeg_kit_flutter_new_audio: ^2.5.7
+  fl_chart: ^1.1.1
+  flutter:
+    sdk: flutter
+  flutter_cache_manager: ^3.4.5
+  flutter_localizations:
+    sdk: flutter
+  flutter_displaymode: ^0.7.0
+  flutter_markdown: ^0.7.7
+  flutter_riverpod: ^3.0.3
+  flutter_rust_bridge: ^2.13.0
+  flutter_secure_storage: ^10.3.4
+  flutter_inappwebview: ^6.2.0-beta.3
+  flutter_svg: ^2.3.0
+  home_widget: ^0.10.0
+  freezed_annotation: ^3.0.0
+  http: ^1.2.0
+  image: ^4.10.2
+  image_picker: ^1.2.3
+  intl: any
+  isar_community: ^3.3.2
+  isar_community_flutter_libs: ^3.3.2
+  json_annotation: ^4.9.0
+  just_audio:
+    path: third_party/just_audio
+  lucide_icons_flutter: ^3.1.8
+  mornye_discord:
+    path: third_party/mornye_discord
+  native_toolchain_rust: ^1.0.7
+  path: ^1.9.1
+  path_provider: ^2.1.6
+  permission_handler: ^13.0.2
+  rive: ^0.14.11
+  riverpod_annotation: ^4.0.0
+  restart_app: ^1.10.1
+  rust_lib_flick_player:
+    path: rust_builder
+  shared_preferences: ^2.2.2
+  synchronized: ^3.4.0
+  in_app_update: ^5.0.0
+  share_plus: ^13.3.1
+  skeletonizer: ^3.0.0
+  url_launcher: ^6.3.2
+  unorm_dart: ^0.3.2
+  video_player: ^2.9.5
+  xml: ^7.0.1
+  mobile_scanner: ^7.4.2
+
+dev_dependencies:
+  build_runner: ^2.15.1
+  flutter_launcher_icons: ^0.14.4
+  flutter_lints: ^6.0.0
+  flutter_test:
+    sdk: flutter
+  test: ^1.25.0
+  freezed: ^3.0.0
+  integration_test:
+    sdk: flutter
+  isar_community_generator: ^3.3.2
+  json_serializable: 6.11.2
+  riverpod_generator: 4.0.0+1
+  riverpod_lint: ^3.0.3
+
+# Android theme accent aliases are generated via tool/gen_lokal_launcher_icons.py.
+# Keep flutter_launcher_icons from accidentally restoring Flick branding.
+flutter_launcher_icons:
+  image_path: "assets/branding/hadoo-mark.png"
+  android: "launcher_icon"
+  adaptive_icon_background: "#070B09"
+  adaptive_icon_foreground: "assets/branding/hadoo-mark.png"
+  adaptive_icon_monochrome: "assets/branding/hadoo-mark.png"
+
+# Resolve conflict between riverpod_generator and isar_community_generator
+# while keeping build_runner compatible with the cached toolchain versions.
+dependency_overrides:
+  analyzer: 8.1.1
+  dart_style: 3.1.2
+
+flutter:
+  config:
+    # The inherited iOS port stages pinned FFmpeg/SMB frameworks for CocoaPods.
+    enable-swift-package-manager: false
+  uses-material-design: true
+
+  # Generates AppLocalizations from lib/l10n/*.arb (see l10n.yaml).
+  generate: true
+
+  # Lokal's liquid glass lens (LokalGlass).
+  shaders:
+    - shaders/lokal_glass_lens.frag
+    - shaders/lokal_glass_rim.frag
+    - shaders/cover_cloud_dissolve.frag
+
+  assets:
+    - assets/branding/hadoo-mark.png
+    - assets/branding/hadoo-logo.png
+    - assets/fonts/JetBrainsMono-OFL.txt
+    - assets/youtube/
+    - assets/licenses/libsmb2.txt
+    - assets/licenses/soulseek-rs-lib.txt
+    - assets/spotify/session_hook.js
+    - assets/icons/flicklogo.png
+    - assets/icons/flicklogo_svg.svg
+    - assets/icons/flicklogo_transparent.png
+    - assets/recap/
+    - assets/milkdrop/
+    - assets/icons/svg/menu.svg
+    - assets/icons/svg/record_vinyl.svg
+    - assets/icons/svg/settings.svg
+    - assets/icons/svg/menu_black.svg
+    - assets/icons/svg/record_vinyl_black.svg
+    - assets/icons/svg/settings_black.svg
+    - assets/icons/svg/menu_white.svg
+    - assets/icons/svg/record_vinyl_white.svg
+    - assets/icons/svg/settings_white.svg
+    - assets/icons/svg/shuffle_black.svg
+    - assets/icons/svg/shuffle_white.svg
+    - assets/autoeq/autoeq_catalog.json
+    - assets/autoeq/autoeq_brands.json
+    - assets/fonts/GoogleSansFlex-OFL.txt
+    - assets/fonts/NotoSansSC-OFL.txt
+    - assets/fonts/DMSans-OFL.txt
+    - assets/fonts/DMMono-OFL.txt
+    - assets/branding/lokal_icon.png
+    - assets/branding/lokal_icon_sticker.png
+    - assets/branding/lokal_cd_monochrome.svg
+
+  fonts:
+    - family: HadooMono
+      fonts:
+        - asset: assets/fonts/JetBrainsMono-Regular.ttf
+          weight: 400
+        - asset: assets/fonts/JetBrainsMono-Medium.ttf
+          weight: 500
+        - asset: assets/fonts/JetBrainsMono-Bold.ttf
+          weight: 700
+    # DM Sans and DM Mono are desktop Lokal's faces (body and uppercase
+    # labels). Static instances of the upstream variable fonts (SIL OFL 1.1);
+    # see DMSans-OFL.txt and DMMono-OFL.txt.
+    - family: DMSans
+      fonts:
+        - asset: assets/fonts/DMSans-Regular.ttf
+          weight: 400
+        - asset: assets/fonts/DMSans-Medium.ttf
+          weight: 500
+        - asset: assets/fonts/DMSans-SemiBold.ttf
+          weight: 600
+    - family: DMMono
+      fonts:
+        - asset: assets/fonts/DMMono-Regular.ttf
+          weight: 400
+        - asset: assets/fonts/DMMono-Medium.ttf
+          weight: 500
+
+    # Google Sans Flex replaces Product Sans, which was not licensed for
+    # third-party redistribution. The four faces are instanced from the
+    # upstream variable font (SIL OFL 1.1, no Reserved Font Names) by
+    # tool/gen_app_font.py; see GoogleSansFlex-OFL.txt for the license.
+    - family: GoogleSansFlex
+      fonts:
+        - asset: assets/fonts/GoogleSansFlex-BoldItalic.ttf
+          weight: 700
+          style: italic
+        - asset: assets/fonts/GoogleSansFlex-Italic.ttf
+          weight: 400
+          style: italic
+        - asset: assets/fonts/GoogleSansFlex-Bold.ttf
+          weight: 700
+          style: normal
+        - asset: assets/fonts/GoogleSansFlex-Regular.ttf
+          weight: 400
+          style: normal
+
+    # Simplified Chinese fallback.
+    #
+    # Google Sans Flex is Latin/Greek only, and the app's bundled subset is
+    # deliberately smaller still. Skia does not search bundled fonts for
+    # missing characters (AssetFontManager::onMatchFamilyStyleCharacter
+    # returns nullptr), so nothing would change without an explicit request.
+    # AppTheme.fontFamilyFallback names this family, and every style in the
+    # app's text theme carries that fallback, so Chinese renders in the bundled
+    # Noto Sans SC instead of the device font.
+    #
+    # The subset is generated by tool/gen_font_subset.py from the variable Noto
+    # Sans SC: instanced to static 400/700, then cut down to the characters the
+    # app's own strings use (1156 of them). That keeps it at ~348 KB per weight
+    # instead of ~17 MB for the full family. Characters outside the subset -- a
+    # rare glyph in a song title, say -- still fall back to the platform font,
+    # so nothing renders as a tofu box. Run the script again (with --check) after
+    # adding strings; --check can also be wired into CI to catch a stale subset.
+    #
+    # Licensed under the SIL Open Font License 1.1; see NotoSansSC-OFL.txt.
+    - family: NotoSansSC
+      fonts:
+        - asset: assets/fonts/NotoSansSC-Regular.ttf
+          weight: 400
+          style: normal
+        - asset: assets/fonts/NotoSansSC-Bold.ttf
+          weight: 700
+          style: normal

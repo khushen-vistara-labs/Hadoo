@@ -1,60 +1,32 @@
-# Maintenance
+# Maintenance and release preparation
 
-## Local and published files
+`trunk` is the active Hadoo source branch. Use [Contributing](../CONTRIBUTING.md) for changes and [Build from source](build.md) for a clean setup. The current development preview is **2015**.
 
-Everything generated or private belongs under `.hadoo-local/`: tools, original
-APKs, build outputs, signing keys, scratch files and backups. `.gitignore` also
-excludes common APK, keystore and private-key extensions elsewhere.
+## Versioning
 
-GitHub Actions checks Hadoo's source and patch compatibility only. It has no APK
-input, no device connection and no signing key. There is no automatic APK release
-or publishing workflow.
+Update the version in `mobile/pubspec.yaml` and the entry in [CHANGELOG.md](../CHANGELOG.md) for each published build. The integer after `+` becomes the Android version code and iPhone build number. Increase it for updates. The iPhone build uses the numeric marketing version (such as `2.0.0`) for its platform metadata.
 
-## Upstream updates
+## Android release signing
 
-1. Read the Morphe Desktop and Morphe Patches release notes and confirm they use
-   compatible patcher versions.
-2. Choose exact stable releases. Obtain each asset's SHA-256 from official GitHub
-   release metadata and verify the downloaded bytes independently.
-3. Update `config/upstream-lock.json`, including the YouTube Music package's
-   supported stable versions, signing certificates and option keys from that
-   exact patch release's `patches-list.json`.
-4. Run `./hadoo setup`, `./hadoo check`, `./hadoo patches`, then a complete local
-   build from a supported original APK. Test the result on your device.
-5. Keep the same signing key so the new build can update the previous build.
+Use a keystore you control. Configure `ANDROID_KEYSTORE_PATH`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, and `ANDROID_KEY_PASSWORD` in your terminal or secret manager. Alternatively, create the ignored file `mobile/android/key.properties` with `storeFile`, `storePassword`, `keyAlias`, and `keyPassword`. Use an absolute keystore path. Keep a recoverable private backup of the key.
 
-Failed patches stop the build. Hadoo does not pass `--force` or
-`--continue-on-error`. It uses full bytecode rebuilding rather than stripping
-classes aggressively. Service-side playback failures may still require a
-reviewed upstream update.
+```sh
+./hadoo build android --release
+apksigner verify --verbose mobile/build/app/outputs/flutter-apk/app-full-release.apk
+```
 
-## Embedded defaults
+Use `apksigner` from the installed Android Build Tools. The release application ID is `com.icemonkey.hadoo`. A different signing key, application ID, or older version code can prevent an in-place update.
 
-`config/phone-settings.json` and `config/native-settings.json` are build inputs.
-`tools/HadooDefaultsPatch.java` compiles against the checksum-pinned Desktop JAR
-into an independent local MPP; the upstream MPP remains unchanged. The add-on
-uses Java 17 class files as required by Morphe's patch loader.
+## iPhone packaging
 
-The add-on runs after upstream patch execution. It changes Morphe constructor
-defaults while restoring any shared bytecode registers, changes the startup
-animation default getter, and sets fallback arguments in YouTube Music's native
-account-aware boolean preferences wrapper. Native saved values still take
-precedence. Unsupported constructors, enum values or native getter shapes fail
-the build. The finished APK is inspected independently and its default profile,
-add-on SHA-256 and source hash are recorded in `build.json`.
+Use the [iPhone build guide](build.md#iphone) for an unsigned device build and IPA. Install a personally signed copy for device qualification. Keep the signed package for any distinct distribution channel separate. App Store and TestFlight distribution require the Apple Developer Program and applicable review and signing steps.
 
-When updating upstream, test a fresh install and confirm that changing the
-audio preference off survives restart and reinstall-as-update. Do not clear an
-existing user's app data to test fresh defaults; use a disposable emulator.
+## Release checklist
 
-## Earlier Hadoo implementation
+1. Run `./hadoo check` and build from a clean checkout on the release toolchains. Record the source commit and build number.
+2. Verify install and in-place update on Android and iPhone. Check basic playback, queue changes, screen-off audio, signed-in recommendations, each playlist type, airplane-mode download playback, and a sign-out/sign-in cycle.
+3. Test car claims on the corresponding head unit. Include cold launch, browse, track selection, steering-wheel controls, and reconnect. Record which tests ran and which devices were used.
+4. Validate archive integrity and the installed package version. Keep licenses and notices in the app and deliver the corresponding source and lockfiles with the artifact. Review the terms for any separately licensed SDK before public distribution.
+5. If publishing binaries, attach them deliberately to a GitHub Release with per-platform install steps, SHA-256 checksums, and known limitations. Mark previews as pre-releases. Never commit APKs, IPAs, tools, signing keys, account sessions, service logs, or music to the repository.
 
-The migration preserved the old working tree, including uncommitted changes and
-local build dependencies, at `.hadoo-local/legacy-2026-11-03/`. The original two
-logo PNGs were copied without changing their bytes. The backup also contains the
-previous Git HEAD, working-tree status, binary diff and logo checksums.
-
-This backup is local to the migration machine and is not part of a fresh clone.
-Committed versions remain in Git history. No history was rewritten. To inspect
-the previous implementation, use a separate worktree or the local backup; do not
-restore files over the rebuilt project without first saving current changes.
+Use [platform status](mobile-rewrite.md) to publish what has actually been checked. For the earlier APK patch workflow, use the [legacy guide](legacy-morphe.md).

@@ -1,0 +1,10 @@
+# Configures Flutter's gen-l10n code generation.
+# See https://docs.flutter.dev/ui/accessibility-and-internationalization/internationalization
+arb-dir: lib/l10n
+template-arb-file: app_en.arb
+output-localization-file: app_localizations.dart
+output-class: AppLocalizations
+# Write the generated code into the source tree so it is visible in review and
+# importable as package:flick/l10n/generated/app_localizations.dart.
+output-dir: lib/l10n/generated
+nullable-getter: false
