@@ -1,6 +1,6 @@
 # Maintenance and release preparation
 
-`trunk` is the active Hadoo source branch. Use [Contributing](../CONTRIBUTING.md) for changes and [Build from source](build.md) for a clean setup. The current development preview is **2015**.
+`trunk` is the active Hadoo source branch. Use [Contributing](../CONTRIBUTING.md) for changes and [Build from source](build.md) for a clean setup. The current development preview is **2016**.
 
 ## Versioning
 

@@ -126,19 +126,22 @@ void main() {
     expect(noSerial, '1:2:/dev/bus/usb/001/002');
   });
 
-  test('auto-engage defaults to enabled and persists', () async {
-    SharedPreferences.setMockInitialValues({});
-    final service = Uac2PreferencesService();
+  test(
+    'an unset auto-engage preference keeps phone volume on discovery',
+    () async {
+      SharedPreferences.setMockInitialValues({});
+      final service = Uac2PreferencesService();
 
-    expect(await service.getAutoEngageUsbDacEnabled(), isTrue);
+      expect(await service.getAutoEngageUsbDacEnabled(), isFalse);
 
-    await service.setAutoEngageUsbDacEnabled(false);
-    expect(await service.getAutoEngageUsbDacEnabled(), isFalse);
-    expect(Uac2PreferencesService.isAutoEngageUsbDacEnabledSync, isFalse);
+      await service.setAutoEngageUsbDacEnabled(true);
+      expect(await service.getAutoEngageUsbDacEnabled(), isTrue);
+      expect(Uac2PreferencesService.isAutoEngageUsbDacEnabledSync, isTrue);
 
-    await service.clearAllPreferences();
-    expect(await service.getAutoEngageUsbDacEnabled(), isTrue);
-  });
+      await service.clearAllPreferences();
+      expect(await service.getAutoEngageUsbDacEnabled(), isFalse);
+    },
+  );
 
   test('declined devices persist and can be cleared', () async {
     SharedPreferences.setMockInitialValues({});

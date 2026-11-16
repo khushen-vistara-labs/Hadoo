@@ -303,7 +303,10 @@ class _Uac2PreferencesSectionsState
               l10n.autoBitPerfectForUsbDacs,
               (enabled) => LokalSettingRow.toggle(
                 label: l10n.autoBitPerfectForUsbDacs,
-                description: l10n.switchToTheExclusiveUsbPath,
+                description: lokalText(
+                  'Automatically switch to exclusive USB when a DAC connects. '
+                  'The phone’s volume buttons are bypassed on this output.',
+                ),
                 value: enabled,
                 onChanged: (value) async {
                   await service.setAutoEngageUsbDacEnabled(value);

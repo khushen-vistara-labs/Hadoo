@@ -46,10 +46,9 @@ bool isLiveExternalUsbRoute(Uac2DeviceStatus status) {
 String usbDevicePromptKey(Uac2DeviceInfo device) =>
     '${device.vendorId}:${device.productId}:${device.serial ?? device.deviceName}';
 
-/// Auto-engages Bit-perfect (USB DAC) when a USB DAC is attached, so the
-/// exclusive path wins by default instead of silently staying on Android's
-/// mixer. Renders nothing; mount once in the shell. Per-device declines are
-/// persisted, and the switch offers Undo.
+/// Auto-engages Bit-perfect (USB DAC) on attachment when the listener opts in.
+/// Renders nothing; mount once in the shell. Per-device declines are persisted,
+/// and the switch offers Undo.
 class UsbBitPerfectPrompt extends ConsumerStatefulWidget {
   const UsbBitPerfectPrompt({super.key});
 

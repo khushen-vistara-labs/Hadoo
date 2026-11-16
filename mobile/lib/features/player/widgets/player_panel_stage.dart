@@ -4,104 +4,80 @@ import 'dart:ui' show lerpDouble;
 import 'package:flutter/material.dart';
 import 'package:flick/l10n/l10n.dart';
 
-/// A single artwork and title travel between three poses: large cover,
-/// queue header, and the compact now-playing row beneath lyrics.
+/// One cover and title move into the compact row below the lyrics.
 class PlayerPanelStage extends StatelessWidget {
   const PlayerPanelStage({
     super.key,
-    required this.queueProgress,
     required this.lyricsProgress,
-    required this.queueOpen,
     required this.lyricsOpen,
     required this.artwork,
     required this.info,
-    required this.queue,
     required this.lyrics,
     this.artGap = 16,
     this.infoReserve = 72,
-    this.onQueueHeaderTap,
     this.onLyricsCoverReturn,
-    this.onQueueHeaderDrag,
-    this.onQueueHeaderRelease,
   });
-  final Animation<double> queueProgress, lyricsProgress;
-  final bool queueOpen, lyricsOpen;
+
+  final Animation<double> lyricsProgress;
+  final bool lyricsOpen;
   final Widget Function(BuildContext, double, double) artwork;
   final Widget Function(BuildContext, double) info;
-  final Widget queue, lyrics;
+  final Widget lyrics;
   final double artGap;
   final double infoReserve;
-  final VoidCallback? onQueueHeaderTap, onLyricsCoverReturn;
-  final ValueChanged<double>? onQueueHeaderDrag, onQueueHeaderRelease;
+  final VoidCallback? onLyricsCoverReturn;
+
   @override
   Widget build(BuildContext context) => AnimatedBuilder(
-    animation: Listenable.merge([queueProgress, lyricsProgress]),
+    animation: lyricsProgress,
     builder: (context, _) {
-      final l = lyricsProgress.value.clamp(0.0, 1.0);
-      final q = queueProgress.value.clamp(0.0, 1.0) * (1 - l);
-      final compact = q + l;
-      Widget panel(Widget child, double opacity, bool active) => IgnorePointer(
-        ignoring: !active,
-        child: ExcludeSemantics(
-          excluding: !active,
-          child: TickerMode(
-            enabled: opacity > 0,
-            child: Opacity(
-              opacity: opacity,
-              child: RepaintBoundary(child: child),
-            ),
-          ),
-        ),
+      final progress = lyricsProgress.value.clamp(0.0, 1.0);
+      final opacity = Curves.easeOut.transform(
+        ((progress - .12) / .88).clamp(0.0, 1.0),
       );
       return ClipRect(
         child: CustomMultiChildLayout(
           delegate: _PanelLayout(
-            queue: q,
-            lyrics: l,
+            lyrics: progress,
             artGap: artGap,
             infoReserve: MediaQuery.textScalerOf(context).scale(infoReserve),
           ),
           children: [
             LayoutId(
-              id: _Part.queue,
-              child: panel(
-                queue,
-                Curves.easeOut.transform(((q - .15) / .85).clamp(0.0, 1.0)),
-                queueOpen && !lyricsOpen,
-              ),
-            ),
-            LayoutId(
               id: _Part.lyrics,
-              child: panel(
-                lyrics,
-                Curves.easeOut.transform(((l - .12) / .88).clamp(0.0, 1.0)),
-                lyricsOpen,
+              child: IgnorePointer(
+                ignoring: !lyricsOpen,
+                child: ExcludeSemantics(
+                  excluding: !lyricsOpen,
+                  child: TickerMode(
+                    enabled: opacity > 0,
+                    child: Opacity(
+                      opacity: opacity,
+                      child: RepaintBoundary(child: lyrics),
+                    ),
+                  ),
+                ),
               ),
             ),
             LayoutId(
               id: _Part.art,
               child: LayoutBuilder(
                 builder: (context, c) => RepaintBoundary(
-                  child: artwork(context, c.maxWidth, compact),
+                  child: artwork(context, c.maxWidth, progress),
                 ),
               ),
             ),
-            LayoutId(id: _Part.info, child: info(context, compact)),
+            LayoutId(id: _Part.info, child: info(context, progress)),
             LayoutId(
               id: _Part.header,
               child: IgnorePointer(
-                ignoring: !queueOpen && !lyricsOpen,
-                child: lyricsOpen
-                    ? _LyricsCoverReturnTarget(onReturn: onLyricsCoverReturn)
-                    : GestureDetector(
-                        behavior: HitTestBehavior.opaque,
-                        onTap: onQueueHeaderTap,
-                        onVerticalDragUpdate: (d) =>
-                            onQueueHeaderDrag?.call(-d.delta.dy),
-                        onVerticalDragEnd: (d) => onQueueHeaderRelease?.call(
-                          -(d.primaryVelocity ?? 0),
-                        ),
-                      ),
+                ignoring: !lyricsOpen,
+                child: ExcludeSemantics(
+                  excluding: !lyricsOpen,
+                  child: _LyricsCoverReturnTarget(
+                    onReturn: onLyricsCoverReturn,
+                  ),
+                ),
               ),
             ),
           ],
@@ -130,7 +106,7 @@ Rect playerPanelRestArtworkRect(
   return Rect.fromLTWH((width - side) / 2, (room - side) / 2, side, side);
 }
 
-/// Artwork rectangle at any point in the existing queue/lyrics transition.
+/// Artwork rectangle at any point in the lyrics transition.
 /// These are exactly the constraints and offsets used by _PanelLayout, so
 /// Space's growing frost mask can follow the actual cover frame by frame.
 @visibleForTesting
@@ -138,13 +114,10 @@ Rect playerPanelArtworkRect(
   Size size, {
   required double artGap,
   required double infoReserve,
-  required double queue,
   required double lyrics,
 }) {
   final l = lyrics.clamp(0.0, 1.0);
-  final q = queue.clamp(0.0, 1.0) * (1 - l);
-  final c = q + l;
-  final full = 1 - c;
+  final full = 1 - l;
   final rest = playerPanelRestArtworkRect(
     size,
     artGap: artGap,
@@ -156,31 +129,30 @@ Rect playerPanelArtworkRect(
   final headerHeight = math.max(math.min(thumb, h), infoReserve);
   final artCentering = (headerHeight - math.min(thumb, h)) / 2;
   final lyricsTop = math.max(0.0, h - headerHeight - 8);
-  final side = lerpDouble(rest.width, math.min(thumb, h), c)!;
+  final side = lerpDouble(rest.width, math.min(thumb, h), l)!;
   return Rect.fromLTWH(
     (w - rest.width) / 2 * full,
-    rest.top * full + artCentering * c + lyricsTop * l,
+    rest.top * full + (artCentering + lyricsTop) * l,
     side,
     side,
   );
 }
 
-enum _Part { art, info, queue, lyrics, header }
+enum _Part { art, info, lyrics, header }
 
 class _PanelLayout extends MultiChildLayoutDelegate {
   _PanelLayout({
-    required this.queue,
     required this.lyrics,
     required this.artGap,
     required this.infoReserve,
   });
-  final double queue, lyrics, artGap, infoReserve;
+  final double lyrics, artGap, infoReserve;
   static const thumb = 52.0;
   @override
   void performLayout(Size size) {
-    final c = (queue + lyrics).clamp(0.0, 1.0), full = 1 - c;
+    final full = 1 - lyrics;
     final w = size.width, h = size.height;
-    final left = (thumb + 12) * c;
+    final left = (thumb + 12) * lyrics;
     final info = layoutChild(
       _Part.info,
       BoxConstraints(
@@ -197,7 +169,6 @@ class _PanelLayout extends MultiChildLayoutDelegate {
       infoReserve: infoReserve,
     );
     final fullSide = restArtwork.width;
-    final room = restArtwork.top * 2 + fullSide;
     final top = restArtwork.top;
     final headerHeight = math.max(math.min(thumb, h), infoReserve);
     final artCentering = (headerHeight - math.min(thumb, h)) / 2;
@@ -206,8 +177,6 @@ class _PanelLayout extends MultiChildLayoutDelegate {
       size,
       artGap: artGap,
       infoReserve: infoReserve,
-      // _PanelLayout receives the already-composited q term.
-      queue: lyrics >= 1 ? 0 : queue / (1 - lyrics),
       lyrics: lyrics,
     );
     layoutChild(_Part.art, BoxConstraints.tight(artBounds.size));
@@ -217,16 +186,10 @@ class _PanelLayout extends MultiChildLayoutDelegate {
       Offset(
         left,
         (top + fullSide + artGap) * full +
-            (headerHeight - info.height) / 2 * c +
+            (headerHeight - info.height) / 2 * lyrics +
             lyricsTop * lyrics,
       ),
     );
-    final queueTop = math.min(h, headerHeight + 12);
-    layoutChild(
-      _Part.queue,
-      BoxConstraints.tightFor(width: w, height: math.max(0, h - queueTop)),
-    );
-    positionChild(_Part.queue, Offset(0, queueTop + (1 - queue) * 22));
     layoutChild(
       _Part.lyrics,
       BoxConstraints.tightFor(width: w, height: math.max(0, lyricsTop - 10)),
@@ -235,8 +198,8 @@ class _PanelLayout extends MultiChildLayoutDelegate {
     layoutChild(
       _Part.header,
       BoxConstraints.tightFor(
-        width: lerpDouble(w, math.min(thumb, w), lyrics)!,
-        height: lerpDouble(queueTop, math.min(thumb, h), lyrics)!,
+        width: math.min(thumb, w),
+        height: math.min(thumb, h),
       ),
     );
     positionChild(_Part.header, Offset(0, (lyricsTop + artCentering) * lyrics));
@@ -244,14 +207,13 @@ class _PanelLayout extends MultiChildLayoutDelegate {
 
   @override
   bool shouldRelayout(_PanelLayout old) =>
-      old.queue != queue ||
       old.lyrics != lyrics ||
       old.artGap != artGap ||
       old.infoReserve != infoReserve;
 }
 
 /// A compact cover exits lyrics on tap or an upward swipe, without stealing
-/// gestures from the lyrics list or changing the queue's downward drag behavior.
+/// gestures from the lyrics list.
 class _LyricsCoverReturnTarget extends StatefulWidget {
   const _LyricsCoverReturnTarget({this.onReturn});
   final VoidCallback? onReturn;

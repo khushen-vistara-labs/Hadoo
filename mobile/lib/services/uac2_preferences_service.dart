@@ -69,7 +69,7 @@ class Uac2PreferencesService {
   static const _keyDeclinedUsbDevices = 'uac2_declined_usb_devices';
   static const _keyAutoEngageUsbDac = 'uac2_auto_engage_usb_dac';
 
-  static final ValueNotifier<bool> autoEngageUsbDacNotifier = ValueNotifier(true);
+  static final ValueNotifier<bool> autoEngageUsbDacNotifier = ValueNotifier(false);
   static bool get isAutoEngageUsbDacEnabledSync => autoEngageUsbDacNotifier.value;
 
   static bool get isDeveloperModeEnabledSync => developerModeNotifier.value;
@@ -828,7 +828,7 @@ class Uac2PreferencesService {
   Future<bool> getAutoEngageUsbDacEnabled() async {
     try {
       final prefs = await SharedPreferences.getInstance();
-      final enabled = prefs.getBool(_keyAutoEngageUsbDac) ?? true;
+      final enabled = prefs.getBool(_keyAutoEngageUsbDac) ?? false;
       if (autoEngageUsbDacNotifier.value != enabled) {
         autoEngageUsbDacNotifier.value = enabled;
       }
@@ -883,7 +883,7 @@ await prefs.remove(_keyAudioEnginePreference);
       dsdWireGroupingNotifier.value = DsdWireGrouping.auto;
       developerModeNotifier.value = false;
       killIsochronousUsbOnQuitNotifier.value = true;
-      autoEngageUsbDacNotifier.value = true;
+      autoEngageUsbDacNotifier.value = false;
       tuning432HzNotifier.value = false;
       btLowLatencyModeNotifier.value = false;
       btHiResDirectNotifier.value = false;

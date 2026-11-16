@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.0.0-dev.17 (build 2016) · 2026-11-16
+
+- Android keeps the phone’s volume buttons available for USB headphones on standard playback. Automatic exclusive USB is now opt-in.
+- **Queue** in the full player opens a dedicated page with room to browse and reorder upcoming songs.
+- The full-player **Lyrics** toolbar gives the title its own line on phones and wraps actions on narrow displays.
+
 ## 2.0.0-dev.16 (build 2015) · 2026-11-16
 
 - iPhone now initializes a YouTube guest session before fetching direct audio. Verified complete AAC downloads and decoding for Ishaare and Dhoond on the Mac, and playback on iPhone 14.

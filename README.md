@@ -16,7 +16,7 @@ Hadoo is a standalone music player for Android and iPhone with a terminal-inspir
 | Build, test, or contribute | [Build from source](docs/build.md) · [Contributing](CONTRIBUTING.md) |
 | Check the current version and device coverage | [Changelog](CHANGELOG.md) · [Platform status](docs/mobile-rewrite.md) |
 
-Build **2015** (`2.0.0-dev.16`) is the current source preview on `trunk`. Follow the [build guide](docs/build.md) to make an APK or IPA. Published packages will appear in [GitHub Releases](https://github.com/khushen-vistara-labs/Hadoo/releases).
+Build **2016** (`2.0.0-dev.17`) is the current source preview on `trunk`. Follow the [build guide](docs/build.md) to make an APK or IPA. Published packages will appear in [GitHub Releases](https://github.com/khushen-vistara-labs/Hadoo/releases).
 
 ## What you can do
 

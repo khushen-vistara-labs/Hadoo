@@ -6,14 +6,14 @@ import 'package:flick/features/player/widgets/player_panel_stage.dart';
 
 void main() {
   testWidgets(
-    'tablet square stage fills its pane and keeps queue/lyrics cover transitions',
+    'tablet square stage fills its pane and keeps the lyrics cover transition',
     (tester) async {
       tester.view
         ..physicalSize = const Size(1024, 768)
         ..devicePixelRatio = 1;
       addTearDown(tester.view.reset);
-      for (final (queue, lyrics) in [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)]) {
-        final compact = queue + lyrics > 0;
+      for (final lyrics in [0.0, 1.0]) {
+        final compact = lyrics > 0;
         await tester.pumpWidget(
           MaterialApp(
             home: Center(
@@ -23,9 +23,7 @@ void main() {
                 child: PlayerPanelStage(
                   artGap: 0,
                   infoReserve: compact ? 72 : 0,
-                  queueProgress: AlwaysStoppedAnimation(queue),
                   lyricsProgress: AlwaysStoppedAnimation(lyrics),
-                  queueOpen: queue > 0,
                   lyricsOpen: lyrics > 0,
                   artwork: (_, _, _) => const ColoredBox(
                     key: ValueKey('tablet-square-cover'),
@@ -34,7 +32,6 @@ void main() {
                   info: (_, _) => compact
                       ? const SizedBox(height: 44, child: Text('Recording'))
                       : const SizedBox.shrink(),
-                  queue: const SizedBox.expand(),
                   lyrics: const SizedBox.expand(),
                 ),
               ),
@@ -62,9 +59,7 @@ void main() {
               width: 360,
               height: 560,
               child: PlayerPanelStage(
-                queueProgress: const AlwaysStoppedAnimation(0.0),
                 lyricsProgress: const AlwaysStoppedAnimation(1.0),
-                queueOpen: false,
                 lyricsOpen: true,
                 onLyricsCoverReturn: () => returns++,
                 artwork: (_, _, _) => const ColoredBox(
@@ -72,7 +67,6 @@ void main() {
                   color: Colors.blue,
                 ),
                 info: (_, _) => const SizedBox(height: 44, child: Text('Song')),
-                queue: const SizedBox(),
                 lyrics: const ColoredBox(
                   key: ValueKey('lyrics-area'),
                   color: Colors.black,
@@ -152,10 +146,9 @@ void main() {
     },
   );
   testWidgets(
-    'one cover moves between queue and lyrics without growing or losing scroll',
+    'one cover moves into and back from Lyrics without losing scroll',
     (tester) async {
-      final q = ValueNotifier<double>(1), l = ValueNotifier<double>(0);
-      addTearDown(q.dispose);
+      final l = ValueNotifier<double>(0);
       addTearDown(l.dispose);
       Widget list(String name) => ListView(
         key: ValueKey(name),
@@ -164,7 +157,7 @@ void main() {
             SizedBox(height: 40, child: Text('$name $i')),
         ],
       );
-      final queue = list('queue'), lyrics = list('lyrics');
+      final lyrics = list('lyrics');
       await tester.pumpWidget(
         MaterialApp(
           home: Center(
@@ -174,9 +167,7 @@ void main() {
               child: ValueListenableBuilder<double>(
                 valueListenable: l,
                 builder: (context, value, _) => PlayerPanelStage(
-                  queueProgress: AlwaysStoppedAnimation(q.value),
                   lyricsProgress: AlwaysStoppedAnimation(value),
-                  queueOpen: value == 0 && q.value > 0,
                   lyricsOpen: value > 0,
                   artwork: (context, side, progress) => const ColoredBox(
                     key: ValueKey('shared-cover'),
@@ -186,7 +177,6 @@ void main() {
                     height: 44,
                     child: Text('Song title', key: ValueKey('shared-title')),
                   ),
-                  queue: queue,
                   lyrics: lyrics,
                 ),
               ),
@@ -200,36 +190,29 @@ void main() {
           matching: find.byType(Scrollable),
         ),
       );
-      scroll('queue').position.jumpTo(160);
       final start = tester.getRect(find.byKey(const ValueKey('shared-cover')));
-      expect(start.width, 52);
+      expect(start.width, greaterThan(300));
       var previousY = start.top;
       for (final t in [.1, .3, .5, .7, 1.0]) {
         l.value = t;
         await tester.pump();
         final rect = tester.getRect(find.byKey(const ValueKey('shared-cover')));
-        expect(rect.width, 52); // Never returns via the large cover.
+        expect(rect.width, inInclusiveRange(52.0, start.width));
         expect(rect.top, greaterThan(previousY));
         previousY = rect.top;
         expect(find.byKey(const ValueKey('shared-cover')), findsOneWidget);
       }
+      expect(
+        tester.getSize(find.byKey(const ValueKey('shared-cover'))).width,
+        52,
+      );
       scroll('lyrics').position.jumpTo(200);
       for (final t in [.8, .4, .6, .2, 0.0]) {
         l.value = t;
         await tester.pump();
       }
-      expect(scroll('queue').position.pixels, 160);
       expect(scroll('lyrics').position.pixels, 200);
       expect(tester.getRect(find.byKey(const ValueKey('shared-cover'))), start);
-      q.value = 0;
-      l.value = .01;
-      await tester.pump();
-      l.value = 0;
-      await tester.pump();
-      expect(
-        tester.getSize(find.byKey(const ValueKey('shared-cover'))).width,
-        greaterThan(300),
-      );
       expect(tester.takeException(), isNull);
     },
   );

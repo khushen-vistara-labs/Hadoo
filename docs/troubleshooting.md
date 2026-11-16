@@ -12,6 +12,12 @@
 
 Check free space and any media access prompt, then retry the download on a stable network. A saved track should appear under **Downloads**. If it plays only while online, check that the download completed and try opening the saved item directly. On Android, also check access to the folder Hadoo uses for the current install.
 
+## USB headphone volume on Android
+
+Exclusive USB sends audio directly to the DAC, so the phone’s media volume buttons have no effect. Use the DAC’s volume control or Hadoo’s volume slider when the route supports it. A fixed-volume bit-perfect route may provide neither.
+
+To use the phone’s buttons, open **Settings → Advanced output → USB DAC**, turn off **Auto Bit-perfect for USB DACs**, and choose **just_audio / ExoPlayer** under **Playback Engine**. Let the engine restart if prompted. If the current track still uses the old route, reconnect the headphones and restart playback.
+
 ## Android installation
 
 - **Device is missing or unauthorized.** Unlock it, use a USB data cable, enable USB debugging, and accept the computer's fingerprint on the device. Run `adb devices` again. Use `adb -s SERIAL install -r PATH_TO_APK` when several devices are listed.

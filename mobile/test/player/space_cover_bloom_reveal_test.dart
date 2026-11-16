@@ -37,34 +37,34 @@ void main() {
     }
   });
 
-  test('queue and lyrics cover geometry follows the real panel morph', () {
+  test('lyrics cover geometry follows the real panel morph', () {
     const panel = Size(384, 560);
     final resting = playerPanelArtworkRect(
-      panel, artGap: 17, infoReserve: 72, queue: 0, lyrics: 0,
-    );
-    final midQueue = playerPanelArtworkRect(
-      panel, artGap: 17, infoReserve: 72, queue: .5, lyrics: 0,
-    );
-    final queueThumbnail = playerPanelArtworkRect(
-      panel, artGap: 17, infoReserve: 72, queue: 1, lyrics: 0,
+      panel,
+      artGap: 17,
+      infoReserve: 72,
+      lyrics: 0,
     );
     final midLyrics = playerPanelArtworkRect(
-      panel, artGap: 17, infoReserve: 72, queue: 0, lyrics: .5,
+      panel,
+      artGap: 17,
+      infoReserve: 72,
+      lyrics: .5,
     );
     final lyricsThumbnail = playerPanelArtworkRect(
-      panel, artGap: 17, infoReserve: 72, queue: 0, lyrics: 1,
+      panel,
+      artGap: 17,
+      infoReserve: 72,
+      lyrics: 1,
     );
     expect(resting.width, 384);
-    expect(queueThumbnail.width, 52);
     expect(lyricsThumbnail.width, 52);
-    expect(midQueue.width, inInclusiveRange(52, 384));
     expect(midLyrics.width, inInclusiveRange(52, 384));
-    expect(midQueue.width, greaterThan(queueThumbnail.width));
     expect(midLyrics.top, lessThan(lyricsThumbnail.top));
     expect(midLyrics.top, greaterThan(resting.top));
   });
 
-  testWidgets('Space blur follows moving artwork during queue/lyrics exit', (
+  testWidgets('Space blur follows moving artwork during lyrics exit', (
     tester,
   ) async {
     tester.view.physicalSize = viewport;

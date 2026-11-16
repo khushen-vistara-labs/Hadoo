@@ -1,6 +1,6 @@
 # Install or update Hadoo
 
-Hadoo's current preview is build **2015**. The Android preview targets ARM64 phones on Android 8.0 (API 26) or later. The iPhone project targets iOS 16 or later. See [platform status](mobile-rewrite.md) for the devices tested.
+Hadoo's current source preview is build **2016**. The Android preview targets ARM64 phones on Android 8.0 (API 26) or later. The iPhone project targets iOS 16 or later. See [platform status](mobile-rewrite.md) for the devices tested.
 
 Get matching artifacts from [GitHub Releases](https://github.com/khushen-vistara-labs/Hadoo/releases) when available, or follow [Build from source](build.md). A GitHub source ZIP contains code. Choose an APK for Android or an IPA for signing on iPhone.
 

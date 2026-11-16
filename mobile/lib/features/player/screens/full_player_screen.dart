@@ -5,6 +5,8 @@ import 'package:flick/features/player/widgets/lokal_player_columns.dart';
 import 'package:flick/features/player/widgets/player_video_frame.dart';
 import 'package:flick/features/player/widgets/player_lyric_style.dart';
 import 'package:flick/core/utils/lokal_layout.dart';
+import 'package:flick/core/navigation/lokal_page_motion.dart';
+import 'package:flick/features/settings/screens/uac2_settings_screen.dart';
 
 import 'desktop_remote_full_player.dart';
 
@@ -30,6 +32,7 @@ import 'package:flick/widgets/common/overflow_marquee_title.dart';
 import 'package:flick/core/theme/lokal_appearance.dart';
 
 import '../widgets/lyrics_source_button.dart';
+import '../widgets/full_player_lyrics_toolbar.dart';
 import '../widgets/lyrics_file_export.dart';
 import '../widgets/lyrics_save_button.dart';
 import '../widgets/player_panel_stage.dart';
@@ -79,7 +82,6 @@ import 'package:flick/widgets/lokal/lokal_player_artwork.dart';
 import 'package:flick/widgets/lokal/lokal_pull_to_dismiss.dart';
 import 'package:flick/widgets/lokal/lokal_quality.dart';
 import 'package:flick/services/catalogue_quality.dart';
-import 'package:flick/widgets/lokal/lokal_queue_reveal.dart';
 import 'package:flick/features/player/widgets/loop_mode_sheet.dart';
 import 'package:flick/features/player/widgets/online_lyrics_search_sheet.dart';
 
@@ -148,7 +150,6 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen>
   Rect? _spaceCoverRect;
   bool _spaceCanvasMode = false;
   bool _spaceFullCover = false;
-  bool _spaceWaitingForQueue = false;
   final GlobalKey _spacePanelKey = GlobalKey(debugLabel: 'space-player-panel');
   bool _spacePanelCompact = false;
   bool _spacePanelTabletCover = false;
@@ -181,14 +182,9 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen>
             : 17,
         infoReserve: MediaQuery.textScalerOf(context).scale(
           _spacePanelTabletCover
-              ? 72 *
-                    (_lyricsProgress.value + _queueProgress.value).clamp(
-                      0.0,
-                      1.0,
-                    )
+              ? 72 * _lyricsProgress.value
               : 72,
         ),
-        queue: _queueProgress.value,
         lyrics: _lyricsProgress.value,
       );
       final origin = player.globalToLocal(panel.localToGlobal(Offset.zero));
@@ -199,25 +195,8 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen>
 
   double _spaceArtworkCornerRadius() {
     if (_spaceFullCover || _spaceCanvasMode) return 0;
-    final lyrics = _lyricsProgress.value;
-    final compact = (_queueProgress.value * (1 - lyrics) + lyrics).clamp(
-      0.0,
-      1.0,
-    );
-    return lerpDouble(20, 12, compact)!;
+    return lerpDouble(20, 12, _lyricsProgress.value)!;
   }
-
-  void _resumeSpaceAfterQueue(AnimationStatus status) {
-    if (status != AnimationStatus.dismissed || !_spaceWaitingForQueue) return;
-    _spaceWaitingForQueue = false;
-    _queueProgress.removeStatusListener(_resumeSpaceAfterQueue);
-    if (mounted) _toggleImmersiveLyrics();
-  }
-
-  late final Listenable _spaceCoverMotion = Listenable.merge([
-    _lyricsProgress,
-    _queueProgress,
-  ]);
 
   late final AnimationController _spaceProgress =
       AnimationController(
@@ -294,7 +273,7 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen>
     _posterMeasurePending = true;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _posterMeasurePending = false;
-      if (!mounted || _showLyrics || _queue.engaged) return;
+      if (!mounted || _showLyrics) return;
       final slot = _posterAnchorKey.currentContext?.findRenderObject();
       final info = _infoAnchorKey.currentContext?.findRenderObject();
       final frame = _playerBoundsKey.currentContext?.findRenderObject();
@@ -318,14 +297,7 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen>
     });
   }
 
-  /// The queue opens in place: the cover shrinks into a header row and the
-  /// list rises under it, all off this one value (0 = player, 1 = queue).
-  late final AnimationController _queueProgress = AnimationController(
-    vsync: this,
-  );
-  late final LokalQueueRevealMotion _queue = LokalQueueRevealMotion(
-    _queueProgress,
-  )..addListener(_onQueueTargetChanged);
+  bool _queuePageOpen = false;
 
   late final AnimationController _lyricsProgress = AnimationController(
     vsync: this,
@@ -455,9 +427,6 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen>
     _initialRouteAnimation?.removeStatusListener(_onInitialRouteStatus);
     LokalPerformanceAdvisor.exitPlayerSurface('modern-full-player');
     _volumeControl.dispose();
-    _queue.dispose();
-    _queueProgress.removeStatusListener(_resumeSpaceAfterQueue);
-    _queueProgress.dispose();
     _lyricsProgress.dispose();
     _spaceProgress.dispose();
     _canvasChrome.dispose();
@@ -654,19 +623,6 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen>
   }
 
   void _toggleImmersiveLyrics() {
-    // Wait for the compact queue cover to return to the poster before
-    // revealing Space in Fullcover mode.
-    if (!_immersiveLyrics &&
-        !_spaceWaitingForQueue &&
-        _animate &&
-        !LokalLayout.isLandscapeTablet(context) &&
-        ref.read(lokalAppearanceProvider).fullscreenCover &&
-        _queueProgress.value > .005) {
-      _spaceWaitingForQueue = true;
-      _queueProgress.addStatusListener(_resumeSpaceAfterQueue);
-      _queue.setOpen(false, animate: true);
-      return;
-    }
     if (_immersiveLyrics) {
       // The painter, aperture and subtitles reverse in place. Unmount only
       // when the reverse animation is fully dismissed.
@@ -683,9 +639,6 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen>
 
     _restoreCanvasControls();
     if (_showLyrics) _moveLyrics(false);
-    // Keep the queue thumbnail -> full-size cover morph. Resetting the
-    // queue without animation caused the artwork to pop into Space.
-    _queue.setOpen(false, animate: _animate);
     HapticFeedback.selectionClick();
     final active =
         _videoOverrideSong ??
@@ -905,36 +858,24 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen>
 
   void _toggleLyrics() {
     HapticFeedback.selectionClick();
-    if (_showLyrics) {
-      // At the lyric pose the hidden queue can reset without moving artwork.
-      // Mid-flight, animate it instead so a rapid reversal stays continuous.
-      _queue.setOpen(false, animate: _animate && _lyricsProgress.value < .999);
-      _moveLyrics(false);
-    } else {
-      _queueProgress.stop();
-      _moveLyrics(true);
-    }
-  }
-
-  void _onQueueTargetChanged() {
-    if (mounted) setState(() {});
+    _moveLyrics(!_showLyrics);
   }
 
   bool get _animate => !MediaQuery.disableAnimationsOf(context);
 
-  void _setQueueOpen(bool open) {
-    if (open == _queue.isOpen && !_showLyrics) return;
-    HapticFeedback.selectionClick();
-    _queue.setOpen(open, animate: _animate && _lyricsProgress.value < .999);
-    if (_showLyrics) _moveLyrics(false);
-  }
-
-  void _toggleQueue() => _setQueueOpen(_showLyrics || !_queue.isOpen);
-
-  void _releaseQueue(double upVelocity) {
-    final was = _queue.isOpen;
-    if (_queue.release(upVelocity, animate: _animate) != was) {
-      HapticFeedback.selectionClick();
+  Future<void> _openQueue({bool feedback = true}) async {
+    if (_queuePageOpen) return;
+    _queuePageOpen = true;
+    if (feedback) HapticFeedback.selectionClick();
+    try {
+      await Navigator.of(context, rootNavigator: true).push<void>(
+        LokalPageRoute<void>(
+          settings: const RouteSettings(name: '/now-playing/queue'),
+          builder: (_) => const QueueScreen(returnToPlayer: true),
+        ),
+      );
+    } finally {
+      _queuePageOpen = false;
     }
   }
 
@@ -1273,7 +1214,7 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen>
                 child: SpaceCoverBloomReveal(
                   coverRect: _spaceCoverRect,
                   coverRectResolver: () => _spaceArtworkBounds(_spaceFullCover),
-                  coverMotion: _spaceCoverMotion,
+                  coverMotion: _lyricsProgress,
                   coverCornerRadiusResolver: _spaceArtworkCornerRadius,
                   canvasMode: _spaceCanvasMode,
                   coverCornerRadius: _spaceFullCover ? 0 : 20,
@@ -1392,14 +1333,13 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen>
           ];
 
     return PopScope(
-      // Back puts the queue or the lyrics away first, then closes the player.
+      // Back puts the lyrics away first, then closes the player.
       canPop:
           !_immersiveLyrics &&
           _videoOverrideId == null &&
           (!_videoActive || _videoRouteReleased) &&
           !_videoFullscreen &&
-          !_showLyrics &&
-          !_queue.isOpen,
+          !_showLyrics,
       onPopInvokedWithResult: (didPop, _) {
         if (didPop) return;
         if (_immersiveLyrics) {
@@ -1410,36 +1350,22 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen>
           _exitVideoMode();
         } else if (_showLyrics) {
           _toggleLyrics();
-        } else if (_queue.isOpen) {
-          _setQueueOpen(false);
         } else if (_videoActive) {
           unawaited(_close());
         }
       },
       child: LokalPullToDismiss(
         onDismiss: _close,
-        // Pulling up drags the queue in, following the finger.
-        onPullUpUpdate:
-            _immersiveLyrics ||
-                _showLyrics ||
-                _videoOverrideId != null ||
-                widget.videoSong != null
+        onPullUp:
+            _immersiveLyrics || _showLyrics || _videoActive || _queuePageOpen
             ? null
-            : _queue.dragBy,
-        onPullUpEnd:
-            _immersiveLyrics ||
-                _showLyrics ||
-                _videoOverrideId != null ||
-                widget.videoSong != null
-            ? null
-            : _releaseQueue,
-        // While the queue is out, its header owns vertical drags.
+            : () => unawaited(_openQueue(feedback: false)),
         isBlocked: () =>
             _immersiveLyrics ||
             _videoOverrideId != null ||
             widget.videoSong != null ||
             _carouselDragging ||
-            _queue.engaged,
+            _queuePageOpen,
         child: _scaffold(colors, isCasting, diagnostics),
       ),
     );
@@ -1488,8 +1414,7 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen>
                     _motionEnabled(song) &&
                     _canvasReadyForSong == song.id &&
                     !_showLyrics &&
-                    !_immersiveLyrics &&
-                    !_queue.engaged;
+                    !_immersiveLyrics;
                 final hidden = clearViewAvailable && _canvasHidden;
                 return GestureDetector(
                   behavior: HitTestBehavior.translucent,
@@ -1673,7 +1598,7 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen>
                             coverRect: _spaceCoverRect,
                             coverRectResolver: () =>
                                 _spaceArtworkBounds(_spaceFullCover),
-                            coverMotion: _spaceCoverMotion,
+                            coverMotion: _lyricsProgress,
                             coverCornerRadiusResolver:
                                 _spaceArtworkCornerRadius,
                             canvasMode: _spaceCanvasMode,
@@ -1867,14 +1792,11 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen>
   Widget _fullscreenArtwork(Song song) {
     final motion = _motionEnabled(song);
     return AnimatedBuilder(
-      animation: Listenable.merge([_queueProgress, _lyricsProgress]),
+      animation: _lyricsProgress,
       builder: (context, _) {
-        final progress =
-            (_lyricsProgress.value +
-                    _queueProgress.value * (1 - _lyricsProgress.value))
-                .clamp(0.0, 1.0);
+        final progress = _lyricsProgress.value;
         return IgnorePointer(
-          ignoring: _showLyrics || _queue.engaged,
+          ignoring: _showLyrics,
           child: Opacity(
             opacity: 1 - progress,
             child: TickerMode(
@@ -1896,7 +1818,6 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen>
                     enabled:
                         progress == 0 &&
                         !_showLyrics &&
-                        !_queue.isOpen &&
                         !_immersiveLyrics &&
                         !_usesEmbeddedVideo,
                     onDragStateChanged: (value) {
@@ -2066,7 +1987,7 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen>
   }
 
   /// Landscape tablets give artwork and the transport their own columns.
-  /// The existing panel still owns lyrics, queue, carousel and their gestures.
+  /// The panel owns the lyrics and artwork carousel.
   Widget _tabletPlayerChrome(
     Song song,
     bool isCasting,
@@ -2125,96 +2046,78 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen>
     final separateIdentity = tabletCover || identityInControls;
     _spacePanelCompact = compact;
     _spacePanelTabletCover = separateIdentity;
-    return LayoutBuilder(
-      builder: (context, c) {
-        _queue.travel = math.max(math.min(c.maxWidth, c.maxHeight) * .8, 200);
-        return PlayerPanelStage(
-          queueProgress: _queueProgress,
-          lyricsProgress: _lyricsProgress,
-          queueOpen: _queue.isOpen,
-          lyricsOpen: _showLyrics,
-          artGap: separateIdentity
-              ? 0
-              : compact
-              ? 10
-              : 17,
-          infoReserve: separateIdentity
-              ? 72 *
-                    (_lyricsProgress.value + _queueProgress.value).clamp(
-                      0.0,
-                      1.0,
-                    )
-              : 72,
-          onQueueHeaderTap: () => _setQueueOpen(false),
-          onLyricsCoverReturn: _toggleLyrics,
-          onQueueHeaderDrag: _queue.dragBy,
-          onQueueHeaderRelease: _releaseQueue,
-          artwork: (context, size, p) {
-            if (fullCover) {
-              // The poster owns the single Hero and carousel in this mode.
-              // Only reveal the compact cover while entering lyrics/queue.
-              if (p == 0) {
-                _measurePoster();
-                return SizedBox.expand(key: _posterAnchorKey);
-              }
-              return IgnorePointer(
-                child: HeroMode(
-                  enabled: false,
-                  child: Opacity(
-                    opacity: p,
-                    child: _artwork(
-                      song,
-                      size,
-                      current: !_videoActive,
-                      progress: p,
-                    ),
-                  ),
-                ),
-              );
-            }
-            final atRest =
-                p == 0 && !_queue.isOpen && !_showLyrics && !_immersiveLyrics;
-            return ValueListenableBuilder<List<Song>>(
-              valueListenable: _player.upNextNotifier,
-              builder: (context, _, __) => ValueListenableBuilder<int>(
-                valueListenable: _player.currentIndexNotifier,
-                builder: (context, _, __) => SongStageCarousel(
-                  key: _carouselKey,
-                  currentSong: song,
-                  nextSong: _player.peekNext,
-                  prevSong: _player.peekPrevious,
-                  buttonDissolve: true,
-                  animateButtonDissolve:
-                      ref.watch(appPreferencesProvider).animationsEnabled &&
-                      !LokalPerformanceScope.of(context),
-                  enabled: atRest,
-                  // Match the reference: a slim gutter separates neighbouring
-                  // covers while the regular (non-Fullcover) artwork is swiped.
-                  // The fullscreen poster carousel keeps its edge-to-edge slide.
-                  coverGap: 16,
-                  onDragStateChanged: (v) => _carouselDragging = v,
-                  onNext: _player.next,
-                  onPrevious: _player.previousBySwipe,
-                  stageBuilder: (s) => Align(
-                    alignment: Alignment.center,
-                    child: _artwork(
-                      s,
-                      size,
-                      current: s.id == song.id,
-                      progress: p,
-                    ),
-                  ),
+    return PlayerPanelStage(
+      lyricsProgress: _lyricsProgress,
+      lyricsOpen: _showLyrics,
+      artGap: separateIdentity
+          ? 0
+          : compact
+          ? 10
+          : 17,
+      infoReserve: separateIdentity ? 72 * _lyricsProgress.value : 72,
+      onLyricsCoverReturn: _toggleLyrics,
+      artwork: (context, size, p) {
+        if (fullCover) {
+          // The poster owns the single Hero and carousel in this mode.
+          // Only reveal the compact cover while entering Lyrics.
+          if (p == 0) {
+            _measurePoster();
+            return SizedBox.expand(key: _posterAnchorKey);
+          }
+          return IgnorePointer(
+            child: HeroMode(
+              enabled: false,
+              child: Opacity(
+                opacity: p,
+                child: _artwork(
+                  song,
+                  size,
+                  current: !_videoActive,
+                  progress: p,
                 ),
               ),
-            );
-          },
-          info: (context, p) => separateIdentity && p == 0
-              ? const SizedBox.shrink()
-              : _panelIdentity(song, compact, p, anchor: !separateIdentity),
-          queue: const QueueList(embedded: true),
-          lyrics: _lyricsArea(song),
+            ),
+          );
+        }
+        final atRest = p == 0 && !_showLyrics && !_immersiveLyrics;
+        return ValueListenableBuilder<List<Song>>(
+          valueListenable: _player.upNextNotifier,
+          builder: (context, _, __) => ValueListenableBuilder<int>(
+            valueListenable: _player.currentIndexNotifier,
+            builder: (context, _, __) => SongStageCarousel(
+              key: _carouselKey,
+              currentSong: song,
+              nextSong: _player.peekNext,
+              prevSong: _player.peekPrevious,
+              buttonDissolve: true,
+              animateButtonDissolve:
+                  ref.watch(appPreferencesProvider).animationsEnabled &&
+                  !LokalPerformanceScope.of(context),
+              enabled: atRest,
+              // Match the reference: a slim gutter separates neighbouring
+              // covers while the regular (non-Fullcover) artwork is swiped.
+              // The fullscreen poster carousel keeps its edge-to-edge slide.
+              coverGap: 16,
+              onDragStateChanged: (v) => _carouselDragging = v,
+              onNext: _player.next,
+              onPrevious: _player.previousBySwipe,
+              stageBuilder: (s) => Align(
+                alignment: Alignment.center,
+                child: _artwork(
+                  s,
+                  size,
+                  current: s.id == song.id,
+                  progress: p,
+                ),
+              ),
+            ),
+          ),
         );
       },
+      info: (context, p) => separateIdentity && p == 0
+          ? const SizedBox.shrink()
+          : _panelIdentity(song, compact, p, anchor: !separateIdentity),
+      lyrics: _lyricsArea(song),
     );
   }
 
@@ -2545,19 +2448,9 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen>
     return Column(
       key: const ValueKey('lyrics'),
       children: [
-        Row(
-          children: [
-            Expanded(
-              child: Text(
-                'Lyrics',
-                style: TextStyle(
-                  fontFamily: _font,
-                  fontSize: 13,
-                  letterSpacing: 0.6,
-                  color: Colors.white.withValues(alpha: 0.6),
-                ),
-              ),
-            ),
+        FullPlayerLyricsToolbar(
+          timing: data == null ? null : lyricsTimingLabel(data),
+          actions: [
             if (data != null && hasUsableLyrics(data))
               LyricsSaveButton(
                 key: const ValueKey('save-current-lyrics-file'),
@@ -2569,6 +2462,8 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen>
             if (hasImmersiveLyrics(data))
               IconButton(
                 tooltip: 'Space — immersive lyrics',
+                constraints: const BoxConstraints.tightFor(width: 44, height: 44),
+                visualDensity: VisualDensity.standard,
                 icon: const Icon(
                   LucideIcons.expand,
                   color: Colors.white70,
@@ -2582,6 +2477,7 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen>
               song: song,
               lyricsService: _lyricsService,
               busy: _lyricsLoading,
+              iconOnly: true,
               onSelected: (source) {
                 setState(() => _lyricsSource = source);
                 unawaited(_loadLyrics(force: true));
@@ -2592,10 +2488,13 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen>
             if (data != null)
               LyricsSublineButtons(
                 lyrics: data,
+                compactControls: true,
                 onChanged: (value) => setState(() => _sublineLyrics = value),
               ),
             IconButton(
-              tooltip: 'Search online',
+              tooltip: lokalText('Search online'),
+              constraints: const BoxConstraints.tightFor(width: 44, height: 44),
+              visualDensity: VisualDensity.standard,
               icon: const Icon(
                 LucideIcons.search,
                 size: 20,
@@ -2900,12 +2799,28 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen>
             ),
           ),
           const SizedBox(width: 13),
-          Icon(
-            sliderValue <= 0.001 ? LucideIcons.volumeX : LucideIcons.volume2,
-            size: 18,
-            color: FullPlayerVisuals.secondaryText,
-          ),
-          const SizedBox(width: 18),
+          if (_volumeControl.usesDirectUsb)
+            IconButton(
+              tooltip: _volumeControl.available
+                  ? lokalText('USB volume · Phone buttons bypassed')
+                  : lokalText('USB volume fixed · Open USB DAC settings'),
+              icon: const Icon(LucideIcons.usb, size: 18),
+              color: FullPlayerVisuals.secondaryText,
+              onPressed: () => Navigator.of(context, rootNavigator: true)
+                  .push<void>(
+                    LokalPageRoute<void>(
+                      builder: (_) => const Uac2SettingsScreen(),
+                    ),
+                  ),
+            )
+          else ...[
+            Icon(
+              sliderValue <= 0.001 ? LucideIcons.volumeX : LucideIcons.volume2,
+              size: 18,
+              color: FullPlayerVisuals.secondaryText,
+            ),
+            const SizedBox(width: 18),
+          ],
           Container(width: 1, height: 26, color: FullPlayerVisuals.border),
           const SizedBox(width: 10),
           ValueListenableBuilder<ShuffleMode>(
@@ -2986,8 +2901,11 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen>
           selected: active,
           onTap: onTap,
           excludeSemantics: true,
-          child: SizedBox(
-            width: width,
+          child: ConstrainedBox(
+            constraints: BoxConstraints(
+              minWidth: width ?? 44,
+              maxWidth: math.max(width ?? 44, 160),
+            ),
             child: _pill(
               selected: active,
               compact: true,
@@ -3037,8 +2955,7 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen>
             chip(
               LucideIcons.listMusic,
               l10n.queue,
-              _toggleQueue,
-              active: _queue.isOpen && !_showLyrics,
+              () => unawaited(_openQueue()),
               width: (constraints.maxWidth - 8) / 4,
             ),
             chip(

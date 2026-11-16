@@ -1,6 +1,6 @@
 # Hadoo platform status
 
-The current development preview is **2015** (`2.0.0-dev.16`). [Install it](device-setup.md), [build it from source](build.md), or check the [changelog](../CHANGELOG.md).
+The current development preview is **2016** (`2.0.0-dev.17`). [Install it](device-setup.md), [build it from source](build.md), or check the [changelog](../CHANGELOG.md).
 
 | Area | Current behavior | Device evidence |
 | --- | --- | --- |

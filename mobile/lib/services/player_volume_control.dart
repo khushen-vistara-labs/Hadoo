@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 
 import 'package:flick/models/audio_engine_type.dart';
+import 'package:flick/models/audio_output_diagnostics.dart';
 import 'package:flick/services/player_service.dart';
 import 'package:flick/services/casting/casting_service.dart';
 import 'package:flick/services/uac2_service.dart';
@@ -35,13 +36,25 @@ class PlayerVolumeControl extends ChangeNotifier with WidgetsBindingObserver {
   double? _systemVolume;
   bool _disposed = false;
 
+  bool get _mixerBypassesVolume =>
+      player.audioOutputDiagnosticsNotifier.value?.pathManagement ==
+      AudioPathManagement.androidMixerBitPerfect;
+
+  bool get usesDirectUsb =>
+      Platform.isAndroid &&
+      !player.isCasting &&
+      (_mixerBypassesVolume ||
+          player.currentEngineType == AudioEngineType.usbDacExperimental);
+
   bool get usesSystemVolume =>
       Platform.isAndroid &&
       !player.isCasting &&
-      player.currentEngineType != AudioEngineType.usbDacExperimental &&
+      !usesDirectUsb &&
       player.currentEngineType != AudioEngineType.dapInternalHighRes;
-  bool get available =>
-      usesSystemVolume ? _systemVolume != null : player.isVolumeAvailable;
+
+  bool get available => usesSystemVolume
+      ? _systemVolume != null
+      : (player.isCasting || !_mixerBypassesVolume) && player.isVolumeAvailable;
   double get max => usesSystemVolume ? 1 : player.maxVolume;
   double get value =>
       (usesSystemVolume ? (_systemVolume ?? 0) : player.currentVolume)
@@ -68,6 +81,7 @@ class PlayerVolumeControl extends ChangeNotifier with WidgetsBindingObserver {
   }
 
   Future<void> set(double volume) async {
+    if (!available) return;
     if (!usesSystemVolume) {
       await player.setVolume(volume);
       _changed();

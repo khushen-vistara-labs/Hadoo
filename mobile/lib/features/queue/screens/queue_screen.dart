@@ -26,13 +26,19 @@ List<String> queueRowIdentities(List<Song> songs, String section) {
 }
 
 class QueueScreen extends StatelessWidget {
-  const QueueScreen({super.key});
+  const QueueScreen({super.key, this.returnToPlayer = false});
+
+  final bool returnToPlayer;
 
   @override
-  Widget build(BuildContext context) => const Scaffold(
+  Widget build(BuildContext context) => Scaffold(
     backgroundColor: Colors.transparent,
     body: BlurredSongBackground(
-      child: SafeArea(bottom: false, child: QueueList()),
+      child: SafeArea(
+        child: QueueList(
+          onOpenPlayer: returnToPlayer ? () => Navigator.of(context).pop() : null,
+        ),
+      ),
     ),
   );
 }

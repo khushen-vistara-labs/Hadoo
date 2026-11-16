@@ -36,6 +36,14 @@ Open **Settings → Online sources** to enable optional providers or add your ow
 
 Streaming rights, preview-only results, and provider responses affect what can be saved. Only download content you have permission to keep. A song in a playlist may still need an internet connection unless you downloaded it.
 
+## Now Playing
+
+Tap **Queue** or swipe up in Now Playing to open the full queue page. Press Back or tap the current song to return to the player. Hold an upcoming song and drag it to change the order.
+
+Open **Lyrics** to see the lyrics above the playback controls. The toolbar keeps save, source selection, translation, romanization, and search accessible. **Space** is available when the lyrics have synchronized timing.
+
+On Android, standard playback uses the phone’s media volume buttons for USB headphones. If you want exclusive USB, choose it under **Settings → Advanced output → USB DAC**. **Auto Bit-perfect for USB DACs** is off unless you turn it on.
+
 ## In the car
 
 Connect the phone to a compatible **Android Auto** head unit. For a trusted locally built preview, the car launcher may require enabling Android Auto's developer option for unknown sources. Open Hadoo in the car launcher for **Offline**, **Library**, **Liked songs**, or **Playlists**. Voice search currently searches saved library tracks. Configure Android Auto before driving. [Android Auto setup for test builds](https://developer.android.com/training/cars/testing#test-in-real-vehicles)

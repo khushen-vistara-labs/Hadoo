@@ -74,6 +74,48 @@ Future<void> _drag(WidgetTester tester, String key, double dy) async {
 }
 
 void main() {
+  testWidgets('the queue page fills a phone and returns to Now Playing', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(360, 800);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [playerProvider.overrideWith(_QueuePlayer.new)],
+        child: MaterialApp(
+          theme: LokalTheme.build(LokalTokens.themes[LokalThemeId.dark]!),
+          home: Builder(
+            builder: (context) => Scaffold(
+              body: TextButton(
+                onPressed: () => Navigator.of(context).push<void>(
+                  MaterialPageRoute<void>(
+                    builder: (_) => const QueueScreen(returnToPlayer: true),
+                  ),
+                ),
+                child: const Text('Open queue'),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.tap(find.text('Open queue'));
+    await tester.pumpAndSettle();
+    final queue = find.byType(QueueScreen);
+    expect(tester.getSize(queue), const Size(360, 800));
+    final upcoming = find.descendant(
+      of: queue,
+      matching: find.byType(CustomScrollView),
+    );
+    expect(tester.getSize(upcoming).height, greaterThan(560));
+    expect(find.text('Track a'), findsOneWidget);
+    await tester.tap(find.byKey(const ValueKey('queue-now-playing')));
+    await tester.pumpAndSettle();
+    expect(queue, findsNothing);
+    expect(find.text('Open queue'), findsOneWidget);
+  });
+
   testWidgets('full row long press starts queue reordering, not a tap', (
     tester,
   ) async {
