@@ -8,6 +8,20 @@ Update the version in `mobile/pubspec.yaml` and the entry in [CHANGELOG.md](../C
 
 ## Android release signing
 
+GitHub's **Release APK and IPA** workflow builds both platforms when you publish a release, including a pre-release. It checks out the release tag's exact commit. Update `mobile/pubspec.yaml` and the changelog before creating that tag so each update has a higher build number.
+
+1. Commit the version and source changes to `trunk`.
+2. Open **GitHub → Releases → Draft a new release**, create a tag from that commit, and publish it.
+3. Follow **Actions → Release APK and IPA**. Once both builds finish, the workflow attaches the Android APK, unsigned iPhone IPA, matching source archive, installation notes, and SHA-256 checksums to that release.
+
+Use **Actions → Release APK and IPA → Run workflow** with an existing release tag to retry its builds. Leaving the tag blank tests `trunk` and keeps packages in the Actions run's downloadable artifacts. Each retry builds the same version and commit. GitHub retains those test artifacts for 14 days.
+
+The Android artifact is `Hadoo-<version>-arm64.apk`, signed with the persistent release key. Its package ID is `com.icemonkey.hadoo`. It installs separately from the `com.icemonkey.hadoo.test` previews previously installed from this computer. The `full-metadata.json` asset supports Hadoo's Android update checker for published stable releases.
+
+The iPhone artifact is `Hadoo-unsigned.ipa` for iOS 16 and later. Import it into AltStore Classic and sign it with your Apple Account using the [iPhone installation steps](device-setup.md#iphone). App Store and TestFlight distribution use Apple's separate signing and submission process.
+
+The Android job reads four repository secrets from **Settings → Secrets and variables → Actions**. Keep `ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, and `ANDROID_KEY_PASSWORD` together when backing up or migrating signing. Their values stay out of the repository and downloaded packages. The job removes its temporary keystore after the build. Replacing this key changes which existing installations can accept updates.
+
 Use a keystore you control. Configure `ANDROID_KEYSTORE_PATH`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, and `ANDROID_KEY_PASSWORD` in your terminal or secret manager. Alternatively, create the ignored file `mobile/android/key.properties` with `storeFile`, `storePassword`, `keyAlias`, and `keyPassword`. Use an absolute keystore path. Keep a recoverable private backup of the key.
 
 ```sh

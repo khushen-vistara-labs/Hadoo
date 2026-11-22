@@ -4,6 +4,8 @@ Hadoo's current source preview is build **2016**. The Android preview targets AR
 
 Get matching artifacts from [GitHub Releases](https://github.com/khushen-vistara-labs/Hadoo/releases) when available, or follow [Build from source](build.md). A GitHub source ZIP contains code. Choose an APK for Android or an IPA for signing on iPhone.
 
+Published releases automatically build their APK and IPA. Allow the **Release APK and IPA** Actions run to finish before downloading. Choose `Hadoo-<version>-arm64.apk` for an Android phone or compatible Android head unit. Choose `Hadoo-unsigned.ipa` for signing through AltStore Classic on iPhone. The included `INSTALL.txt` and `SHA256SUMS.txt` identify the installation requirements and download checksums.
+
 ## Android
 
 1. Transfer the APK to your phone and open it from Files or Downloads. If Android asks, enable **Allow from this source** for the app opening the file. You can turn the permission off after installation.

@@ -1,0 +1,189 @@
+name: Release APK and IPA
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing release tag to rebuild. Leave blank to test builds from trunk.
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-artifacts-${{ github.event.release.tag_name || inputs.release_tag || 'test' }}
+  cancel-in-progress: false
+
+env:
+  FLUTTER_VERSION: '3.47.1'
+  RUST_VERSION: '1.98.0'
+  RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
+
+jobs:
+  source:
+    name: Release source and version
+    runs-on: ubuntu-24.04
+    outputs:
+      commit: ${{ steps.metadata.outputs.commit }}
+      tag: ${{ steps.metadata.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.release_tag || 'trunk' }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify an existing release before rebuilding its assets
+        if: env.RELEASE_TAG != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release view --repo "$GITHUB_REPOSITORY" -- "$RELEASE_TAG" > /dev/null
+      - name: Read the tagged app version
+        id: metadata
+        run: python3 tools/release.py metadata
+      - name: Test release packaging
+        run: python3 -m unittest discover -s tools -p 'test_release.py' -v
+      - name: Package the matching source and installation notes
+        run: python3 tools/release.py source
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hadoo-source
+          path: dist/release/*
+          if-no-files-found: error
+          retention-days: 14
+
+  android:
+    name: Signed Android ARM64 APK
+    needs: source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.source.outputs.commit }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - name: Install native build dependencies
+        run: bash mobile/tool/install_android_host_dependencies.sh
+      - uses: android-actions/setup-android@v3
+      - name: Install the pinned Android SDK and Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager 'platforms;android-37.0' 'build-tools;36.0.0' 'ndk;28.2.13676358' 'cmake;3.22.1'
+          if [ ! -e "$ANDROID_HOME/platforms/android-37" ]; then
+            ln -s android-37.0 "$ANDROID_HOME/platforms/android-37"
+          fi
+          rustup toolchain install "$RUST_VERSION" --profile minimal --target aarch64-linux-android
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          libraries = sorted(Path('/usr/lib').glob('llvm-*/lib/libclang.so'))
+          if not libraries:
+              raise SystemExit('libclang is missing')
+          with open(os.environ['GITHUB_ENV'], 'a') as output:
+              output.write(f'LIBCLANG_PATH={libraries[-1].parent}\n')
+          PY
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-${{ hashFiles('mobile/rust/Cargo.lock') }}
+      - name: Resolve Flutter dependencies
+        run: ./hadoo setup
+      - name: Compile, sign and verify the APK
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: python3 tools/release.py android
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hadoo-android
+          path: dist/release/*
+          if-no-files-found: error
+          retention-days: 14
+
+  ios:
+    name: iPhone IPA for personal signing
+    needs: source
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.source.outputs.commit }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - name: Install the pinned Rust device toolchain
+        run: rustup toolchain install "$RUST_VERSION" --profile minimal --target aarch64-apple-ios
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-${{ hashFiles('mobile/rust/Cargo.lock') }}
+      - name: Resolve Flutter dependencies
+        run: ./hadoo setup
+      - name: Compile and inspect the unsigned device IPA
+        run: python3 tools/release.py ios
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hadoo-ios
+          path: dist/release/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Attach verified packages to the release
+    needs: [source, android, ios]
+    if: needs.source.outputs.tag != ''
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.source.outputs.commit }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: hadoo-*
+          merge-multiple: true
+          path: dist/release
+      - name: Checksum every release asset
+        run: python3 tools/release.py checksums
+      - name: Upload the APK, IPA, source and checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload --repo "$GITHUB_REPOSITORY" --clobber -- "$RELEASE_TAG" dist/release/*
