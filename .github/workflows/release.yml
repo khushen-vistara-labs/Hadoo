@@ -84,6 +84,9 @@ jobs:
       - name: Install native build dependencies
         run: bash mobile/tool/install_android_host_dependencies.sh
       - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+          log-accepted-android-sdk-licenses: false
       - name: Install the pinned Android SDK and Rust toolchain
         shell: bash
         run: |
