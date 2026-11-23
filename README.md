@@ -16,12 +16,15 @@ Hadoo is a standalone music player for Android and iPhone with a terminal-inspir
 | Build, test, or contribute | [Build from source](docs/build.md) · [Contributing](CONTRIBUTING.md) |
 | Check the current version and device coverage | [Changelog](CHANGELOG.md) · [Platform status](docs/mobile-rewrite.md) |
 
-Build **2016** (`2.0.0-dev.17`) is the current source preview on `trunk`. Publishing a [GitHub Release](https://github.com/khushen-vistara-labs/Hadoo/releases) automatically builds an Android APK and an unsigned iPhone IPA for personal signing. Follow the [release steps](docs/maintenance.md#android-release-signing) or [build locally](docs/build.md).
+Build **2016** (`2.0.0-dev.17`) is the current committed source preview on `trunk`. Publishing a [GitHub Release](https://github.com/khushen-vistara-labs/Hadoo/releases) automatically builds a signed Android ARM64 APK and an unsigned iPhone IPA for personal signing. Manual build tests keep their downloads in GitHub Actions artifacts. Follow the [release steps](docs/maintenance.md#automatic-github-releases) or [build locally](docs/build.md). [Platform status](docs/mobile-rewrite.md) distinguishes this source version from later local Android previews.
+
+On iPhone, import the IPA in **AltStore → My Apps → +** for managed refreshes. Direct **AltServer → Sideload .ipa** installs do not appear in My Apps. Both require Apple signing, with seven-day renewal for a free Apple Account. [iPhone setup and updates](docs/device-setup.md#iphone)
 
 ## What you can do
 
 - **Search and listen.** Browse songs, videos, and playlists. Sign in to YouTube Music for your Home recommendations and synced playlists. Source availability depends on the recording, provider, account, and region.
 - **Make playlists.** Choose a **Hadoo playlist** for tracks from multiple sources or a **YouTube playlist** to sync with YouTube Music.
+- **Use two phones.** YouTube playlists follow the selected YouTube account. Hadoo playlists and downloaded audio remain local in the current distributed builds; a saved username does not enable cloud sync.
 - **Listen offline.** Download supported recordings and find them in Downloads. Hadoo also plays local music files and supports background playback.
 - **Use car controls.** Android Auto and CarPlay integrations are included. Both still need physical head-unit qualification. CarPlay also requires Apple-approved audio provisioning.
 

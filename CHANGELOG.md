@@ -1,5 +1,12 @@
 # Changelog
 
+## Documentation and CI · 2026-11-23
+
+- Document Android APK installation, package/signing identity, compatible standalone head units, Android Auto, and release versus test-artifact downloads.
+- Distinguish AltStore-managed IPA imports from direct AltServer installs, seven-day personal signing, file transfer, refresh, and version updates. Record the verified iPhone build 2016 installation without claiming AltStore registration.
+- Explain playlist sync availability, download retry/skipped counters, offline lyrics, and remaining car qualification. Record local Android build-2020 coverage separately from the committed source version.
+- Maintain separate Linux and macOS header screenshot references and retain failed CI comparison images. App version/build numbers are unchanged by these documentation and test changes.
+
 ## 2.0.0-dev.17 (build 2016) · 2026-11-16
 
 - Android keeps the phone’s volume buttons available for USB headphones on standard playback. Automatic exclusive USB is now opt-in.

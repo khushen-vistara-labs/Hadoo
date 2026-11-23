@@ -63,6 +63,8 @@ rustup target add aarch64-apple-ios
 
 This stages pinned FFmpeg and SMB dependencies, then produces the unsigned device bundle at `mobile/build/ios/iphoneos/Runner.app`. Keep the computer online while it downloads dependencies and compiles. The version comes from `mobile/pubspec.yaml`.
 
+Command Line Tools alone cannot build this iPhone target. When full Xcode is unavailable locally, use the [GitHub release workflow](maintenance.md#automatic-github-releases), whose iPhone job runs on a Mac with Xcode. Its unsigned output still needs personal signing before installation.
+
 ### Package an IPA for AltStore
 
 Run this after a successful build, from the repository root. The archive preserves the app bundle and its included license files.
@@ -80,6 +82,8 @@ rm -rf "$stage"
 
 Follow the [AltStore installation steps](device-setup.md#iphone) to sign the IPA and install it.
 
+For release packaging with native bundle inspection and metadata, `tools/release.py ios` is the workflow entry point. The packaging helper checks the device architecture, deployment target, native libraries, app identity, and version before creating `dist/release/Hadoo-unsigned.ipa`. Its generated checksums identify that exact unsigned package; signing changes the bytes.
+
 ### Sign with Xcode
 
 After running the build above, open `mobile/ios/Runner.xcworkspace` in Xcode. Connect the phone and enable Developer Mode. In the **Runner** target's **Signing & Capabilities**, enable automatic signing and select your own team. If Apple declines the bundle identifier, choose a unique one and keep it for future updates. Select your iPhone and click **Run**. [Apple's device signing instructions](https://developer.apple.com/documentation/xcode/building-and-running-an-app)
@@ -95,3 +99,13 @@ After running the build above, open `mobile/ios/Runner.xcworkspace` in Xcode. Co
 ```
 
 This runs Dart analysis and the Hadoo, car catalog, discovery, playback, and update checks in CI. For a more targeted test, run `flutter test --no-pub <test-path>` inside `mobile/`. Run `flutter test --no-pub` there for the full Flutter suite. Native and device checks are listed in [Maintenance](maintenance.md#release-checklist).
+
+Release helper checks run with `python3 -m unittest discover -s tools -p 'test_release.py' -v` from the repository root. Screenshot tests use host-specific references; see [Contributing](../CONTRIBUTING.md#validate-changes) before updating them.
+
+## Playlist sync availability
+
+The committed release build supports on-device Hadoo playlists and account-backed YouTube playlists. Google Drive playlist sync is unfinished local development work and is not configured in the distributed builds. The release workflow does not create a Hadoo account or provision Google OAuth clients. Shipping sync requires committing and validating the integration, registering both platforms with the correct installed identities, and configuring the release builds before claiming cross-phone synchronization.
+
+## Compatibility names
+
+Hadoo is the product name. Imported components can retain publisher namespaces, historical filenames, storage keys, and native bridge identifiers. Preserve the Flutter/Rust ABI and migration keys when renaming source. Upstream notices retain their original attribution. File-renaming work in local previews must be committed and tested before a release tag includes it.

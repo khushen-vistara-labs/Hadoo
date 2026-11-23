@@ -13,4 +13,6 @@ The Flutter and Rust app for Android and iPhone. The [main README](../README.md)
 
 Regenerate app icons from the original Hadoo mark with `dart run tool/gen_hadoo_branding.dart` from this directory.
 
+The [installation guide](../docs/device-setup.md) covers Android package identity and iPhone signing. An unsigned IPA must be transferred to the phone and imported through AltStore for My Apps management; direct AltServer installs use manual renewal. [Platform status](../docs/mobile-rewrite.md) records committed-source builds separately from later local previews.
+
 The [source lock](../config/mobile-upstream-lock.json) records the imported version. The [engineering records](docs/README.md) preserve upstream context. Use the [Hadoo docs index](../docs/README.md) for current setup instructions, and preserve [third-party notices](THIRD_PARTY_NOTICES.md) when distributing.

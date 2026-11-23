@@ -17,6 +17,10 @@ Open **Library → Playlists**, use the new-playlist action, and choose the dest
 | **Hadoo playlist** | Local files and eligible tracks from multiple sources, including external add-ons | In Hadoo on this phone |
 | **YouTube playlist** | YouTube Music recording IDs. New playlists are private and edits sync to the signed-in account | In Hadoo and in YouTube Music |
 
+Use the same YouTube account on two phones to access its YouTube playlists. **Hadoo playlists, downloads, local files, likes, and a saved profile username do not become a cloud account.** The Google Drive playlist-sync work is not configured in the current distributed builds. An unavailable-sync message does not affect local playlists or YouTube playlist access. See [platform status](mobile-rewrite.md) for what has actually shipped.
+
+Later local Android previews add a direct **New Hadoo playlist** action to Library. If your build lacks that action, create a Hadoo playlist from a track's **Add to playlist** picker.
+
 To add a song, open its **⋯ → Add to playlist** menu. Choose **Hadoo playlists** for a recording that only exists on another source. If a result has a YouTube recording ID, it can also be eligible for a YouTube playlist. Hadoo checks for an existing copy when adding a YouTube recording and reports duplicates. YouTube writes need a live account session and a server response. Playlist entries point to recordings. Download eligible recordings separately for offline listening.
 
 ## Pick your sources
@@ -34,6 +38,14 @@ Open **Settings → Online sources** to enable optional providers or add your ow
 2. Open **Downloads** from Home. Tap the saved track to play it. If you plan to travel, try opening it once in airplane mode before leaving.
 3. Manage saved tracks from Downloads. Local file imports and optional network libraries are available in Settings.
 
+For a playlist or collection download, **Downloaded** counts new files saved in that run. **Skipped** includes recordings already saved locally and duplicate entries; it is not a failure count. **Unavailable** or **Failed** reports entries the run could not save. Stopping and retrying retains completed files and checks for existing copies. For example, `Downloaded 0 · Skipped 130 · Unavailable 0` can mean all 130 entries were already available. Check the Downloads list and play its local entry to confirm.
+
+Each phone downloads its own audio. Signing into the same YouTube account or seeing the same playlist on another phone does not copy downloaded files there.
+
+### Offline lyrics
+
+Hadoo can read lyrics embedded in an audio file, a manually selected lyrics file, or a matching `.lrc`/`.elrc` file saved beside the audio. Downloads attempt an online lyrics lookup and save available lyrics, but missing lyrics or a provider timeout does not block saving the audio. Audio downloaded successfully is not a guarantee that lyrics were found. Test the saved song in airplane mode before relying on its lyrics offline. New online lyrics searches and translation requests need a connection.
+
 Streaming rights, preview-only results, and provider responses affect what can be saved. Only download content you have permission to keep. A song in a playlist may still need an internet connection unless you downloaded it.
 
 ## Now Playing
@@ -48,6 +60,10 @@ On Android, standard playback uses the phone’s media volume buttons for USB he
 
 Connect the phone to a compatible **Android Auto** head unit. For a trusted locally built preview, the car launcher may require enabling Android Auto's developer option for unknown sources. Open Hadoo in the car launcher for **Offline**, **Library**, **Liked songs**, or **Playlists**. Voice search currently searches saved library tracks. Configure Android Auto before driving. [Android Auto setup for test builds](https://developer.android.com/training/cars/testing#test-in-real-vehicles)
 
+Android Auto uses the car's media browsing and Now Playing controls. Hadoo's phone lyrics screen is not exposed as an Android Auto lyrics view. Saved audio can play offline; new online catalogue requests still need the phone's connection.
+
 A build signed with an approved **CarPlay** audio entitlement can show the same sections and Now Playing. The ordinary iPhone preview uses phone playback and can send audio over Bluetooth. [CarPlay build requirements](build.md#carplay)
 
 See [platform status](mobile-rewrite.md) for device testing and remaining car checks.
+
+For a head unit that runs Android apps itself, use the [standalone head-unit installation steps](device-setup.md#android-head-units-and-android-auto). Installing an APK on that unit and connecting a phone through Android Auto are separate installation routes.

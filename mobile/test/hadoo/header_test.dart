@@ -90,7 +90,11 @@ void main() {
     await tester.pumpAndSettle();
     await expectLater(
       find.byKey(const ValueKey('hadoo-preview')),
-      matchesGoldenFile('goldens/terminal-header.png'),
+      // Font rasterization differs between the macOS development host and CI.
+      // Keep exact comparisons against the reviewed image for this host.
+      matchesGoldenFile(
+        'goldens/${Platform.operatingSystem}/terminal-header.png',
+      ),
     );
   });
 }

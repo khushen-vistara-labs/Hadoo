@@ -1,6 +1,8 @@
-<p align="center"><img src="assets/images/hadoo-logo.png" width="180" alt="Hadoo"></p>
+<p align="center"><img src="../assets/images/hadoo-logo.png" width="180" alt="Hadoo"></p>
 
-# Hadoo
+# Earlier Hadoo Android APK patch workflow
+
+This is the archived Android-only patching workflow. For the current standalone Android and iPhone app, use [Installation and updates](device-setup.md) and [Build from source](build.md).
 
 Your personal YouTube Music build, with Hadoo's name and artwork.
 
