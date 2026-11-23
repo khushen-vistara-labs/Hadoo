@@ -11,7 +11,7 @@ concurrency:
 jobs:
   mobile:
     name: Standalone app analysis and regression tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -27,5 +27,13 @@ jobs:
         run: ./hadoo setup
       - name: Check app sources and focused player/catalog/car regressions
         run: ./hadoo check
+      - name: Upload failed screenshot comparisons
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: flutter-golden-diffs
+          path: mobile/test/**/failures/*.png
+          if-no-files-found: ignore
+          retention-days: 7
       # No signing keys, account sessions or proprietary APK inputs needed.
       # Native package builds and physical car/device acceptance are separate.
